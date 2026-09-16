@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim AS codex-cli
 
-ARG NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org
 RUN mkdir -p /opt/codex-cli \
     && npm install \
         --prefix /opt/codex-cli \
@@ -14,7 +14,7 @@ RUN mkdir -p /opt/codex-cli \
 
 FROM python:3.11-slim-bookworm
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG DEBIAN_MIRROR=deb.debian.org
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
