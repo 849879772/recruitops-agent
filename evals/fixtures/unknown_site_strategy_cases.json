@@ -1,0 +1,66 @@
+{
+  "fixture_id": "unknown-site-strategy-20260831-v1",
+  "frozen_at": "2026-08-31T10:33:09+08:00",
+  "description": "Two official URLs absent from Agent configuration before the evaluation: one Moka tenant and one self-built career site.",
+  "cases": [
+    {
+      "case_id": "unknown-moka-ys4fun",
+      "company": "勇仕网络",
+      "source_url": "https://app.mokahr.com/campus-recruitment/ys4fun/45636/",
+      "expected_titles": [
+        "动捕演员（实习生）",
+        "游戏服务端开发",
+        "游戏客户端开发",
+        "游戏测试",
+        "游戏策划"
+      ],
+      "strategies": [
+        {
+          "name": "platform_adapter",
+          "crawler": "moka",
+          "url": "https://app.mokahr.com/campus-recruitment/ys4fun/45636/"
+        },
+        {
+          "name": "generic_extraction",
+          "crawler": "render",
+          "url": "https://app.mokahr.com/campus-recruitment/ys4fun/45636/"
+        },
+        {
+          "name": "verified_manual_candidate",
+          "crawler": "moka",
+          "url": "https://app.mokahr.com/campus-recruitment/ys4fun/45636/"
+        }
+      ]
+    },
+    {
+      "case_id": "unknown-self-built-ksw",
+      "company": "坤恒顺维",
+      "source_url": "https://www.ksw-tech.com/",
+      "expected_titles": [
+        "销售工程师",
+        "软件工程师",
+        "技术支持工程师",
+        "硬件工程师",
+        "FPGA逻辑工程师",
+        "算法工程师"
+      ],
+      "strategies": [
+        {
+          "name": "platform_adapter",
+          "crawler": "manual_required",
+          "url": "https://www.ksw-tech.com/"
+        },
+        {
+          "name": "generic_extraction",
+          "crawler": "render",
+          "url": "https://www.ksw-tech.com/"
+        },
+        {
+          "name": "verified_manual_candidate",
+          "crawler": "static_html",
+          "url": "https://www.ksw-tech.com/information/campus-hiring.html"
+        }
+      ]
+    }
+  ]
+}

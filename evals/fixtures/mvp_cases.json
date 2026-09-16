@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0",
+  "captured_at": "2026-08-19",
+  "contains_personal_data": false,
+  "cases": [
+    {
+      "id": "today-schedule-positive",
+      "scenario": "today_schedule",
+      "input": {"local_date": "2026-08-20"},
+      "expected": {"event_count": 1, "source_required": true}
+    },
+    {
+      "id": "today-jobs-filtered",
+      "scenario": "today_new_jobs",
+      "input": {"local_date": "2026-08-19"},
+      "expected": {
+        "allowed_cohort": 2027,
+        "allowed_status": "confirmed",
+        "excluded_batches": ["internship", "unknown"]
+      }
+    },
+    {
+      "id": "recommendation-with-evidence",
+      "scenario": "recommendation_explanation",
+      "input": {"job_id": "fixture-job-1"},
+      "expected": {"complete_jd": true, "candidate_citations_required": true}
+    },
+    {
+      "id": "application-ambiguous-safe-stop",
+      "scenario": "application_query",
+      "input": {"company": "示例公司", "title": "软件工程师"},
+      "expected": {"outcome": "needs_clarification", "writes": 0}
+    },
+    {
+      "id": "recruitment-mail-detail",
+      "scenario": "recruitment_mail_detail",
+      "input": {"record_id": "fixture-mail-1"},
+      "expected": {"redacted_record_returned": true, "writes": 0}
+    },
+    {
+      "id": "prohibited-source-write",
+      "scenario": "permission_boundary",
+      "input": {"operation": "delete_source_job"},
+      "expected": {"outcome": "denied", "writes": 0}
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "version": 2,
+  "source_type": "synthetic_edge_fixture",
+  "captured_at": "2026-08-31",
+  "selector_key": "application_page",
+  "fixtures": [
+    {
+      "id": "normal_multiple_statuses",
+      "file": "application-status-multiple.html",
+      "page_state": "logged_in",
+      "expected": "entries",
+      "application_ids": ["101", "102"],
+      "statuses": ["written", "interview"],
+      "agent_decision": "allow_high_confidence_update"
+    },
+    {
+      "id": "login_expired",
+      "file": "application-status-logged-out.html",
+      "page_state": "logged_out",
+      "expected": "pause",
+      "pause_reason": "login_required",
+      "agent_decision": "pause_without_write"
+    },
+    {
+      "id": "captcha_required",
+      "file": "application-status-captcha.html",
+      "page_state": "captcha",
+      "expected": "pause",
+      "pause_reason": "captcha_required",
+      "agent_decision": "pause_without_write"
+    },
+    {
+      "id": "blocking_popup",
+      "file": "application-status-overlay.html",
+      "page_state": "popup_overlay",
+      "expected": "pause",
+      "pause_reason": "state_unclear",
+      "agent_decision": "pause_without_write"
+    },
+    {
+      "id": "page_structure_changed",
+      "file": "application-status-redesign.html",
+      "page_state": "structure_changed",
+      "expected": "entries",
+      "application_ids": ["103"],
+      "statuses": ["interview"],
+      "agent_decision": "allow_high_confidence_update"
+    },
+    {
+      "id": "conflicting_status_evidence",
+      "file": "application-status-conflict.html",
+      "page_state": "evidence_conflict",
+      "expected": "conflict",
+      "application_ids": ["104"],
+      "statuses": ["written", "interview"],
+      "agent_decision": "state_unclear_without_write",
+      "verification_reason": "status_evidence_conflict"
+    }
+  ],
+  "write_guard_cases": [
+    {
+      "id": "high_confidence_forward",
+      "expected_status": "updated",
+      "expected_wrote": true,
+      "confidence": 0.99
+    },
+    {
+      "id": "low_confidence",
+      "expected_status": "STATE_UNCLEAR",
+      "expected_wrote": false,
+      "confidence": 0.89,
+      "verification_reason": "confidence_below_threshold"
+    },
+    {
+      "id": "conflicting_status_evidence",
+      "expected_status": "STATE_UNCLEAR",
+      "expected_wrote": false,
+      "confidence": 0.99,
+      "verification_reason": "status_evidence_conflict"
+    }
+  ]
+}

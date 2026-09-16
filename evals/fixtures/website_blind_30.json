@@ -1,0 +1,308 @@
+{
+  "version": 1,
+  "source_snapshot": "company_integration_audit.csv",
+  "selection": "sha256(company + source_url), healthy non-empty rows",
+  "development_exclusion": "The fixture is frozen after implementation and must not be changed while tuning crawler acceptance logic.",
+  "cases": [
+    {
+      "case_id": "blind-01",
+      "company": "oppo",
+      "crawler": "oppo",
+      "source_url": "https://careers.oppo.com/university/oppo/recruitment/post",
+      "expected_jobs": 91,
+      "expected_detail_jobs": 91,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:59:00+08:00"
+    },
+    {
+      "case_id": "blind-02",
+      "company": "长安汽车",
+      "crawler": "beisen",
+      "source_url": "https://changan.zhiye.com/campus/jobs",
+      "expected_jobs": 9,
+      "expected_detail_jobs": 9,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:17:28+08:00"
+    },
+    {
+      "case_id": "blind-03",
+      "company": "亿联网络提前批",
+      "crawler": "beisen",
+      "source_url": "https://yealink.zhiye.com/campus/jobs",
+      "expected_jobs": 17,
+      "expected_detail_jobs": 17,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:26+08:00"
+    },
+    {
+      "case_id": "blind-04",
+      "company": "云天励飞",
+      "crawler": "beisen",
+      "source_url": "https://intellif1.zhiye.com/campus/jobs",
+      "expected_jobs": 7,
+      "expected_detail_jobs": 7,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:05:03+08:00"
+    },
+    {
+      "case_id": "blind-05",
+      "company": "韶音科技",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus-recruitment/aftershokzhr/36940",
+      "expected_jobs": 15,
+      "expected_detail_jobs": 15,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:26+08:00"
+    },
+    {
+      "case_id": "blind-06",
+      "company": "燧原科技",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus_apply/enflame/40892",
+      "expected_jobs": 14,
+      "expected_detail_jobs": 14,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:59:44+08:00"
+    },
+    {
+      "case_id": "blind-07",
+      "company": "文远知行",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus_apply/jingchi/2137",
+      "expected_jobs": 10,
+      "expected_detail_jobs": 10,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:58:38+08:00"
+    },
+    {
+      "case_id": "blind-08",
+      "company": "miHoYo",
+      "crawler": "mihoyo",
+      "source_url": "https://jobs.mihoyo.com/#/campus",
+      "expected_jobs": 36,
+      "expected_detail_jobs": 36,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:58:55+08:00"
+    },
+    {
+      "case_id": "blind-09",
+      "company": "南芯科技",
+      "crawler": "beisen",
+      "source_url": "https://nanxin.zhiye.com/campus/jobs",
+      "expected_jobs": 37,
+      "expected_detail_jobs": 37,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:16:50+08:00"
+    },
+    {
+      "case_id": "blind-10",
+      "company": "实习僧速腾",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus-recruitment/robosense/69887",
+      "expected_jobs": 33,
+      "expected_detail_jobs": 33,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:14:39+08:00"
+    },
+    {
+      "case_id": "blind-11",
+      "company": "兆易创新",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus-recruitment/gigadevice/92215",
+      "expected_jobs": 33,
+      "expected_detail_jobs": 33,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:04:15+08:00"
+    },
+    {
+      "case_id": "blind-12",
+      "company": "博世",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus-recruitment/bosch/73873",
+      "expected_jobs": 31,
+      "expected_detail_jobs": 31,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:06+08:00"
+    },
+    {
+      "case_id": "blind-13",
+      "company": "沐瞳科技",
+      "crawler": "feishu",
+      "source_url": "https://moonton.jobs.feishu.cn/campus/position/application",
+      "expected_jobs": 5,
+      "expected_detail_jobs": 5,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:46+08:00"
+    },
+    {
+      "case_id": "blind-14",
+      "company": "星宸科技",
+      "crawler": "beisen",
+      "source_url": "https://sigmastar.zhiye.com/campus/jobs",
+      "expected_jobs": 1,
+      "expected_detail_jobs": 1,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:59:47+08:00"
+    },
+    {
+      "case_id": "blind-15",
+      "company": "长安",
+      "crawler": "beisen",
+      "source_url": "https://changan.zhiye.com/campus/jobs",
+      "expected_jobs": 9,
+      "expected_detail_jobs": 9,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:24+08:00"
+    },
+    {
+      "case_id": "blind-16",
+      "company": "联影医疗",
+      "crawler": "beisen",
+      "source_url": "https://united-imaging.zhiye.com/campus/jobs",
+      "expected_jobs": 71,
+      "expected_detail_jobs": 71,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:17:13+08:00"
+    },
+    {
+      "case_id": "blind-17",
+      "company": "顺丰",
+      "crawler": "sf",
+      "source_url": "https://campus.sf-express.com/",
+      "expected_jobs": 8,
+      "expected_detail_jobs": 8,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:59:02+08:00"
+    },
+    {
+      "case_id": "blind-18",
+      "company": "联发科技",
+      "crawler": "beisen",
+      "source_url": "https://mediatek.zhiye.com/campus/jobs",
+      "expected_jobs": 17,
+      "expected_detail_jobs": 17,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:15+08:00"
+    },
+    {
+      "case_id": "blind-19",
+      "company": "亿联网络",
+      "crawler": "beisen",
+      "source_url": "https://yealink.zhiye.com/campus/jobs",
+      "expected_jobs": 17,
+      "expected_detail_jobs": 17,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:16:48+08:00"
+    },
+    {
+      "case_id": "blind-20",
+      "company": "珠海全志科技",
+      "crawler": "moka",
+      "source_url": "https://campus.allwinnertech.com/campus-recruitment/allwinnertech/43436",
+      "expected_jobs": 11,
+      "expected_detail_jobs": 11,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:06:16+08:00"
+    },
+    {
+      "case_id": "blind-21",
+      "company": "中国兵器工业集团",
+      "crawler": "beisen",
+      "source_url": "https://norincogroupzhaopin.zhiye.com/campus/jobs",
+      "expected_jobs": 1224,
+      "expected_detail_jobs": 1224,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:16:04+08:00"
+    },
+    {
+      "case_id": "blind-22",
+      "company": "字节跳动",
+      "crawler": "bytedance",
+      "source_url": "https://jobs.bytedance.com/campus",
+      "expected_jobs": 1,
+      "expected_detail_jobs": 1,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:58:52+08:00"
+    },
+    {
+      "case_id": "blind-23",
+      "company": "北汽集团",
+      "crawler": "beisen",
+      "source_url": "https://baicgroup.zhiye.com/campus/jobs",
+      "expected_jobs": 325,
+      "expected_detail_jobs": 325,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:16:49+08:00"
+    },
+    {
+      "case_id": "blind-24",
+      "company": "艾为电子",
+      "crawler": "beisen",
+      "source_url": "https://awinic.zhiye.com/campus/jobs",
+      "expected_jobs": 1,
+      "expected_detail_jobs": 1,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:19+08:00"
+    },
+    {
+      "case_id": "blind-25",
+      "company": "杰华特微电子",
+      "crawler": "beisen",
+      "source_url": "https://joulwatt.zhiye.com/campus/jobs",
+      "expected_jobs": 24,
+      "expected_detail_jobs": 24,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:00:20+08:00"
+    },
+    {
+      "case_id": "blind-26",
+      "company": "拓竹科技",
+      "crawler": "feishu",
+      "source_url": "https://bambulab.jobs.feishu.cn/campus/position/application",
+      "expected_jobs": 29,
+      "expected_detail_jobs": 29,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T17:59:28+08:00"
+    },
+    {
+      "case_id": "blind-27",
+      "company": "东方财富",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus-recruitment/eastmoney/92400",
+      "expected_jobs": 30,
+      "expected_detail_jobs": 30,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:02:40+08:00"
+    },
+    {
+      "case_id": "blind-28",
+      "company": "ArcSoft虹软",
+      "crawler": "beisen",
+      "source_url": "https://career.arcsoft.com.cn/campus/jobs",
+      "expected_jobs": 19,
+      "expected_detail_jobs": 19,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:06:24+08:00"
+    },
+    {
+      "case_id": "blind-29",
+      "company": "卡尔动力",
+      "crawler": "feishu",
+      "source_url": "https://kargobot.jobs.feishu.cn/267069",
+      "expected_jobs": 19,
+      "expected_detail_jobs": 19,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:16:50+08:00"
+    },
+    {
+      "case_id": "blind-30",
+      "company": "广联达",
+      "crawler": "moka",
+      "source_url": "https://app.mokahr.com/campus-recruitment/glodon/91966",
+      "expected_jobs": 14,
+      "expected_detail_jobs": 14,
+      "expected_status": "HEALTHY",
+      "frozen_at": "2026-07-13T18:03:52+08:00"
+    }
+  ]
+}

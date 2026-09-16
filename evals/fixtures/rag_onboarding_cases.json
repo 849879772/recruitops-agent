@@ -1,0 +1,463 @@
+{
+  "fixture_id": "rag-website-onboarding-v1",
+  "version": 1,
+  "source_type": "fixture",
+  "result_type": "synthetic",
+  "frozen_at": "2026-08-19",
+  "description": "Synthetic, offline website-onboarding cases for paired baseline/RAG evaluation.",
+  "cases": [
+    {
+      "case_id": "synthetic-moka-pagination",
+      "company": "Synthetic Moka Labs",
+      "platform": "moka",
+      "source_url": "https://example.invalid/moka/pagination",
+      "frozen_at": "2026-08-19",
+      "observations": {
+        "page_shape": "listing_with_pagination",
+        "pagination_signal": "pageIndex_and_totalPages",
+        "detail_signal": "stable_job_id"
+      },
+      "retrieval_evidence": [
+        {
+          "source_ref": "fixture://knowledge/moka-pagination",
+          "content": "Moka campus pages expose paginated listing data; use the stable detail ID for job links."
+        }
+      ],
+      "ground_truth": {
+        "status": "connected",
+        "jobs": [
+          {
+            "job_id": "moka-001",
+            "title": "Robotics Software Engineer",
+            "detail_url": "https://example.invalid/moka/jobs/moka-001"
+          },
+          {
+            "job_id": "moka-002",
+            "title": "Embedded Systems Engineer",
+            "detail_url": "https://example.invalid/moka/jobs/moka-002"
+          }
+        ]
+      },
+      "synthetic_runs": {
+        "baseline": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "moka-001",
+              "title": "Robotics Software Engineer",
+              "detail_url": "https://example.invalid/moka/jobs/moka-001"
+            },
+            {
+              "job_id": "moka-002",
+              "title": "Embedded Systems Engineer",
+              "detail_url": "https://example.invalid/moka/jobs/moka-002"
+            }
+          ],
+          "steps": 8,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 260,
+          "estimated_output_tokens": 90
+        },
+        "rag": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "moka-001",
+              "title": "Robotics Software Engineer",
+              "detail_url": "https://example.invalid/moka/jobs/moka-001"
+            },
+            {
+              "job_id": "moka-002",
+              "title": "Embedded Systems Engineer",
+              "detail_url": "https://example.invalid/moka/jobs/moka-002"
+            }
+          ],
+          "steps": 5,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 210,
+          "estimated_output_tokens": 70
+        }
+      }
+    },
+    {
+      "case_id": "synthetic-beisen-detail-api",
+      "company": "Synthetic Beisen Works",
+      "platform": "beisen",
+      "source_url": "https://example.invalid/beisen/detail-api",
+      "frozen_at": "2026-08-19",
+      "observations": {
+        "page_shape": "category_cards_with_detail_api",
+        "detail_signal": "numeric_requisition_id",
+        "noise": "navigation_cards_are_not_jobs"
+      },
+      "retrieval_evidence": [
+        {
+          "source_ref": "fixture://knowledge/beisen-detail-api",
+          "content": "Beisen category cards require a detail request per requisition ID; navigation cards are not job rows."
+        }
+      ],
+      "ground_truth": {
+        "status": "connected",
+        "jobs": [
+          {
+            "job_id": "beisen-101",
+            "title": "C++ Platform Engineer",
+            "detail_url": "https://example.invalid/beisen/jobs/beisen-101"
+          },
+          {
+            "job_id": "beisen-102",
+            "title": "Computer Vision Engineer",
+            "detail_url": "https://example.invalid/beisen/jobs/beisen-102"
+          },
+          {
+            "job_id": "beisen-103",
+            "title": "Test Development Engineer",
+            "detail_url": "https://example.invalid/beisen/jobs/beisen-103"
+          }
+        ]
+      },
+      "synthetic_runs": {
+        "baseline": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "beisen-101",
+              "title": "C++ Platform Engineer",
+              "detail_url": "https://example.invalid/beisen/jobs/beisen-101"
+            },
+            {
+              "job_id": "beisen-102",
+              "title": "Computer Vision Engineer",
+              "detail_url": "https://example.invalid/beisen/jobs/beisen-102"
+            }
+          ],
+          "steps": 10,
+          "manual_interventions": 1,
+          "estimated_input_tokens": 340,
+          "estimated_output_tokens": 100
+        },
+        "rag": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "beisen-101",
+              "title": "C++ Platform Engineer",
+              "detail_url": "https://example.invalid/beisen/jobs/beisen-101"
+            },
+            {
+              "job_id": "beisen-102",
+              "title": "Computer Vision Engineer",
+              "detail_url": "https://example.invalid/beisen/jobs/beisen-102"
+            },
+            {
+              "job_id": "beisen-103",
+              "title": "Test Development Engineer",
+              "detail_url": "https://example.invalid/beisen/jobs/beisen-103"
+            }
+          ],
+          "steps": 6,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 230,
+          "estimated_output_tokens": 80
+        }
+      }
+    },
+    {
+      "case_id": "synthetic-spa-network-json",
+      "company": "Synthetic SPA Systems",
+      "platform": "custom-spa",
+      "source_url": "https://example.invalid/spa/network-json",
+      "frozen_at": "2026-08-19",
+      "observations": {
+        "page_shape": "javascript_shell",
+        "listing_signal": "network_json_payload",
+        "detail_signal": "slug_and_id"
+      },
+      "retrieval_evidence": [
+        {
+          "source_ref": "fixture://knowledge/spa-network-json",
+          "content": "For this SPA, inspect the read-only JSON listing payload before attempting DOM selectors."
+        }
+      ],
+      "ground_truth": {
+        "status": "connected",
+        "jobs": [
+          {
+            "job_id": "spa-201",
+            "title": "Data Infrastructure Engineer",
+            "detail_url": "https://example.invalid/spa/jobs/spa-201"
+          },
+          {
+            "job_id": "spa-202",
+            "title": "Frontend Infrastructure Engineer",
+            "detail_url": "https://example.invalid/spa/jobs/spa-202"
+          }
+        ]
+      },
+      "synthetic_runs": {
+        "baseline": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "spa-201",
+              "title": "Data Infrastructure Engineer",
+              "detail_url": "https://example.invalid/spa/jobs/spa-201"
+            },
+            {
+              "job_id": "spa-202",
+              "title": "Frontend Infrastructure Engineer",
+              "detail_url": "https://example.invalid/spa/jobs/spa-202"
+            }
+          ],
+          "steps": 9,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 310,
+          "estimated_output_tokens": 95
+        },
+        "rag": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "spa-201",
+              "title": "Data Infrastructure Engineer",
+              "detail_url": "https://example.invalid/spa/jobs/spa-201"
+            },
+            {
+              "job_id": "spa-202",
+              "title": "Frontend Infrastructure Engineer",
+              "detail_url": "https://example.invalid/spa/jobs/spa-202"
+            }
+          ],
+          "steps": 6,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 240,
+          "estimated_output_tokens": 75
+        }
+      }
+    },
+    {
+      "case_id": "synthetic-infinite-scroll",
+      "company": "Synthetic Infinite Scroll",
+      "platform": "custom-scroll",
+      "source_url": "https://example.invalid/custom/infinite-scroll",
+      "frozen_at": "2026-08-19",
+      "observations": {
+        "page_shape": "infinite_scroll",
+        "listing_signal": "cursor_in_next_page_link",
+        "risk": "partial_results_look_valid"
+      },
+      "retrieval_evidence": [
+        {
+          "source_ref": "fixture://knowledge/infinite-scroll",
+          "content": "Infinite-scroll fixtures need a cursor exhaustion check; a valid first batch is not a complete crawl."
+        }
+      ],
+      "ground_truth": {
+        "status": "connected",
+        "jobs": [
+          {
+            "job_id": "scroll-301",
+            "title": "Robotics Controls Engineer",
+            "detail_url": "https://example.invalid/custom/jobs/scroll-301"
+          },
+          {
+            "job_id": "scroll-302",
+            "title": "Motion Planning Engineer",
+            "detail_url": "https://example.invalid/custom/jobs/scroll-302"
+          },
+          {
+            "job_id": "scroll-303",
+            "title": "Perception Engineer",
+            "detail_url": "https://example.invalid/custom/jobs/scroll-303"
+          },
+          {
+            "job_id": "scroll-304",
+            "title": "Simulation Engineer",
+            "detail_url": "https://example.invalid/custom/jobs/scroll-304"
+          }
+        ]
+      },
+      "synthetic_runs": {
+        "baseline": {
+          "classification": "synthetic",
+          "status": "manual_required",
+          "jobs": [
+            {
+              "job_id": "scroll-301",
+              "title": "Robotics Controls Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/scroll-301"
+            },
+            {
+              "job_id": "scroll-302",
+              "title": "Motion Planning Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/scroll-302"
+            },
+            {
+              "job_id": "scroll-303",
+              "title": "Perception Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/scroll-303"
+            }
+          ],
+          "steps": 12,
+          "manual_interventions": 2,
+          "estimated_input_tokens": 420,
+          "estimated_output_tokens": 120
+        },
+        "rag": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "scroll-301",
+              "title": "Robotics Controls Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/scroll-301"
+            },
+            {
+              "job_id": "scroll-302",
+              "title": "Motion Planning Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/scroll-302"
+            },
+            {
+              "job_id": "scroll-303",
+              "title": "Perception Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/scroll-303"
+            },
+            {
+              "job_id": "scroll-304",
+              "title": "Simulation Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/scroll-304"
+            }
+          ],
+          "steps": 8,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 280,
+          "estimated_output_tokens": 95
+        }
+      }
+    },
+    {
+      "case_id": "synthetic-misleading-navigation",
+      "company": "Synthetic Navigation Group",
+      "platform": "custom-navigation",
+      "source_url": "https://example.invalid/custom/misleading-navigation",
+      "frozen_at": "2026-08-19",
+      "observations": {
+        "page_shape": "navigation_heavy",
+        "listing_signal": "category_links_without_rows",
+        "risk": "product_navigation_must_not_be_treated_as_jobs"
+      },
+      "retrieval_evidence": [
+        {
+          "source_ref": "fixture://knowledge/misleading-navigation",
+          "content": "Navigation and product category links are not job records; require a job-shaped row and detail evidence."
+        }
+      ],
+      "ground_truth": {
+        "status": "connected",
+        "jobs": [
+          {
+            "job_id": "nav-401",
+            "title": "Cloud Platform Engineer",
+            "detail_url": "https://example.invalid/custom/jobs/nav-401"
+          },
+          {
+            "job_id": "nav-402",
+            "title": "Security Automation Engineer",
+            "detail_url": "https://example.invalid/custom/jobs/nav-402"
+          }
+        ]
+      },
+      "synthetic_runs": {
+        "baseline": {
+          "classification": "synthetic",
+          "status": "failed",
+          "jobs": [],
+          "steps": 7,
+          "manual_interventions": 1,
+          "estimated_input_tokens": 300,
+          "estimated_output_tokens": 55
+        },
+        "rag": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "nav-401",
+              "title": "Cloud Platform Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/nav-401"
+            },
+            {
+              "job_id": "nav-402",
+              "title": "Security Automation Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/nav-402"
+            }
+          ],
+          "steps": 6,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 220,
+          "estimated_output_tokens": 75
+        }
+      }
+    },
+    {
+      "case_id": "synthetic-auth-gated-fallback",
+      "company": "Synthetic Auth Gate",
+      "platform": "custom-auth",
+      "source_url": "https://example.invalid/custom/auth-gated-fallback",
+      "frozen_at": "2026-08-19",
+      "observations": {
+        "page_shape": "public_shell_with_authenticated_fallback",
+        "listing_signal": "embedded_public_job_summary",
+        "risk": "do_not_attempt_credentialed_write"
+      },
+      "retrieval_evidence": [
+        {
+          "source_ref": "fixture://knowledge/auth-gated-fallback",
+          "content": "Use the public read-only job summary when available and stop before credentialed actions."
+        }
+      ],
+      "ground_truth": {
+        "status": "connected",
+        "jobs": [
+          {
+            "job_id": "auth-501",
+            "title": "Developer Tools Engineer",
+            "detail_url": "https://example.invalid/custom/jobs/auth-501"
+          }
+        ]
+      },
+      "synthetic_runs": {
+        "baseline": {
+          "classification": "synthetic",
+          "status": "manual_required",
+          "jobs": [],
+          "steps": 4,
+          "manual_interventions": 1,
+          "estimated_input_tokens": 180,
+          "estimated_output_tokens": 40
+        },
+        "rag": {
+          "classification": "synthetic",
+          "status": "connected",
+          "jobs": [
+            {
+              "job_id": "auth-501",
+              "title": "Developer Tools Engineer",
+              "detail_url": "https://example.invalid/custom/jobs/auth-501"
+            }
+          ],
+          "steps": 3,
+          "manual_interventions": 0,
+          "estimated_input_tokens": 160,
+          "estimated_output_tokens": 50
+        }
+      }
+    }
+  ]
+}

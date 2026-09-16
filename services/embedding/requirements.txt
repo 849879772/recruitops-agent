@@ -1,0 +1,7 @@
+# Install CUDA torch separately using the index documented in QWEN_EMBEDDING.md.
+torch==2.8.0
+sentence-transformers>=5.1,<6
+transformers>=4.51,<5
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-dotenv>=1,<2

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>RecruitOps Agent</title>
+  </head>
+  <body>
+    <main>
+      <h1>RecruitOps Agent</h1>
+      <button id="authorize" type="button">授权并读取当前标签页</button>
+      <section aria-labelledby="application-capture-title">
+        <h2 id="application-capture-title">记录当前岗位</h2>
+        <label for="capture-job-id">岗位 ID（同页多岗位时填写）</label>
+        <input id="capture-job-id" type="text" maxlength="200" autocomplete="off" spellcheck="false">
+        <label for="capture-note">备注（可选）</label>
+        <textarea id="capture-note" maxlength="1000" rows="3"></textarea>
+        <button id="capture-application" type="button">记录已投递</button>
+      </section>
+      <button id="open-options" type="button">配置本机 API</button>
+      <p id="status" role="status">尚未读取页面。</p>
+    </main>
+    <script src="src/protocol.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

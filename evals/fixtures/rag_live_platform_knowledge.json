@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "description": "Company-neutral crawler selection knowledge. It contains platform patterns, not holdout company names or expected outcomes.",
+  "documents": [
+    {
+      "id": "platform-beisen",
+      "source": "crawler_recipe",
+      "source_ref": "approved://crawler-platform/beisen",
+      "content": "北森招聘平台通常使用企业独立的 zhiye.com 子域名。校园招聘入口常见路径为 /campus、/Campus、/campus/jobs 或首页再进入 campus。对此类可分页职位站选择 beisen crawler；不要把 portal-oss.zhiye.com 的活动说明文档当作岗位列表。",
+      "metadata": {"domain": "crawler", "platform": "beisen", "trust": "approved"}
+    },
+    {
+      "id": "platform-generic-render",
+      "source": "crawler_recipe",
+      "source_ref": "approved://crawler-platform/render",
+      "content": "只有在页面确实包含重复岗位卡片、具体岗位链接并且依赖 JavaScript 渲染，同时没有已知 ATS 专用适配器时，才选择 render crawler。公司介绍、新闻、招聘概览和单个公告不满足岗位列表验收条件。",
+      "metadata": {"domain": "crawler", "platform": "render", "trust": "approved"}
+    },
+    {
+      "id": "platform-static-html",
+      "source": "crawler_recipe",
+      "source_ref": "approved://crawler-platform/static-html",
+      "content": "static_html 仅适用于服务端 HTML 中直接出现多个真实岗位标题和各自详情链接的官方列表。导航项、业务介绍、岗位类别卡片、二维码或联系方式不能作为岗位行。",
+      "metadata": {"domain": "crawler", "platform": "static_html", "trust": "approved"}
+    },
+    {
+      "id": "platform-manual-required",
+      "source": "crawler_knowledge",
+      "source_ref": "approved://crawler-platform/manual-required",
+      "content": "当 URL 是 about-us、human-resources、news、活动概览、微信公众号文章、问卷或仅展示“校园招聘更多”导航而没有可分页岗位列表时，必须返回 manual_required，继续寻找实际岗位入口。不得为了返回结果而用通用 crawler 把导航或宣传文字当岗位。",
+      "metadata": {"domain": "crawler", "platform": "manual_required", "trust": "approved"}
+    }
+  ]
+}

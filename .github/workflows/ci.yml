@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]" PyYAML
+
+      - name: Run pytest
+        run: python -m pytest -c pytest-public.ini
+
+      - name: Compile Python sources
+        run: python -m compileall -q apps packages evals scripts
+
+      - name: Run frozen evaluation
+        run: python -m evals.mvp_runner
+
+      - name: Run frozen RAG evaluation
+        run: python -m evals.rag_runner
+
+      - name: Check migrations without a database
+        run: python scripts/check_migrations.py
+
+      - name: Build runtime image
+        run: docker build --tag recruitops-agent-ci .

@@ -1,0 +1,546 @@
+{
+  "fixture_version": "entry-discovery-36-v1",
+  "source_config_path": "config/companies.yaml",
+  "companies": [
+    {
+      "id": "oc-13e53fe093918339",
+      "name": "中际旭创",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://zj-innolight.jobs.feishu.cn/300308",
+      "crawler": "feishu",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-13e53fe093918339",
+      "recruitment_unit_name": "中际旭创",
+      "organization_id": "org-177c51be077f5a10",
+      "cohort": "debug"
+    },
+    {
+      "id": "oc-32b82c0fa49b2a78",
+      "name": "亦方创新",
+      "industries": [
+        "智能硬件/机器人"
+      ],
+      "careers_url": "https://acnri4vb8c0j.jobs.feishu.cn/779347/",
+      "crawler": "feishu",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-32b82c0fa49b2a78",
+      "recruitment_unit_name": "亦方创新",
+      "organization_id": "org-9f2ba5c02064a06a",
+      "cohort": "debug"
+    },
+    {
+      "id": "oc-e90f3c58418ec21c",
+      "name": "华为制造部",
+      "industries": [
+        "软件技术"
+      ],
+      "careers_url": "https://career.huawei.com/cn",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-e90f3c58418ec21c",
+      "recruitment_unit_name": "华为制造部",
+      "organization_id": "org-0f42ae6e8051b975",
+      "cohort": "debug"
+    },
+    {
+      "id": "oc-c4c52d34d1cecbd4",
+      "name": "华沿机器人",
+      "industries": [
+        "机器人"
+      ],
+      "careers_url": "https://oa.huayan-robotics.com:20600/sp/ebdfpage/distribute/freepass/tt33qh60n5/1169444931071361026?inviter=1118319951235899395",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-c4c52d34d1cecbd4",
+      "recruitment_unit_name": "华沿机器人",
+      "organization_id": "org-5af9a4463085a827",
+      "cohort": "debug"
+    },
+    {
+      "id": "oc-00efc862d94d77ac",
+      "name": "嘉为科技",
+      "industries": [
+        "互联网"
+      ],
+      "careers_url": "https://canway.m.zhiye.com/#/jobs?jc=2",
+      "crawler": "beisen",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-00efc862d94d77ac",
+      "recruitment_unit_name": "嘉为科技",
+      "organization_id": "org-fcd2c059c77c188d",
+      "cohort": "debug"
+    },
+    {
+      "id": "oc-321683cb98cacf47",
+      "name": "姚记科技",
+      "industries": [
+        "互联网,游戏"
+      ],
+      "careers_url": "https://zhaopin.yaoji.cn/?employmentType=",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-321683cb98cacf47",
+      "recruitment_unit_name": "姚记科技",
+      "organization_id": "org-14b02ae4b088bc01",
+      "cohort": "debug"
+    },
+    {
+      "id": "oc-30ddc56ec5321e1d",
+      "name": "字节跳动-AI产品经理早鸟通道",
+      "industries": [
+        "互联网/人工智能"
+      ],
+      "careers_url": "https://wj.toutiao.com/q/v2/7657509120173735979/975xOc70/4d7d/#/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-30ddc56ec5321e1d",
+      "recruitment_unit_name": "字节跳动-AI产品经理早鸟通道",
+      "organization_id": "org-c909143ed4050ee6",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-ec5d39105928a78a",
+      "name": "安世博集团",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://www.acepowerenergy.com/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-ec5d39105928a78a",
+      "recruitment_unit_name": "安世博集团",
+      "organization_id": "org-09ef6a1e93c5c54b",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-f2295136118ef94d",
+      "name": "宏茂微电子",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://young.yingjiesheng.com/xyzlogin?ctmid=b902c501-931b-43ad-9b9b-6797e07dc5c7&ehirejobid=&jumpurl=https%3A%2F%2Fxyz.51job.com%2FExternal%2FOthers%2FLogin51.aspx%3FCtmID%3Db902c501-931b-43ad-9b9b-6797e07dc5c7%26prd%3D%26prp%3D%26cd%3D%26cp%3D%26ruid%3D%26backurl%3D%26auid%3D%26uuid%3D%26partner%3D",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-f2295136118ef94d",
+      "recruitment_unit_name": "宏茂微电子",
+      "organization_id": "org-edfa4522cbfddc3f",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-e95e1d35ccb0f646",
+      "name": "宝时得",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://positec.hotjob.cn/",
+      "crawler": "hotjob",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-e95e1d35ccb0f646",
+      "recruitment_unit_name": "宝时得",
+      "organization_id": "org-20462da0350496bc",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-83212af7a1359780",
+      "name": "平行线教育",
+      "industries": [
+        "互联网,教育"
+      ],
+      "careers_url": "https://bsurl.cn/v2/h63Yubiv",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-83212af7a1359780",
+      "recruitment_unit_name": "平行线教育",
+      "organization_id": "org-01b8b65ea327f502",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-7a9d3d56cc8bc0fd",
+      "name": "开沃集团",
+      "industries": [
+        "新能源"
+      ],
+      "careers_url": "https://f.kdocs.cn/ksform/w/write/bVbaegHz",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-7a9d3d56cc8bc0fd",
+      "recruitment_unit_name": "开沃集团",
+      "organization_id": "org-a31b3785f13049f1",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-1e2985296defdc41",
+      "name": "微派网络",
+      "industries": [
+        "游戏"
+      ],
+      "careers_url": "https://wepie.jobs.feishu.cn/359597/",
+      "crawler": "feishu",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-1e2985296defdc41",
+      "recruitment_unit_name": "微派网络",
+      "organization_id": "org-23b5f8f939c75b73",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-230d1cc4ff4266bb",
+      "name": "思特奇",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://xyzp.myyule.com/#/recruit/recruitList",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-230d1cc4ff4266bb",
+      "recruitment_unit_name": "思特奇",
+      "organization_id": "org-973a6efe595361eb",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-24b359e94160ab4a",
+      "name": "惠科股份",
+      "industries": [
+        "科技,其他"
+      ],
+      "careers_url": "http://joinus.hkcqjy.com.cn/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-24b359e94160ab4a",
+      "recruitment_unit_name": "惠科股份",
+      "organization_id": "org-f92aac41d3679360",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-a42a83b3f58bc8fb",
+      "name": "新意科技",
+      "industries": [
+        "互联网/人工智能"
+      ],
+      "careers_url": "https://www.shinetechnology.com/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-a42a83b3f58bc8fb",
+      "recruitment_unit_name": "新意科技",
+      "organization_id": "org-3d315818129b09d1",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-84fe69ef8b63524a",
+      "name": "昂科技术",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://young.yingjiesheng.com/xyzlogin?ctmid=F397D7DA-CD05-491F-8ADA-5686C729CC2B&ehirejobid=&jumpurl=httpsxyz.51job.comconsumerpcresumeindexctmid8931993prdmp.weixin.qq.comprpcdxyz.51job.comcpruidbackurlauiduuidpartner",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-84fe69ef8b63524a",
+      "recruitment_unit_name": "昂科技术",
+      "organization_id": "org-fa30d35af33b240f",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-f74bfabf9c8ab616",
+      "name": "杰克科技",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://chinajack.m.zhiye.com/#/",
+      "crawler": "beisen",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-f74bfabf9c8ab616",
+      "recruitment_unit_name": "杰克科技",
+      "organization_id": "org-77c91310f2b2a1cd",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-31253cea7385b006",
+      "name": "杰理科技",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://test03.jieliapp.com/health/web/jieli/resume/fillin",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-31253cea7385b006",
+      "recruitment_unit_name": "杰理科技",
+      "organization_id": "org-5c7b9b86eb4d9055",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-f4275e1704e402d9",
+      "name": "格科",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://gcoreinc.hotjob.cn/",
+      "crawler": "hotjob",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-f4275e1704e402d9",
+      "recruitment_unit_name": "格科",
+      "organization_id": "org-a14d0fa3c75c3614",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-db09b0e98a3b1630",
+      "name": "楚能汽车技术研发中心",
+      "industries": [
+        "新能源"
+      ],
+      "careers_url": "https://register.cornexauto.com/#/schoolFormPage?data=S25OSE16WVlERnIxb3JPMmhpbi9rS0RvcjRFeVFJb2Y3TWtVYThzTXdIcW9pUUw5VnJYdHhpMlZqaFErVlNUSA&t=0.1724462039520558",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-db09b0e98a3b1630",
+      "recruitment_unit_name": "楚能汽车技术研发中心",
+      "organization_id": "org-1ddb6afe76d0bacc",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-71b8328781c8a2ce",
+      "name": "正浩EcoFlow",
+      "industries": [
+        "新能源,科技"
+      ],
+      "careers_url": "https://jobs.ecoflow.com/602892/position/list?keywords=&category=&location=&project=7660773517268699430&type=&job_hot_flag=\u00a4t=1&limit=10&functionCategory=&tag=",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-71b8328781c8a2ce",
+      "recruitment_unit_name": "正浩EcoFlow",
+      "organization_id": "org-45dbca1375466db1",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-2097a5e8c86f1daa",
+      "name": "永新光学",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://www.wenjuan.com/s/AvmqYjO/?is=qrcode",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-2097a5e8c86f1daa",
+      "recruitment_unit_name": "永新光学",
+      "organization_id": "org-f88f1e35f7469a11",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-450c4aba382eac67",
+      "name": "沛睿微电子",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://www.raymx-micro.com/Home/Position",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-450c4aba382eac67",
+      "recruitment_unit_name": "沛睿微电子",
+      "organization_id": "org-ada87d6462fd3acd",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-9d7976cd2585ba3a",
+      "name": "法睿兰达",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "http://www.fairylandtech.com/personnel.html#c_grid-1649416843917",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-9d7976cd2585ba3a",
+      "recruitment_unit_name": "法睿兰达",
+      "organization_id": "org-bc88b88e32d0057c",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-c1c3d2b1ff84f295",
+      "name": "瀚海聚能",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://www.hhmax-energy.com/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-c1c3d2b1ff84f295",
+      "recruitment_unit_name": "瀚海聚能",
+      "organization_id": "org-06f69840743c2af9",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-d6d67e425ac4c537",
+      "name": "福耀集团",
+      "industries": [
+        "其他,新能源"
+      ],
+      "careers_url": "https://job.fuyaogroup.com/fuyao/position/index?projectId=6a752162d3d9c2792c84e535&recruitmentType=CAMPUSRECRUITMENT",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-d6d67e425ac4c537",
+      "recruitment_unit_name": "福耀集团",
+      "organization_id": "org-dbe6800a8ed5b79a",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-88eb88e725ec321a",
+      "name": "红茶移动",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://talentsphere.redteamobile.com/submit-resume",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-88eb88e725ec321a",
+      "recruitment_unit_name": "红茶移动",
+      "organization_id": "org-9fbdefc955631491",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-64ef99c3c709a5ed",
+      "name": "美象信息",
+      "industries": [
+        "互联网/人工智能"
+      ],
+      "careers_url": "https://www.meixxx.com/post",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-64ef99c3c709a5ed",
+      "recruitment_unit_name": "美象信息",
+      "organization_id": "org-87d970016dbfbbdc",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-12dab72ff681343e",
+      "name": "联域股份",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "http://recruit.snc-lighting.com:5173/#/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-12dab72ff681343e",
+      "recruitment_unit_name": "联域股份",
+      "organization_id": "org-e5bfb20b6de8b026",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-f6bd6fc738bc2d9c",
+      "name": "英集芯科技",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "http://job.injoinic.com/schedule.html",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-f6bd6fc738bc2d9c",
+      "recruitment_unit_name": "英集芯科技",
+      "organization_id": "org-ddeac5d2a10b4009",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-9d07858aab4ef33c",
+      "name": "蓝箭航天",
+      "industries": [
+        "高端装备与国防科技/航空航天"
+      ],
+      "careers_url": "https://uq1h428xyc.jobs.feishu.cn/522146/?spread=TSSQ2FT",
+      "crawler": "feishu",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-9d07858aab4ef33c",
+      "recruitment_unit_name": "蓝箭航天",
+      "organization_id": "org-51531a08c9683810",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-08b16af55953e557",
+      "name": "虹科",
+      "industries": [
+        "科技"
+      ],
+      "careers_url": "https://job.hkaco.com/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-08b16af55953e557",
+      "recruitment_unit_name": "虹科",
+      "organization_id": "org-297043b0f587c0b1",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-fd8451825c253bee",
+      "name": "超星集团",
+      "industries": [
+        "互联网,教育"
+      ],
+      "careers_url": "https://office.chaoxing.com/apps/forms/web/apply.html?mappId=20830777&openid=&id=3506323&enc=e33beb1ece876d01195257eaf2b4411e&formAppId=&fidEnc=e1415bf352644bc0&userLoginInfo=userInfodeptId329906id6460563inserttime1618813515000mobileuid173679788unameupdatetime1726649085000&defaultUid=173679788&uuid=db8b5c33c8c3447dba081db3321a4e49",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-fd8451825c253bee",
+      "recruitment_unit_name": "超星集团",
+      "organization_id": "org-1fbbf5c490dba509",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-b911707bb6c0c9e4",
+      "name": "远峰科技",
+      "industries": [
+        "新能源"
+      ],
+      "careers_url": "https://yftech2012.jobs.feishu.cn/659526/m/?spread=MM41RWW",
+      "crawler": "feishu",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-b911707bb6c0c9e4",
+      "recruitment_unit_name": "远峰科技",
+      "organization_id": "org-01db8c05cdd1a049",
+      "cohort": "acceptance"
+    },
+    {
+      "id": "oc-327b10b2537a8ff2",
+      "name": "麦吉太文",
+      "industries": [
+        "互联网/人工智能"
+      ],
+      "careers_url": "https://campus.magictavern.com/",
+      "crawler": "render",
+      "integration_status": "not_connected",
+      "integration_note": "OC-only catalog: recruitment_entry_discovery_required",
+      "recruitment_unit_id": "oc-327b10b2537a8ff2",
+      "recruitment_unit_name": "麦吉太文",
+      "organization_id": "org-b9a97b93addf63c1",
+      "cohort": "acceptance"
+    }
+  ]
+}

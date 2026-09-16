@@ -1,0 +1,18 @@
+# Source-only refresh. Dependency or runtime changes require the main Dockerfile.
+ARG BASE_IMAGE=recruitops-agent-api:latest
+FROM ${BASE_IMAGE}
+USER root
+COPY pyproject.toml /tmp/recruitops-pyproject.toml
+RUN python -c "from pathlib import Path; assert Path('/app/pyproject.toml').read_bytes() == Path('/tmp/recruitops-pyproject.toml').read_bytes(), 'Dependencies changed; use the main Dockerfile'"
+WORKDIR /app
+# Replace packaged source so deleted modules cannot survive a source-only refresh.
+RUN rm -rf /app/packages /app/apps /app/scripts /app/.agents
+COPY --chown=app:app packages ./packages
+COPY --chown=app:app apps ./apps
+COPY --chown=app:app scripts ./scripts
+COPY --chown=app:app migrations ./migrations
+COPY --chown=app:app .agents ./.agents
+COPY --chown=app:app AGENTS.md ./AGENTS.md
+COPY --chown=app:app README.md ./README.md
+COPY --chown=app:app docs/ARTIFACT_VERSIONS.json ./docs/ARTIFACT_VERSIONS.json
+USER app

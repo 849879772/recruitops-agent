@@ -1,0 +1,31 @@
+{
+  "fixture_id": "rag-live-platform-diverse-holdout-20260830",
+  "frozen_at": "2026-08-30",
+  "description": "A second official-URL holdout covering Beisen, Feishu and legacy Hotjob. The failed Hotjob extraction remains in the fixture instead of being removed after observation.",
+  "cases": [
+    {
+      "case_id": "holdout-picc",
+      "company": "中国人民保险集团",
+      "source_url": "https://picc.zhiye.com/xiaoyuan",
+      "expected_crawler": "beisen",
+      "minimum_jobs": 1,
+      "source_ref": "official 2027 campus application URL"
+    },
+    {
+      "case_id": "holdout-dcar",
+      "company": "懂车帝",
+      "source_url": "https://dcar.jobs.feishu.cn/s/woMOBmRjL9o",
+      "expected_crawler": "feishu",
+      "minimum_jobs": 1,
+      "source_ref": "official campus referral URL"
+    },
+    {
+      "case_id": "holdout-ctsec-legacy-hotjob",
+      "company": "财通证券",
+      "source_url": "https://www.hotjob.cn/wt/CT/web/index?brandCode=1",
+      "expected_crawler": "hotjob",
+      "minimum_jobs": 1,
+      "source_ref": "official legacy Hotjob campus entry"
+    }
+  ]
+}

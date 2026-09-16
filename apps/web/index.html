@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f2f7ff">
+    <title>秋招工作台 | RecruitOps Agent</title>
+    <link rel="stylesheet" href="./styles.css?v=0.4.20-20260915">
+    <script defer src="./app.js?v=0.4.20-20260915"></script>
+    <script defer src="./company-sources.js?v=0.4.20-20260915"></script>
+    <script defer src="./configuration.js?v=0.4.20-20260915"></script>
+    <script defer src="./knowledge.js?v=0.4.20-20260915"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="主导航">
+        <div class="brand-block">
+          <div class="brand-mark" aria-hidden="true">R</div>
+          <div>
+            <p class="brand-name">秋招工作台</p>
+            <p class="brand-caption">发现机会，稳步推进</p>
+          </div>
+        </div>
+
+        <nav class="primary-nav" aria-label="工作台导航">
+          <button class="nav-item" type="button" data-view="configuration"><span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M4 7h16M4 17h16"></path><circle cx="8" cy="7" r="3" fill="white"></circle><circle cx="16" cy="17" r="3" fill="white"></circle></svg></span><span>配置</span></button>
+          <p class="nav-group-label">发现</p>
+          <button class="nav-item is-active" type="button" data-view="jobs" data-job-nav-mode="all">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2"></rect><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></span>
+            <span>27届校招</span>
+            <span class="nav-count" id="nav-job-count">—</span>
+          </button>
+          <button class="nav-item" type="button" data-view="companies">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21V4h10v17M14 9h6v12M8 8h2M8 12h2M8 16h2M17 13h1M17 17h1"></path></svg></span>
+            <span>公司</span>
+          </button>
+
+          <p class="nav-group-label">我的</p>
+          <button class="nav-item" type="button" data-view="assistant">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H8l-4 4z"></path></svg></span>
+            <span>求职助理</span>
+          </button>
+          <button class="nav-item" type="button" data-view="knowledge">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 7v14m-9-3V3h6a3 3 0 0 1 3 3 3 3 0 0 1 3-3h6v15h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3H3Z"></path></svg></span><span>个人知识库</span>
+          </button>
+          <button class="nav-item" type="button" data-view="applications">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 12h6M9 16h6"></path></svg></span>
+            <span>投递记录</span>
+            <span class="nav-count" id="nav-application-count">—</span>
+          </button>
+          <button class="nav-item" type="button" data-view="schedule">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg></span>
+            <span>日程安排</span>
+            <span class="nav-count" id="nav-schedule-count">—</span>
+          </button>
+          <button class="nav-item" type="button" data-view="automations">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="7"></circle><path d="M12 13V9M9 3h6M12 3v3"></path></svg></span>
+            <span>定时任务</span>
+            <span class="nav-count" id="nav-automation-count">—</span>
+          </button>
+          <button class="nav-item" type="button" data-view="mail">
+            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path></svg></span>
+            <span>招聘邮箱</span>
+            <span class="nav-count" id="nav-mail-count">—</span>
+          </button>
+        </nav>
+
+        <details class="system-nav">
+          <summary><span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"></path></svg></span><span>系统</span></summary>
+          <div class="system-nav-items">
+            <button class="nav-item" type="button" data-view="approvals">
+              <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6zM9 12l2 2 4-4"></path></svg></span>
+              <span>待确认事项</span>
+              <span class="nav-count" id="nav-approval-count">—</span>
+            </button>
+            <button class="nav-item" type="button" data-view="tasks">
+              <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6h14M5 12h14M5 18h14"></path></svg></span>
+              <span>运行记录</span>
+              <span class="nav-count" id="nav-task-count">0</span>
+            </button>
+            <button class="nav-item" type="button" data-view="integrations">
+              <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a4 4 0 0 0 5.7.3l2-2a4 4 0 0 0-5.7-5.7l-1.1 1.1M14 11a4 4 0 0 0-5.7-.3l-2 2A4 4 0 0 0 12 18.4l1.1-1.1"></path></svg></span>
+              <span>数据接入</span>
+            </button>
+          </div>
+        </details>
+
+        <div class="sidebar-footer">
+          <div class="read-only-note">
+            <span class="status-dot status-dot--ok" aria-hidden="true"></span>
+            <span>本机服务</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-area">
+        <header class="topbar">
+          <div class="topbar-leading">
+            <button class="mobile-menu-button" id="mobile-menu-button" type="button" aria-label="打开导航" aria-expanded="false">
+              <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6h14M5 12h14M5 18h14"></path></svg>
+            </button>
+            <div>
+              <p class="eyebrow" id="page-eyebrow">岗位 / 2027 届</p>
+              <h1 id="page-title">27届校招</h1>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <span class="date-stamp" id="today-label">—</span>
+            <span class="api-status" id="global-status" data-state="loading">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="status-text">连接中</span>
+            </span>
+            <button class="icon-button" id="refresh-button" type="button" aria-label="刷新数据" title="刷新数据">
+              <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="content-wrap">
+          <section class="view-panel" id="dashboard-view" data-view-panel="dashboard" aria-labelledby="dashboard-heading" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">今天要处理的事情</p>
+                <h2 id="dashboard-heading">今日工作台</h2>
+              </div>
+              <div class="section-actions">
+                <button class="button button--secondary" type="button" data-open-view="assistant">
+                  <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"></path></svg>
+                  问求职助理
+                </button>
+                <button class="button button--ghost" type="button" data-open-view="jobs">浏览全部岗位</button>
+              </div>
+            </div>
+
+            <div class="metric-grid" id="summary-metrics" aria-label="今日摘要">
+              <article class="metric-item">
+                <div class="metric-label"><span class="metric-bar metric-bar--teal" aria-hidden="true"></span>今日新增</div>
+                <strong class="metric-value" id="metric-new-jobs">—</strong>
+                <span class="metric-detail" id="metric-new-jobs-detail">加载中</span>
+              </article>
+              <article class="metric-item">
+                <div class="metric-label"><span class="metric-bar metric-bar--blue" aria-hidden="true"></span>日程</div>
+                <strong class="metric-value" id="metric-schedule">—</strong>
+                <span class="metric-detail" id="metric-schedule-detail">加载中</span>
+              </article>
+              <article class="metric-item">
+                <div class="metric-label"><span class="metric-bar metric-bar--amber" aria-hidden="true"></span>异常</div>
+                <strong class="metric-value" id="metric-anomalies">—</strong>
+                <span class="metric-detail" id="metric-anomalies-detail">等待检查</span>
+              </article>
+              <article class="metric-item">
+                <div class="metric-label"><span class="metric-bar metric-bar--rose" aria-hidden="true"></span>待审批</div>
+                <strong class="metric-value" id="metric-approvals">—</strong>
+                <span class="metric-detail" id="metric-approvals-detail">加载中</span>
+              </article>
+            </div>
+
+            <section class="workspace-section todo-section" aria-labelledby="todo-heading">
+              <div class="section-heading section-heading--compact">
+                <div>
+                  <p class="eyebrow">行动清单</p>
+                  <h3 id="todo-heading">今日待办</h3>
+                </div>
+                <span class="muted-label" id="today-todo-count">加载中</span>
+              </div>
+              <div class="todo-grid" id="today-todos" data-state="loading" aria-live="polite">
+                <div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div>
+              </div>
+            </section>
+
+            <div class="dashboard-grid">
+              <section class="workspace-section" aria-labelledby="schedule-heading">
+                <div class="section-heading section-heading--compact">
+                  <div>
+                    <p class="eyebrow">接下来</p>
+                    <h3 id="schedule-heading">今日安排</h3>
+                  </div>
+                  <button class="text-button" type="button" data-open-view="schedule">查看完整日程 <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></button>
+                </div>
+                <div class="data-list" id="today-schedule" data-state="loading">
+                  <div class="loading-rows" aria-label="加载中">
+                    <span></span><span></span><span></span>
+                  </div>
+                </div>
+              </section>
+
+              <section class="workspace-section" aria-labelledby="new-jobs-heading">
+                <div class="section-heading section-heading--compact">
+                  <div>
+                    <p class="eyebrow">岗位情报</p>
+                    <h3 id="new-jobs-heading">今日新增</h3>
+                  </div>
+                  <button class="text-button" type="button" data-task="today_new_jobs">交给助理筛选 <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></button>
+                </div>
+                <div class="data-list" id="today-new-jobs" data-state="loading">
+                  <div class="loading-rows" aria-label="加载中">
+                    <span></span><span></span><span></span>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div class="dashboard-grid dashboard-grid--lower">
+              <section class="workspace-section" aria-labelledby="anomalies-heading">
+                <div class="section-heading section-heading--compact">
+                  <div>
+                    <p class="eyebrow">需要留意</p>
+                    <h3 id="anomalies-heading">异常</h3>
+                  </div>
+                  <button class="text-button" type="button" data-open-view="integrations">查看接入 <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></button>
+                </div>
+                <div class="data-list" id="today-anomalies" data-state="loading">
+                  <div class="loading-rows loading-rows--short" aria-label="加载中"><span></span><span></span></div>
+                </div>
+              </section>
+
+              <section class="workspace-section" aria-labelledby="pending-heading">
+                <div class="section-heading section-heading--compact">
+                  <div>
+                    <p class="eyebrow">人工确认</p>
+                    <h3 id="pending-heading">待审批</h3>
+                  </div>
+                  <button class="text-button" type="button" data-open-view="approvals">打开审批中心 <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></button>
+                </div>
+                <div class="data-list" id="pending-approvals" data-state="loading">
+                  <div class="loading-rows loading-rows--short" aria-label="加载中"><span></span><span></span></div>
+                </div>
+              </section>
+            </div>
+
+            <section class="workspace-section activity-strip" aria-labelledby="activity-heading">
+              <div class="section-heading section-heading--compact">
+                <div>
+                  <p class="eyebrow">最近一次同步</p>
+                  <h3 id="activity-heading">运营状态</h3>
+                </div>
+                <span class="muted-label" id="last-sync-label">尚未同步</span>
+              </div>
+              <div class="status-summary" id="dashboard-status-summary">
+                <span class="status-dot status-dot--ok" aria-hidden="true"></span>
+                <span>正在读取招聘数据与审批状态</span>
+              </div>
+            </section>
+          </section>
+
+          <section class="view-panel is-visible" id="jobs-view" data-view-panel="jobs" aria-labelledby="jobs-heading">
+            <button class="text-button" id="jobs-back-button" type="button" hidden>返回原列表</button>
+            <div class="section-heading">
+              <div>
+                <h2 id="jobs-heading">27届校招岗位</h2>
+                <p class="section-description" id="jobs-page-description">已确认的正式批和提前批岗位，高匹配岗位优先展示。</p>
+              </div>
+              <div class="section-actions">
+                <div class="segmented-control" role="group" aria-label="岗位时间范围">
+                  <button class="segment-button is-active" type="button" data-job-mode="all">全部 27 届</button>
+                  <button class="segment-button" type="button" data-job-mode="today">今日新增</button>
+                </div>
+                <button class="icon-button" id="jobs-refresh-button" type="button" aria-label="刷新岗位" title="刷新岗位"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg></button>
+              </div>
+            </div>
+
+            <div class="source-note" role="note" aria-label="岗位数据来源">
+              <strong>数据来源</strong>
+              <span>公司发现来自 OfferBiu，岗位与评分读取 RecruitOps 本地 PostgreSQL；投递记录独立保留，不会实时读取原秋招系统。</span>
+            </div>
+
+            <div class="metric-grid jobs-metric-grid" aria-label="岗位摘要">
+              <article class="metric-item"><span class="metric-icon metric-icon--jobs" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"></rect><path d="M9 7V5h6v2M4 11h16M10 11v2h4v-2"></path></svg></span><div class="metric-label">岗位总数</div><strong class="metric-value" id="jobs-total">—</strong><span class="metric-detail">已确认 2027 届</span></article>
+              <article class="metric-item"><span class="metric-icon metric-icon--companies" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V6l8-3 8 3v14M9 20v-4h6v4M8 9h.01M12 9h.01M16 9h.01M8 12h.01M12 12h.01M16 12h.01"></path></svg></span><div class="metric-label">覆盖公司</div><strong class="metric-value" id="jobs-company-total">—</strong><span class="metric-detail">按集团归并</span></article>
+              <article class="metric-item"><span class="metric-icon metric-icon--match" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9L12 3Z"></path></svg></span><div class="metric-label">高匹配</div><strong class="metric-value" id="jobs-high-total">—</strong><span class="metric-detail">70 分及以上</span></article>
+              <article class="metric-item"><span class="metric-icon metric-icon--pending" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"></circle><path d="M12 7v5l3 2"></path></svg></span><div class="metric-label">待评分</div><strong class="metric-value" id="jobs-unscored-total">—</strong><span class="metric-detail" id="jobs-unscored-detail">已通过筛选</span></article>
+            </div>
+
+            <details class="workspace-section featured-jobs-section" aria-labelledby="featured-jobs-heading">
+              <summary class="featured-group-summary"><h3 id="featured-jobs-heading">高匹配岗位</h3><span class="muted-label" id="featured-jobs-count">加载中</span><span class="featured-group-hint">展开查看岗位与匹配分析</span></summary>
+              <div class="featured-job-list" id="featured-job-list" data-state="loading">
+                <div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div>
+              </div>
+            </details>
+
+            <section class="workspace-section jobs-browser" aria-labelledby="all-jobs-heading">
+              <div class="section-heading section-heading--compact">
+                <div><p class="eyebrow">搜索、筛选与分页</p><h3 id="all-jobs-heading">全部岗位</h3></div>
+                <span class="muted-label" id="jobs-result-count">加载中</span>
+              </div>
+              <form class="job-filter-bar" id="job-filter-form">
+                <label class="search-field" for="job-search"><span class="sr-only">搜索岗位</span><input id="job-search" type="search" placeholder="搜索公司、岗位或地点" autocomplete="off"></label>
+                <label><span class="sr-only">公司</span><select id="job-company-filter"><option value="">全部公司</option></select></label>
+                <label><span class="sr-only">岗位类型</span><select id="job-category-filter"><option value="">全部岗位类型</option></select></label>
+                <label><span class="sr-only">招聘平台</span><select id="job-platform-filter"><option value="">全部平台</option></select></label>
+                <label><span class="sr-only">评分状态</span><select id="job-evaluation-filter"><option value="">全部评分状态</option><option value="scored">已评分</option><option value="pending">待评分</option><option value="jd_incomplete">待补全 JD</option><option value="unscored">所有未评分</option></select></label>
+                <label><span class="sr-only">匹配分数</span><select id="job-score-filter"><option value="">不限分数</option><option value="high">70 分及以上</option><option value="medium">60 至 69 分</option><option value="low">60 分以下</option></select></label>
+                <label><span class="sr-only">排序方式</span><select id="job-sort"><option value="score">匹配度优先</option><option value="newest">最新发现</option><option value="company">按公司</option></select></label>
+                <button class="button button--ghost" id="job-filter-reset" type="reset">重置</button>
+              </form>
+              <div class="table-scroll" id="jobs-table-wrap" data-state="loading">
+                <table class="data-table jobs-table">
+                  <thead><tr><th>公司</th><th>岗位</th><th>匹配度</th><th>工作地点</th><th>平台</th><th>操作</th></tr></thead>
+                  <tbody id="jobs-table-body"><tr><td colspan="6"><div class="loading-rows" aria-label="加载中"><span></span><span></span></div></td></tr></tbody>
+                </table>
+              </div>
+              <div class="pager" aria-label="岗位分页">
+                <button class="button button--ghost" id="jobs-prev-button" type="button">上一页</button>
+                <span id="jobs-page-info">—</span>
+                <button class="button button--ghost" id="jobs-next-button" type="button">下一页</button>
+              </div>
+            </section>
+          </section>
+
+          <section class="view-panel" id="companies-view" data-view-panel="companies" aria-labelledby="companies-heading" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">2027 届岗位覆盖</p>
+                <h2 id="companies-heading">公司</h2>
+                <p class="section-description">查看全部来源公司，包括零岗位和失败记录，也可切换到已有岗位排行。</p>
+              </div>
+            </div>
+            <div class="company-browser-toolbar">
+              <label class="search-field" for="company-search"><span class="sr-only">搜索公司</span><input id="company-search" type="search" placeholder="搜索公司名称" autocomplete="off"></label>
+              <label><span class="sr-only">公司排序</span><select id="company-sort"><option value="score">平均匹配度</option><option value="jobs">岗位数量</option><option value="name">公司名称</option></select></label>
+            </div>
+            <section class="workspace-section" aria-labelledby="company-ranking-heading">
+              <div class="section-heading section-heading--compact"><div><p class="eyebrow">公司排行</p><h3 id="company-ranking-heading">当前开放公司</h3></div><span class="muted-label" id="company-ranking-count">加载中</span></div>
+              <div class="table-scroll">
+                <table class="data-table company-ranking-table">
+                  <thead><tr><th>公司</th><th>岗位数</th><th>平均匹配度</th><th>最高分</th><th>最高分岗位</th><th>官网</th></tr></thead>
+                  <tbody id="company-ranking-body"><tr><td colspan="6"><div class="loading-rows" aria-label="加载中"><span></span><span></span></div></td></tr></tbody>
+                </table>
+              </div>
+              <div class="pager"><button class="button button--ghost" id="companies-prev-button" type="button">上一页</button><span id="companies-page-info">—</span><button class="button button--ghost" id="companies-next-button" type="button">下一页</button></div>
+            </section>
+          </section>
+
+          <section class="view-panel" id="applications-view" data-view-panel="applications" aria-labelledby="applications-heading" hidden>
+            <div class="section-heading">
+              <div><h2 id="applications-heading">投递记录</h2><p class="section-description" id="application-page-description">步骤看所在列、卡面只看结果</p></div>
+              <div class="section-actions">
+                <button class="button button--secondary" type="button" data-assistant-prompt="记录一条新的库外投递，请先询问我公司、岗位和投递地址。">添加投递</button>
+                <button class="icon-button" id="applications-refresh-button" type="button" aria-label="刷新投递记录" title="刷新投递记录"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg></button>
+              </div>
+            </div>
+            <div class="application-summary" id="application-summary" aria-label="投递漏斗"></div>
+            <div class="application-kanban" id="application-kanban" data-state="loading"><div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div></div>
+          </section>
+
+          <section class="view-panel" id="schedule-view" data-view-panel="schedule" aria-labelledby="schedule-page-heading" hidden>
+            <div class="section-heading">
+              <div><p class="eyebrow">笔试、面试与截止</p><h2 id="schedule-page-heading">日程安排</h2><p class="section-description">按日期集中查看投递后的后续安排。</p></div>
+              <button class="button button--secondary" type="button" id="schedule-add-button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"></path></svg>添加日程</button>
+            </div>
+            <div class="schedule-toolbar">
+              <div class="segmented-control schedule-view-toggle" role="tablist" aria-label="日程视图">
+                <button class="segment-button is-active" type="button" role="tab" aria-selected="true" data-schedule-view="todo"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6h14M5 12h14M5 18h14"></path></svg>待办</button>
+                <button class="segment-button" type="button" role="tab" aria-selected="false" data-schedule-view="calendar"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>月历</button>
+              </div>
+              <label for="schedule-status-filter">状态</label>
+              <select id="schedule-status-filter">
+                <option value="pending" selected>待处理</option>
+                <option value="completed">已完成</option>
+                <option value="ignored">已忽略</option>
+                <option value="all">全部状态</option>
+              </select>
+              <label for="schedule-date-filter">查看日期</label>
+              <input id="schedule-date-filter" type="date">
+              <button class="button button--ghost" id="schedule-today-button" type="button">今天</button>
+              <button class="button button--ghost" id="schedule-all-button" type="button">全部</button>
+              <span class="muted-label" id="schedule-result-count">加载中</span>
+            </div>
+            <section class="workspace-section schedule-todo-view" id="schedule-todo-view" data-state="loading" aria-label="日程待办"><div class="loading-rows" aria-label="加载中"><span></span><span></span></div></section>
+            <section class="workspace-section schedule-calendar-view" id="schedule-calendar-view" data-state="loading" aria-label="日程月历" hidden>
+              <div class="schedule-calendar-toolbar">
+                <button class="icon-button icon-button--small" id="schedule-month-previous" type="button" title="上个月" aria-label="上个月"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"></path></svg></button>
+                <h3 id="schedule-calendar-month">日程月历</h3>
+                <button class="icon-button icon-button--small" id="schedule-month-next" type="button" title="下个月" aria-label="下个月"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></button>
+              </div>
+              <div class="schedule-calendar-weekdays" aria-hidden="true"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
+              <div class="schedule-calendar-grid" id="schedule-calendar-grid" data-state="loading"></div>
+              <section class="schedule-calendar-undated" id="schedule-calendar-undated" aria-label="未定日期事项" hidden></section>
+            </section>
+          </section>
+
+          <section class="view-panel" id="automations-view" data-view-panel="automations" aria-labelledby="automations-heading" hidden>
+            <section class="workspace-section" id="latest-crawl-report" aria-live="polite" hidden></section>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">本机持久化计划</p>
+                <h2 id="automations-heading">定时任务</h2>
+                <p class="section-description">由求职助理创建的每日任务会保存在这里，并在本机服务运行时按时执行。</p>
+              </div>
+              <div class="section-actions">
+                <button class="button button--secondary" type="button" data-assistant-prompt="请帮我设置一个定时任务，先询问任务内容和每天执行时间。">添加任务</button>
+                <button class="icon-button" id="automations-refresh-button" type="button" aria-label="刷新定时任务" title="刷新定时任务"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg></button>
+              </div>
+            </div>
+            <div class="automation-summary" aria-label="定时任务摘要">
+              <div><span>任务总数</span><strong id="automation-total-count">—</strong></div>
+              <div><span>正在运行</span><strong id="automation-active-count">—</strong></div>
+              <div><span>最近异常</span><strong id="automation-failed-count">—</strong></div>
+            </div>
+            <section class="workspace-section" aria-labelledby="automation-list-heading">
+              <div class="section-heading section-heading--compact">
+                <div><p class="eyebrow">执行计划</p><h3 id="automation-list-heading">本地任务</h3></div>
+                <span class="muted-label" id="automation-list-count">加载中</span>
+              </div>
+              <div class="automation-list" id="automation-list" data-state="loading">
+                <div class="loading-rows" aria-label="加载中"><span></span><span></span></div>
+              </div>
+            </section>
+          </section>
+
+          <section class="view-panel" id="configuration-view" data-view-panel="configuration" aria-labelledby="configuration-heading" hidden>
+            <div class="section-heading"><h2 id="configuration-heading">个人配置</h2><button class="button button--secondary" id="configuration-reload" type="button">重新读取</button></div>
+            <div id="configuration-message" role="status" aria-live="polite"></div>
+            <form id="configuration-form" class="configuration-form">
+              <fieldset><legend>DeepSeek V4.1 Flash</legend><div class="configuration-grid">
+                <label class="configuration-toggle"><input type="checkbox" name="llm_enabled">启用模型调用</label>
+                <label class="configuration-toggle"><input type="checkbox" name="job_analysis_enabled">抓取后自动评分</label>
+                <label class="configuration-toggle"><input type="checkbox" name="codex_runtime_enabled">启用求职助理</label>
+                <label>API 密钥<input name="llm_api_key" type="password" autocomplete="new-password"><span id="api-secret-state"></span></label>
+                <label>API 服务地址<input name="model_api_base_url" type="url" placeholder="https://api.deepseek.com" required></label>
+              </div></fieldset>
+              <fieldset><legend>简历与求职意向</legend><div class="configuration-grid">
+                <label>上传简历<input id="resume-upload" type="file" accept=".pdf,.txt,.md"></label>
+                <label>学历<input name="degree"></label>
+                <label>招聘类型<input name="job_type"></label>
+                <label>目标方向<input name="direction"></label>
+                <label>标题包含关键词<textarea name="title_keywords" rows="3" placeholder="每行一个；留空使用现有方向规则"></textarea></label>
+                <label>标题排除关键词<textarea name="excluded_title_keywords" rows="3" placeholder="每行一个；实习和博士岗位始终排除"></textarea></label>
+              </div>
+              <section id="resume-preview" hidden aria-label="简历解析确认">
+                <h3>确认简历资料</h3>
+                <div class="configuration-grid">
+                  <label>学历<input id="resume-degree"></label>
+                  <label>技能<textarea id="resume-skills" rows="4"></textarea></label>
+                  <label>工程栈<textarea id="resume-stack" rows="4"></textarea></label>
+                  <label>项目经历<textarea id="resume-projects" rows="4" readonly></textarea></label>
+                </div>
+                <details><summary>原文依据</summary><pre id="resume-evidence"></pre></details>
+                <div class="resume-actions"><button type="button" id="resume-confirm" class="button button--primary">确认替换旧简历资料</button><button type="button" id="resume-cancel" class="button">取消</button></div>
+              </section>
+              <details class="configuration-advanced"><summary>高级设置与简历原文</summary><div class="configuration-grid">
+                <label>技能<textarea name="skills" rows="3"></textarea></label>
+                <label>主要方向<textarea name="primary_directions" rows="3"></textarea></label>
+                <label>次要方向<textarea name="secondary_directions" rows="3"></textarea></label>
+                <label>工程栈证据<textarea name="supporting_skills" rows="3"></textarea></label>
+                <label>学习目标<textarea name="learning_targets" rows="3"></textarea></label>
+                <label>未经验证的技能<textarea name="unverified_skills" rows="3"></textarea></label>
+                <label class="configuration-wide">简历正文与项目经历<textarea name="project_evidence" rows="12" maxlength="60000"></textarea></label>
+              </div></details></fieldset>
+              <fieldset><legend>邮箱</legend><div class="configuration-grid">
+                <label class="configuration-toggle"><input type="checkbox" name="mail_enabled">启用邮箱同步</label>
+                <label>邮箱账号<input name="mail_imap_username" autocomplete="username"></label>
+                <label>IMAP 服务器<input name="mail_imap_host"></label>
+                <label>SSL 端口<input name="mail_imap_port" type="number" min="1" max="65535" required></label>
+                <label>邮箱授权码<input name="mail_imap_password" type="password" autocomplete="new-password"><span id="mail-secret-state"></span></label>
+                <label>邮件文件夹<input name="mail_imap_mailbox"></label>
+              </div></fieldset>
+              <button class="button button--primary" id="configuration-save" type="submit">保存配置</button>
+            </form>
+            <section class="workspace-section configuration-import"><div class="section-heading"><h3>投递记录导入</h3><button type="button" class="button button--secondary" id="application-import-template">下载 CSV 模板</button></div>
+              <label>CSV / JSON 文件<input id="application-import-file" type="file" accept=".csv,.json"></label>
+              <button type="button" class="button button--primary" id="application-import-submit">导入投递记录</button><p id="application-import-result" role="status"></p>
+            </section>
+          </section>
+
+          <section class="view-panel" id="knowledge-view" data-view-panel="knowledge" aria-labelledby="knowledge-heading" hidden>
+            <div class="section-heading"><h2 id="knowledge-heading">个人资料</h2><button class="button button--ghost" id="knowledge-refresh" type="button">刷新</button></div>
+            <form id="knowledge-import-form" class="knowledge-import">
+              <label>上传资料<input id="knowledge-file" type="file" accept=".md,.txt,.pdf"><small>Markdown / TXT / 文字版 PDF · 最大 5 MB</small></label>
+              <label>资料类型<select id="knowledge-kind"><option value="notes">学习笔记</option><option value="personal">个人经历材料</option><option value="reference">外部参考</option></select></label>
+              <label>名称<input id="knowledge-name" maxlength="240" placeholder="粘贴笔记时填写"></label>
+              <label class="knowledge-wide">粘贴笔记<textarea id="knowledge-text" rows="4" maxlength="100000"></textarea></label>
+              <div class="knowledge-wide knowledge-actions"><button class="button button--primary" id="knowledge-import" type="submit">导入</button><button class="button button--ghost" id="knowledge-cancel-edit" type="button" hidden>取消更新</button><span id="knowledge-model"></span></div>
+            </form>
+            <p id="knowledge-message" role="status" aria-live="polite"></p>
+            <div class="table-scroll"><table class="data-table knowledge-table"><thead><tr><th>资料</th><th>类型</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="knowledge-documents"></tbody></table></div>
+          </section>
+          <section class="view-panel agent-chat-view" id="assistant-view" data-view-panel="assistant" aria-labelledby="assistant-heading" hidden>
+            <div class="agent-workspace">
+              <aside class="conversation-rail" aria-label="历史会话">
+                <div class="conversation-rail-head">
+                  <div>
+                    <p class="eyebrow">会话</p>
+                    <h2 id="assistant-heading">求职助理</h2>
+                  </div>
+                  <button class="icon-button" id="new-conversation-button" type="button" title="新建会话" aria-label="新建会话"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"></path></svg></button>
+                </div>
+                 <div class="conversation-list" id="conversation-list" data-state="loading">
+                   <div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div>
+                 </div>
+                 <div class="conversation-list-controls" id="conversation-list-controls" hidden>
+                   <span class="conversation-list-status" id="conversation-list-status" role="status" aria-live="polite"></span>
+                   <button class="button button--ghost" id="conversation-load-more-button" type="button" hidden>加载更多</button>
+                 </div>
+                 <div class="conversation-rail-footer">
+                  <button class="button button--ghost" id="clear-conversation-button" type="button">删除当前会话</button>
+                </div>
+              </aside>
+
+              <section class="chat-pane" aria-labelledby="messages-heading">
+                <header class="chat-header">
+                  <div>
+                    <div class="chat-title-row">
+                      <h3 id="messages-heading">当前任务</h3>
+                      <span class="connection-label" id="assistant-message-status" aria-live="polite">等待提问</span>
+                    </div>
+                    <div class="context-chip-list" id="assistant-context-chips" aria-label="当前上下文"></div>
+                    <div class="codex-event-strip" id="assistant-codex-event-strip" role="status" aria-live="polite" aria-label="Codex 事件状态" hidden>
+                      <span class="codex-event-chip" data-codex-status="thread">thread · 未绑定</span>
+                      <span class="codex-event-chip" data-codex-status="turn">turn · 等待</span>
+                      <span class="codex-event-chip" data-codex-status="item">item · 等待</span>
+                      <span class="codex-event-chip" data-codex-status="tool">tool · 未报告</span>
+                      <span class="codex-event-chip" data-codex-status="progress">progress · 等待</span>
+                      <span class="codex-event-chip" data-codex-status="error">error · 无</span>
+                    </div>
+                  </div>
+                  <div class="chat-header-actions">
+                    <span class="context-policy-label" id="assistant-context-policy" title="长对话达到阈值后由 Codex Harness 自动压缩">上下文压缩已启用</span>
+                    <span class="conversation-thread-label" id="assistant-thread-label">新会话</span>
+                  </div>
+                </header>
+
+                <div class="message-list agent-message-list" id="assistant-messages" aria-live="polite" aria-relevant="additions" aria-atomic="false">
+                  <article class="message message--assistant">
+                    <div class="message-meta"><strong>求职助理</strong><span>待命</span></div>
+                    <p>今天想先看岗位、日程、招聘邮件，还是投递进度？</p>
+                  </article>
+                </div>
+
+                <div class="live-run" id="assistant-live-run" role="status" aria-live="polite" hidden>
+                  <span class="live-run-pulse" aria-hidden="true"></span>
+                  <div><strong id="assistant-live-label">等待 Codex 事件</strong><small id="assistant-live-detail">等待事件返回</small></div>
+                </div>
+
+                <form class="chat-composer" id="assistant-form" novalidate>
+                  <input id="assistant-job-id" name="job_id" type="hidden">
+                  <div class="knowledge-chat-context">
+                    <label class="knowledge-toggle"><input type="checkbox" id="assistant-knowledge-enabled">个人知识库</label>
+                    <select id="assistant-knowledge-document" aria-label="知识库资料范围"><option value="">全部资料</option></select>
+                    <span id="assistant-selected-job" hidden></span><button class="button button--ghost" id="assistant-clear-job" title="移除当前岗位" aria-label="移除当前岗位" type="button" hidden>×</button>
+                  </div>
+                  <label class="sr-only" for="assistant-message">向求职助理提问</label>
+                  <textarea class="assistant-message-input" id="assistant-message" name="message" rows="2" autocomplete="off" required aria-describedby="assistant-message-hint" placeholder="询问岗位、投递进度、邮箱或今天的安排"></textarea>
+                  <div class="composer-footer">
+                    <div class="assistant-intent" id="assistant-intent" role="status" aria-live="polite">
+                      <span class="status-dot status-dot--ok" aria-hidden="true"></span>
+                      <span id="assistant-message-hint">等待识别问题</span>
+                    </div>
+                    <div class="composer-actions">
+                      <button class="button button--ghost" id="assistant-stop-button" type="button" hidden>停止</button>
+                      <button class="button button--primary" id="run-task-button" type="submit" aria-label="发送问题">发送</button>
+                    </div>
+                  </div>
+                  <div class="inline-error" id="assistant-form-error" role="alert" hidden></div>
+                </form>
+              </section>
+
+              <aside class="assistant-context-panel" aria-label="任务上下文">
+                <section class="context-section">
+                  <div class="context-section-head"><p class="eyebrow">快捷入口</p><span>4</span></div>
+                  <div class="command-list" id="quick-questions">
+                    <button class="command-button" type="button" data-task="today_new_jobs" data-question="查看今日新增岗位"><strong>今日岗位</strong><span>已确认 2027 校招</span></button>
+                    <button class="command-button" type="button" data-task="today_schedule" data-question="查看今天的笔试和面试安排"><strong>今日日程</strong><span>笔试、面试与截止</span></button>
+                    <button class="command-button" type="button" data-task="application_status_review" data-question="复核官网投递状态"><strong>投递进度</strong><span>官网状态核验</span></button>
+                    <button class="command-button" type="button" data-task="recruitment_mail_search" data-question="查看最近的招聘邮件"><strong>招聘邮箱</strong><span>163 邮件情报</span></button>
+                  </div>
+                </section>
+                <section class="context-section">
+                  <div class="context-section-head"><p class="eyebrow">当前上下文</p><span id="context-field-count">0</span></div>
+                  <dl class="context-facts" id="assistant-context-panel">
+                    <div><dt>状态</dt><dd>尚未选择岗位或公司</dd></div>
+                  </dl>
+                </section>
+                <section class="context-section context-section--safety">
+                  <div class="safety-line"><span class="status-dot status-dot--ok" aria-hidden="true"></span><strong>审批边界已启用</strong></div>
+                  <button class="text-button" type="button" data-open-view="approvals">查看审批中心 <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></button>
+                  <button class="text-button" type="button" data-open-view="tasks">查看完整轨迹 <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></button>
+                </section>
+              </aside>
+            </div>
+
+          </section>
+
+          <section class="view-panel" id="tasks-view" data-view-panel="tasks" aria-labelledby="tasks-heading" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">可追溯执行</p>
+                <h2 id="tasks-heading">任务轨迹</h2>
+                <p class="section-description">保留任务计划、工具调用、耗时与安全停止原因。</p>
+              </div>
+              <button class="button button--secondary" type="button" id="traces-refresh-button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg>刷新轨迹</button>
+            </div>
+            <div class="tasks-layout">
+              <section class="workspace-section" aria-labelledby="task-history-heading">
+                <div class="section-heading section-heading--compact">
+                  <div><p class="eyebrow">本次会话</p><h3 id="task-history-heading">任务记录</h3></div>
+                  <span class="muted-label" id="task-history-count">0 条</span>
+                </div>
+                <div class="data-list" id="task-history" data-state="empty">
+                  <div class="empty-state empty-state--inline"><strong>暂无任务记录</strong><span>执行一次助理任务后会显示在这里。</span></div>
+                </div>
+              </section>
+              <section class="workspace-section" aria-labelledby="trace-heading">
+                <div class="section-heading section-heading--compact">
+                  <div><p class="eyebrow">服务端记录</p><h3 id="trace-heading">执行轨迹</h3></div>
+                  <span class="muted-label" id="trace-count">0 次调用</span>
+                </div>
+                <div class="trace-list" id="trace-list" data-state="loading">
+                  <div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div>
+                </div>
+              </section>
+            </div>
+            <section class="workspace-section" aria-labelledby="selected-task-heading">
+              <div class="section-heading section-heading--compact">
+                <div><p class="eyebrow">结果详情</p><h3 id="selected-task-heading">选中任务</h3></div>
+              </div>
+              <div class="task-result" id="selected-task-result" data-state="empty">
+                <div class="empty-state empty-state--inline"><strong>选择一条任务记录</strong><span>这里会显示计划、结果、证据和错误信息。</span></div>
+              </div>
+            </section>
+          </section>
+
+          <section class="view-panel" id="approvals-view" data-view-panel="approvals" aria-labelledby="approvals-heading" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">人工确认边界</p>
+                <h2 id="approvals-heading">审批中心</h2>
+                <p class="section-description">先核对并批准预览，再使用本机令牌执行一次；每次写入都会备份并留下审计记录。</p>
+              </div>
+              <button class="button button--secondary" type="button" id="approvals-refresh-button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg>刷新审批</button>
+            </div>
+            <div class="approval-summary" id="approval-summary">
+              <span class="summary-number" id="approval-summary-count">—</span>
+              <span><strong>待处理审批</strong><small>操作前请核对证据和幂等键</small></span>
+            </div>
+            <div class="workspace-section approval-section">
+              <div class="section-heading section-heading--compact">
+                <div><p class="eyebrow">操作预览</p><h3>审批列表</h3></div>
+                <span class="muted-label" id="approval-list-count">加载中</span>
+              </div>
+              <div class="approval-list" id="approval-list" data-state="loading">
+                <div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="view-panel" id="mail-view" data-view-panel="mail" aria-labelledby="mail-heading" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">只读邮件情报</p>
+                <h2 id="mail-heading">招聘邮箱</h2>
+                <p class="section-description">查看已同步的招聘邮件；关联与日程变更只生成审批预览。</p>
+              </div>
+              <button class="button button--secondary" type="button" id="mail-refresh-button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg>同步邮件</button>
+            </div>
+            <div class="mail-status-stack" aria-live="polite">
+              <div class="mail-sync-status" id="mail-sync-status" data-state="idle" hidden>
+                <span class="mail-status-indicator" aria-hidden="true"></span>
+                <div><strong id="mail-sync-status-title">等待同步</strong><span id="mail-sync-status-detail">手动同步结果会显示在这里。</span></div>
+              </div>
+              <div class="mail-freshness-note" id="mail-freshness-note" data-state="unknown" hidden>
+                <span class="mail-status-indicator" aria-hidden="true"></span>
+                <div><strong id="mail-freshness-title">邮箱数据状态</strong><span id="mail-freshness-detail"></span></div>
+              </div>
+            </div>
+            <div class="company-metrics" aria-label="招聘邮件摘要">
+              <div><span>当前列表</span><strong id="mail-total-count">—</strong></div>
+              <div><span>待确认</span><strong id="mail-confirm-count">—</strong></div>
+              <div><span>已关联</span><strong id="mail-linked-count">—</strong></div>
+            </div>
+            <section class="workspace-section" aria-labelledby="mail-list-heading">
+              <div class="section-heading section-heading--compact">
+                <div><p class="eyebrow">本地解析结果</p><h3 id="mail-list-heading">邮件列表</h3></div>
+                <span class="muted-label" id="mail-list-count">加载中</span>
+              </div>
+              <div class="mail-list" id="mail-list" data-state="loading">
+                <div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div>
+              </div>
+            </section>
+            <section class="workspace-section" aria-labelledby="mail-preview-heading">
+              <div class="section-heading section-heading--compact">
+                <div><p class="eyebrow">人工确认前</p><h3 id="mail-preview-heading">关联预览</h3></div>
+              </div>
+              <div class="task-result" id="mail-preview" data-state="empty">
+                <div class="empty-state empty-state--inline"><strong>尚未选择邮件</strong><span>选择一封邮件生成投递阶段与日程草稿。</span></div>
+              </div>
+            </section>
+          </section>
+
+          <section class="view-panel" id="integrations-view" data-view-panel="integrations" aria-labelledby="integrations-heading" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">系统维护</p>
+                <h2 id="integrations-heading">数据接入</h2>
+                <p class="section-description">当前阶段提供接入状态观察位，正式配置变更仍需经过审批。</p>
+              </div>
+            </div>
+
+            <div class="company-metrics" id="company-metrics">
+              <div><span>已接入</span><strong id="connected-company-count">—</strong></div>
+              <div><span>待确认</span><strong id="unconnected-company-count">—</strong></div>
+              <div><span>来源总数</span><strong id="total-company-count">—</strong></div>
+            </div>
+
+            <section class="workspace-section" aria-labelledby="company-list-heading">
+              <div class="section-heading section-heading--compact">
+                <div><p class="eyebrow">当前配置快照</p><h3 id="company-list-heading">公司列表</h3></div>
+                <span class="muted-label" id="company-list-count">加载中</span>
+              </div>
+              <div class="company-list" id="company-list" data-state="loading">
+                <div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div>
+              </div>
+            </section>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <dialog class="job-detail-dialog" id="job-detail-dialog" aria-labelledby="job-detail-title">
+      <div class="job-detail-shell">
+        <header class="job-detail-header">
+          <div><p class="eyebrow" id="job-detail-company">岗位详情</p><h2 id="job-detail-title">正在加载</h2></div>
+          <button class="icon-button" id="job-detail-close" type="button" aria-label="关闭岗位详情" title="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6 6 12 12M18 6 6 18"></path></svg></button>
+        </header>
+        <div class="job-detail-content" id="job-detail-content" data-state="loading"><div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div></div>
+      </div>
+    </dialog>
+
+    <dialog class="job-detail-dialog schedule-editor-dialog" id="schedule-editor-dialog" aria-labelledby="schedule-editor-heading">
+      <div class="job-detail-shell">
+        <header class="job-detail-header">
+          <div><p class="eyebrow" id="schedule-editor-kicker">手动记录安排</p><h2 id="schedule-editor-heading">添加日程</h2></div>
+          <button class="icon-button" id="schedule-editor-close" type="button" aria-label="关闭日程编辑" title="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6 6 12 12M18 6 6 18"></path></svg></button>
+        </header>
+        <form class="schedule-editor-form" id="schedule-editor-form">
+          <div class="schedule-editor-grid">
+            <label>标题<input id="schedule-title" name="title" maxlength="512" required></label>
+            <label>事件类型<input id="schedule-event-type" name="event_type" maxlength="64" placeholder="面试 / 笔试 / 截止" required></label>
+            <label>日期<input id="schedule-event-date" name="event_date" type="date"></label>
+            <label>时间<input id="schedule-event-time" name="event_time" type="time"></label>
+            <label>时间含义<select id="schedule-time-kind" name="time_kind"><option value="appointment">约定事项</option><option value="deadline">截止提醒</option><option value="unspecified">时间未定</option></select></label>
+            <label>公司<input id="schedule-company-name" name="company_name" maxlength="255" required></label>
+            <label>岗位<input id="schedule-job-title" name="job_title" maxlength="512" placeholder="可留空"></label>
+            <label>关联投递<select id="schedule-application-id" name="application_id"><option value="">无关联</option></select></label>
+            <label class="schedule-editor-field--wide">位置或链接<input id="schedule-location" name="location_or_link" maxlength="2048"></label>
+            <label class="schedule-editor-field--wide">备注<textarea id="schedule-note" name="note" maxlength="4000" rows="4"></textarea></label>
+          </div>
+          <div class="job-detail-actions schedule-editor-actions">
+            <button class="button button--ghost" id="schedule-editor-cancel" type="button">取消</button>
+            <button class="button button--primary" id="schedule-editor-submit" type="submit">添加日程</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
+
+    <dialog id="knowledge-preview" class="job-detail-dialog knowledge-preview">
+      <div class="job-detail-header"><h2 id="knowledge-preview-title">资料原文</h2><button class="button button--ghost" id="knowledge-preview-close" type="button" aria-label="关闭资料原文">×</button></div>
+      <p id="knowledge-preview-meta"></p><pre id="knowledge-preview-text"></pre>
+      <div class="knowledge-actions"><button class="button button--ghost" id="knowledge-page-prev" type="button">上一页</button><span id="knowledge-page-label"></span><button class="button button--ghost" id="knowledge-page-next" type="button">下一页</button></div>
+    </dialog>
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <noscript>
+      <div class="noscript-message">需要启用 JavaScript 才能读取 RecruitOps API。</div>
+    </noscript>
+  </body>
+</html>

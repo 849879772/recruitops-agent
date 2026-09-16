@@ -1,0 +1,39 @@
+{
+  "fixture_id": "rag-live-platform-holdout-20260830",
+  "frozen_at": "2026-08-30",
+  "description": "Official recruitment URLs discovered for companies that were not connected when the fixture was frozen. The evaluator hides expected crawler labels from the model.",
+  "cases": [
+    {
+      "case_id": "holdout-calb",
+      "company": "中创新航",
+      "source_url": "https://calbjs.zhiye.com/campus/",
+      "expected_crawler": "beisen",
+      "minimum_jobs": 1,
+      "source_ref": "official ATS campus page"
+    },
+    {
+      "case_id": "holdout-founderic",
+      "company": "深圳方正微电子",
+      "source_url": "https://founderic.zhiye.com/campus",
+      "expected_crawler": "beisen",
+      "minimum_jobs": 1,
+      "source_ref": "official ATS campus page"
+    },
+    {
+      "case_id": "holdout-yofc",
+      "company": "长飞光纤光缆股份有限公司",
+      "source_url": "https://yofc2.zhiye.com/",
+      "expected_crawler": "beisen",
+      "minimum_jobs": 1,
+      "source_ref": "official ATS 27 campus page"
+    },
+    {
+      "case_id": "holdout-weichai-overview",
+      "company": "潍柴集团",
+      "source_url": "https://product.weichai.com/group/weichai/cn/mobile/about-us/human-resources/index.html",
+      "expected_crawler": "manual_required",
+      "minimum_jobs": 0,
+      "source_ref": "official HR overview without a concrete paginated job list"
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+{
+  "_fixture": {
+    "source_url": "https://we.zyt.com/5/jobs",
+    "api_url": "https://we.zyt.com/api/Jobad/GetJobAdPageList",
+    "captured_at": "2026-09-03T13:48:37+08:00",
+    "request": {
+      "PageIndex": 0,
+      "PageSize": 100,
+      "Category": ["5"]
+    },
+    "note": "Frozen structural projection of the live response; long Duty and Require values are retained on representative rows only."
+  },
+  "Code": 200,
+  "Message": "operation success",
+  "Count": 17,
+  "Total": 0,
+  "Data": [
+    {
+      "Id": "ee319017-a555-4069-ab72-de89ba664b1b",
+      "JobAdName": "多模态大模型预训练算法岗（领航者实习）",
+      "PostDate": "2026-07-15T16:31:44",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市"],
+      "Duty": "负责移动基座场景下多模态大模型的预训练算法研发。",
+      "Require": "计算机科学、人工智能、电子信息等相关专业本科及以上学历。",
+      "Kind": "实习"
+    },
+    {
+      "Id": "e2ae4e3b-6bc2-4d2b-9661-0e3a421f50a7",
+      "JobAdName": "多模态大模型数据与评测算法岗（领航者实习）",
+      "PostDate": "2026-07-15T16:26:17",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市"],
+      "Kind": "实习"
+    },
+    {
+      "Id": "5f377fdc-901c-40e1-98ce-5a2d6e0ee063",
+      "JobAdName": "多模态大模型后训练算法岗（领航者实习）",
+      "PostDate": "2026-07-15T16:21:03",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市"],
+      "Kind": "实习"
+    },
+    {
+      "Id": "45046036-ad83-4ee8-8b00-a4b8d81c860e",
+      "JobAdName": "大模型训练优化算法岗(领航者实习)",
+      "PostDate": "2026-07-15T16:14:10",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市"],
+      "Kind": "实习"
+    },
+    {
+      "Id": "5dd918a9-fb5c-4b98-ba08-e1cb76735648",
+      "JobAdName": "大模型推理优化算法岗(领航者实习)",
+      "PostDate": "2026-07-15T16:08:34",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市"],
+      "Kind": "实习"
+    },
+    {
+      "Id": "6a481e72-199c-4b15-82d8-5877ef0f1b53",
+      "JobAdName": "世界模型算法岗(领航者实习)",
+      "PostDate": "2026-07-15T16:03:07",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市"],
+      "Kind": "实习"
+    },
+    {
+      "Id": "6c83f5d2-2a6b-44fa-92a6-f62de6853dd3",
+      "JobAdName": "端到端领航算法岗（领航者校招）",
+      "PostDate": "2026-06-17T15:02:59",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["广东省·深圳市", "上海市"],
+      "Duty": "围绕智能驾驶端到端模型进行研发。",
+      "Require": "计算机、人工智能、自动化等相关专业本科及以上学历。",
+      "Kind": "全职"
+    },
+    {
+      "Id": "228703ce-ba07-4e2d-a34d-9c9dea520d44",
+      "JobAdName": "大模型算法岗（机器人移动后训练&应用-领航者校招）",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["广东省·深圳市"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "0775d524-064c-42a2-87b4-a64f34925142",
+      "JobAdName": "大模型算法岗（几何重建与动态估计-领航者校招）",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["广东省·深圳市"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "a167482e-0d2d-4867-a8b4-cac129deee55",
+      "JobAdName": "世界模型算法岗(领航者校招)",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市", "香港特别行政区"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "d3e219ca-c074-499f-8d28-3499886d969d",
+      "JobAdName": "重建仿真算法岗(领航者校招)",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市", "香港特别行政区"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "571ba292-dab4-45d6-8306-cb0cca952f6b",
+      "JobAdName": "大模型推理优化算法岗(领航者校招)",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市", "香港特别行政区"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "2de92b49-422c-4d04-ae51-7491a162a89a",
+      "JobAdName": "多模态大模型后训练算法岗（领航者校招）",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市", "香港特别行政区"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "28284bc5-4353-4511-9609-0fd09521436f",
+      "JobAdName": "多模态大模型数据与评测算法岗(领航者校招)",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市", "香港特别行政区"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "3fe6d6a4-7c3e-453e-bf9f-da4c539c7193",
+      "JobAdName": "大模型训练优化算法岗(领航者校招)",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市", "香港特别行政区"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "5792185a-37f0-49e7-98cf-94ed49039ae4",
+      "JobAdName": "多模态大模型预训练算法岗(领航者校招)",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["上海市", "广东省·深圳市", "北京市", "香港特别行政区"],
+      "Kind": "全职"
+    },
+    {
+      "Id": "77e3a807-1ab4-4724-b4ac-0c84d77a63ac",
+      "JobAdName": "重建仿真算法岗(领航者实习生)",
+      "PostDate": "2026-02-28T17:55:37",
+      "Category": "领航者计划",
+      "CategoryId": "5",
+      "LocNames": ["广东省·深圳市", "上海市", "北京市"],
+      "Kind": "实习"
+    }
+  ]
+}

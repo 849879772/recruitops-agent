@@ -1,0 +1,19 @@
+profile:
+  degree: master
+  job_type: campus
+  direction: robotics software / C++ / AI applications
+  skills:
+    - C++
+    - Python
+    - Linux
+  matching:
+    direction_policy: parallel
+    primary_directions:
+      - robotics software / motion control / robot perception
+      - large language models / agents / RAG applications
+    secondary_directions: []
+    project_evidence: []
+    supporting_skills: []
+    learning_targets: []
+    unverified_skills: []
+

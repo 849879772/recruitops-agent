@@ -1,0 +1,152 @@
+{
+  "version": 4,
+  "messages": {
+    "AUTHORIZE_CURRENT_TAB": {
+      "type": "extension.authorize_current_tab",
+      "direction": "popup_to_service_worker",
+      "requiresUserGesture": true
+    },
+    "READ_SANITIZED_DOM": {
+      "type": "extension.read_sanitized_dom",
+      "direction": "service_worker_to_content_script",
+      "requiresUserAuthorization": true,
+      "payload": ["protocolVersion", "type", "requestId", "authorizedOrigin", "authorization"]
+    },
+    "DOM_SNAPSHOT": {
+      "type": "extension.dom_snapshot",
+      "direction": "content_script_to_service_worker",
+      "payload": ["protocolVersion", "type", "requestId", "ok", "data"]
+    },
+    "SUBMIT_DOM_OBSERVATION": {
+      "type": "extension.submit_dom_observation",
+      "direction": "popup_to_service_worker",
+      "requiresUserGesture": true,
+      "localOnly": true
+    },
+    "OBSERVATION_SUBMITTED": {
+      "type": "extension.observation_submitted",
+      "direction": "service_worker_to_popup",
+      "payload": ["protocolVersion", "type", "requestId", "ok", "data", "error"]
+    },
+    "SUBMIT_APPLICATION_CAPTURE": {
+      "type": "extension.submit_application_capture",
+      "direction": "popup_to_service_worker",
+      "requiresUserGesture": true,
+      "localOnly": true,
+      "payload": ["protocolVersion", "type", "requestId", "userGesture", "snapshot", "jobId", "note"]
+    },
+    "APPLICATION_CAPTURE_SUBMITTED": {
+      "type": "extension.application_capture_submitted",
+      "direction": "service_worker_to_popup",
+      "payload": ["protocolVersion", "type", "requestId", "ok", "data", "error"]
+    },
+    "EXECUTE_CONTROLLED_ACTION": {
+      "type": "extension.execute_controlled_action",
+      "direction": "service_worker_to_content_script",
+      "activeBridgeOnly": true,
+      "requiresCommandAuthorization": true,
+      "containsApprovalToken": false,
+      "singleUseActionTicket": true,
+      "returnsSanitizedEvidenceOnly": true,
+      "databaseWrite": false,
+      "payload": ["protocolVersion", "type", "requestId", "commandAuthorized", "authorizedOrigin", "tabId", "action", "selectorKey", "params", "actionTicket"]
+    },
+    "CONTROLLED_ACTION_RESULT": {
+      "type": "extension.controlled_action_result",
+      "direction": "content_script_to_service_worker",
+      "evidenceOnly": true,
+      "payload": ["protocolVersion", "type", "requestId", "ok", "data", "error", "pause"]
+    },
+    "PAUSE_STATE": {
+      "type": "extension.pause_state",
+      "direction": "content_script_to_service_worker",
+      "payload": ["protocolVersion", "type", "requestId", "state"]
+    },
+    "CONFIG_GET": {
+      "type": "extension.config.get",
+      "direction": "extension_page_to_service_worker",
+      "localOnly": true
+    },
+    "CONFIG_SET": {
+      "type": "extension.config.set",
+      "direction": "extension_page_to_service_worker",
+      "localOnly": true
+    },
+    "CONFIG_TEST": {
+      "type": "extension.config.test",
+      "direction": "extension_page_to_service_worker",
+      "localOnly": true
+    }
+  },
+  "actions": {
+    "observe_application_page": {
+      "commandType": "observe_application_status_page",
+      "selectorKey": "application_page",
+      "parameters": ["include_vision", "vision_fallback_reason", "retain_on_pause"],
+      "evidenceOnly": true
+    }
+  },
+  "selectorWhitelist": {
+    "application_page": [
+      "main",
+      "[role='main']",
+      "body"
+    ]
+  },
+  "browserBridge": {
+    "path": "/browser-bridge",
+    "transport": "persistent_websocket",
+    "protocolVersion": 1,
+    "authentication": {
+      "challenge": "server_generated",
+      "algorithm": "HMAC-SHA256",
+      "tokenSource": "local_api_token",
+      "tokenInUrl": false,
+      "tokenInMessages": false
+    },
+    "serverMessages": ["operation.dispatch", "operation.cancel", "heartbeat"],
+    "extensionMessages": ["auth", "ack", "progress", "result", "cancel", "heartbeat"],
+    "delivery": "at_least_once_unacked_outbox",
+    "commandEnvelope": {
+      "required": ["operation_id", "operation", "command"],
+      "commandRequired": ["action", "selector_key", "params", "page_url", "origin", "application_id", "application_ids"],
+      "typedActions": [
+        {
+          "commandType": "observe_application_status_page",
+          "action": "observe_application_page",
+          "selectorKey": "application_page",
+          "parameters": ["include_vision", "vision_fallback_reason", "retain_on_pause"]
+        }
+      ]
+    },
+    "result": {
+      "kind": "structured_application_records_and_optional_vision_evidence",
+      "databaseWrite": false,
+      "successMeans": "evidence_collected_only"
+    }
+  },
+  "applicationCapture": {
+    "endpoint": "/api/browser/application-captures",
+    "currentPageOnly": true,
+    "sanitizedSnapshotOnly": true,
+    "createsApprovalPreviewOnly": true,
+    "localApiOnly": true
+  },
+  "vision": {
+    "endpoint": "/api/browser/vision",
+    "request": ["image_data_url", "page_url", "operation_id"],
+    "response": ["text", "confidence", "model", "image_sha256", "usage"],
+    "imagePersistence": false,
+    "localApiOnly": true
+  },
+  "pauseState": {
+    "status": "paused",
+    "reason": ["login_required", "captcha_required", "state_unclear"],
+    "requiresUserAction": true,
+    "resumeAction": ["resume_after_login", "resume_after_captcha", "confirm_state"]
+  },
+  "domSnapshot": {
+    "fields": ["origin", "path", "title", "text", "links", "networkRequests", "capturedAt"],
+    "redacts": ["email", "phone", "long numeric identifiers", "form and control text"]
+  }
+}

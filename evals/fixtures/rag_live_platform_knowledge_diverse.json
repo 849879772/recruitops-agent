@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "description": "Company-neutral platform routing rules for a diverse official-URL holdout.",
+  "documents": [
+    {
+      "id": "platform-beisen-v2",
+      "source": "crawler_recipe",
+      "source_ref": "approved://crawler-platform/beisen",
+      "content": "北森招聘平台使用 zhiye.com 企业子域名，校园入口常见 /campus 或 /xiaoyuan。选择 beisen crawler，并要求分页完成及真实岗位详情。",
+      "metadata": {"domain": "crawler", "platform": "beisen", "trust": "approved"}
+    },
+    {
+      "id": "platform-feishu-v2",
+      "source": "crawler_recipe",
+      "source_ref": "approved://crawler-platform/feishu",
+      "content": "飞书招聘使用 jobs.feishu.cn 企业子域名，入口可能是 /campus、/referral/campus 或 /s/ 短链。选择 feishu crawler，短链必须解析到同一企业招聘站并抓取全部分页。",
+      "metadata": {"domain": "crawler", "platform": "feishu", "trust": "approved"}
+    },
+    {
+      "id": "platform-hotjob-v2",
+      "source": "crawler_recipe",
+      "source_ref": "approved://crawler-platform/hotjob",
+      "content": "Hotjob 招聘站使用 hotjob.cn 或 wecruit.hotjob.cn。新版常含 /SU.../pb/school.html 或 /mc/position/campus；旧版 /wt/<tenant>/web/ 仍选择 hotjob，但现有通用适配器可能因缺少 SU 租户键返回 0，必须保留失败而不能伪造岗位。",
+      "metadata": {"domain": "crawler", "platform": "hotjob", "trust": "approved"}
+    },
+    {
+      "id": "platform-manual-v2",
+      "source": "crawler_knowledge",
+      "source_ref": "approved://crawler-platform/manual-required",
+      "content": "公司介绍、招聘概览、公众号文章、问卷和个人中心不是岗位列表。没有可分页真实岗位入口时返回 manual_required。",
+      "metadata": {"domain": "crawler", "platform": "manual_required", "trust": "approved"}
+    }
+  ]
+}

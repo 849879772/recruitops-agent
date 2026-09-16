@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config/candidate_profile.yaml
+config/companies.yaml
+config/rag_sources.yaml
+config/companies.local.yaml
+config/rag_sources.local.yaml
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Stateful and generated data
+.data/
+data/
+outputs/
+reports/
+tmp/
+work/
+backups/
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.log
+*.zip
+
+# Browser and account state
+playwright/.auth/
+cookies*.json
+storage-state*.json
+user-data-dir/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,11 @@
+version: 1
+managed_sources:
+  - personal_knowledge
+sources:
+  - kind: directory
+    path: ../knowledge
+    source: personal_knowledge
+    metadata:
+      domain: candidate
+      trust: user_provided
+

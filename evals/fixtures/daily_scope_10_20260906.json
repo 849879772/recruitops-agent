@@ -1,0 +1,67 @@
+{
+  "fixture_version": "daily-scope-10-v1",
+  "created_at": "2026-09-06T22:35:00+08:00",
+  "purpose": "Bounded Agent daily-sync acceptance across common and dedicated crawler families.",
+  "companies": [
+    {
+      "id": "config-506",
+      "name": "BIGO",
+      "crawler": "moka",
+      "careers_url": "https://campus.bigo.sg/"
+    },
+    {
+      "id": "config-459",
+      "name": "Dexmal 原力灵机",
+      "crawler": "feishu",
+      "careers_url": "https://dexmal-inc.jobs.feishu.cn/s/UcNqTb50zDE"
+    },
+    {
+      "id": "config-219",
+      "name": "TCL",
+      "crawler": "hotjob",
+      "careers_url": "https://wecruit.hotjob.cn/SU64893571bef57c16d356b99e/pb/account.html"
+    },
+    {
+      "id": "config-253",
+      "name": "vivo",
+      "crawler": "beisen",
+      "careers_url": "https://hr-campus.vivo.com/campus/jobs"
+    },
+    {
+      "id": "config-463",
+      "name": "4399游戏",
+      "crawler": "job4399",
+      "careers_url": "https://hr.4399om.com/weixin/?r=job/agent&type=2&isOpen=0&jobTableType=1&code=ctg5d"
+    },
+    {
+      "id": "config-267",
+      "name": "bilibili",
+      "crawler": "bilibili",
+      "careers_url": "https://jobs.bilibili.com/campus/positions"
+    },
+    {
+      "id": "config-23",
+      "name": "淘天",
+      "crawler": "alibaba",
+      "careers_url": "https://talent.taotian.com/campus/position"
+    },
+    {
+      "id": "config-27",
+      "name": "腾讯",
+      "crawler": "tencent",
+      "careers_url": "https://join.qq.com/"
+    },
+    {
+      "id": "config-33",
+      "name": "百度",
+      "crawler": "baidu",
+      "careers_url": "https://talent.baidu.com/jobs/index"
+    },
+    {
+      "id": "config-277",
+      "name": "联想",
+      "crawler": "lenovo",
+      "careers_url": "https://talent.lenovo.com.cn/position"
+    }
+  ]
+}

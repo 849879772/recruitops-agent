@@ -1,0 +1,13 @@
+companies:
+  - id: example-company
+    name: Example Robotics
+    careers_url: https://careers.example.com/campus
+    crawler: generic
+    integration_status: pending_verification
+    industries:
+      - robotics
+    recruitment_types:
+      - campus
+    recruitment_targets:
+      - "2027"
+

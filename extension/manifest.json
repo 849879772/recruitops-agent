@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "RecruitOps Agent Edge Bridge",
+  "version": "0.3.23",
+  "description": "User-authorized, local-only recruitment page observer for Microsoft Edge.",
+  "action": {
+    "default_title": "RecruitOps Agent",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "options_page": "options.html",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "http://[::1]/*",
+    "<all_urls>"
+  ]
+}

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>RecruitOps Agent 配置</title>
+  </head>
+  <body>
+    <main>
+      <h1>RecruitOps Agent 配置</h1>
+      <form id="config-form">
+        <label>
+          本机 API 地址
+          <input id="api-base-url" name="apiBaseUrl" type="url" required>
+        </label>
+        <label>
+          本机 API Token
+          <input id="api-token" name="apiToken" type="password" autocomplete="off" spellcheck="false">
+        </label>
+        <button type="submit">保存本地配置</button>
+        <button id="test-connection" type="button">测试长连接</button>
+      </form>
+      <p id="version"></p>
+      <p id="status" role="status">配置仅保存在扩展本地存储。保存时会申请招聘网站访问权限。</p>
+    </main>
+    <script src="src/protocol.js"></script>
+    <script src="src/config.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

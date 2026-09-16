@@ -1,0 +1,55 @@
+{
+  "documents": [
+    {
+      "id": "crawler-moka",
+      "content": "Moka 平台需要遍历分页接口并使用职位详情 ID 生成直达链接。",
+      "source": "crawler_knowledge",
+      "source_ref": "crawler/moka/pagination",
+      "metadata": {"domain": "crawler", "platform": "moka"}
+    },
+    {
+      "id": "crawler-beisen",
+      "content": "北森招聘站应使用职位列表 API 遍历全部分页，并保留职位 ID 构造详情链接。",
+      "source": "crawler_knowledge",
+      "source_ref": "crawler/beisen/api-pagination",
+      "metadata": {"domain": "crawler", "platform": "beisen"}
+    },
+    {
+      "id": "crawler-cohort",
+      "content": "只有官网活动页或岗位列表提供 2027 届证据时，岗位才能标记为 confirmed 2027。",
+      "source": "campaign_evidence",
+      "source_ref": "crawler/cohort/official-evidence",
+      "metadata": {"domain": "crawler", "kind": "cohort_evidence"}
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "moka-pagination",
+      "query": "Moka 分页 职位详情链接",
+      "relevant_source_refs": ["crawler/moka/pagination"],
+      "should_answer": true,
+      "metadata_filter": {"domain": "crawler", "platform": "moka"}
+    },
+    {
+      "case_id": "beisen-pagination",
+      "query": "北森 API 全部分页 职位 ID",
+      "relevant_source_refs": ["crawler/beisen/api-pagination"],
+      "should_answer": true,
+      "metadata_filter": {"domain": "crawler", "platform": "beisen"}
+    },
+    {
+      "case_id": "cohort-evidence",
+      "query": "官网 2027 届 confirmed 证据",
+      "relevant_source_refs": ["crawler/cohort/official-evidence"],
+      "should_answer": true,
+      "metadata_filter": {"domain": "crawler", "kind": "cohort_evidence"}
+    },
+    {
+      "case_id": "unsupported-crawler-claim",
+      "query": "未知站点的验证码绕过方法",
+      "relevant_source_refs": [],
+      "should_answer": false,
+      "metadata_filter": {"domain": "crawler"}
+    }
+  ]
+}

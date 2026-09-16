@@ -1,0 +1,124 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: recruitops
+      POSTGRES_USER: recruitops
+      POSTGRES_PASSWORD: recruitops
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - recruitops-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recruitops -d recruitops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # 资源限制：防止占用过多系统资源
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'      # 最多使用 1 个 CPU 核心
+          memory: 1G       # 最多使用 1GB 内存
+        reservations:
+          cpus: '0.25'     # 保留 0.25 个 CPU 核心
+          memory: 256M     # 保留 256MB 内存
+
+  api:
+    restart: unless-stopped
+    build:
+      context: .
+    environment:
+      RECRUITOPS_ENV: ${RECRUITOPS_ENV:-production}
+      RECRUITOPS_AGENT_ROOT: /app
+      RECRUITOPS_DATABASE_URL: postgresql+psycopg://recruitops:recruitops@postgres:5432/recruitops
+      RECRUITOPS_API_HOST: 0.0.0.0
+      RECRUITOPS_API_PORT: "8010"
+      RECRUITOPS_API_TOKEN: ${RECRUITOPS_API_TOKEN:-}
+      RECRUITOPS_EMBEDDING_ENDPOINT: ${RECRUITOPS_EMBEDDING_ENDPOINT:-}
+      RECRUITOPS_EMBEDDING_API_KEY: ${RECRUITOPS_EMBEDDING_API_KEY:-}
+      RECRUITOPS_EMBEDDING_MODEL: ${RECRUITOPS_EMBEDDING_MODEL:-BAAI/bge-m3}
+      RECRUITOPS_EMBEDDING_DIMENSION: ${RECRUITOPS_EMBEDDING_DIMENSION:-1024}
+      RECRUITOPS_KNOWLEDGE_EMBEDDING_ENDPOINT: ${RECRUITOPS_KNOWLEDGE_EMBEDDING_ENDPOINT:-}
+      RECRUITOPS_KNOWLEDGE_EMBEDDING_API_KEY: ${RECRUITOPS_KNOWLEDGE_EMBEDDING_API_KEY:-}
+      RECRUITOPS_KNOWLEDGE_EMBEDDING_MODEL: ${RECRUITOPS_KNOWLEDGE_EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+      RECRUITOPS_KNOWLEDGE_EMBEDDING_DIMENSION: ${RECRUITOPS_KNOWLEDGE_EMBEDDING_DIMENSION:-1024}
+      RECRUITOPS_MAIL_ENABLED: ${RECRUITOPS_MAIL_ENABLED:-false}
+      RECRUITOPS_MAIL_IMAP_HOST: ${RECRUITOPS_MAIL_IMAP_HOST:-imap.163.com}
+      RECRUITOPS_MAIL_IMAP_PORT: ${RECRUITOPS_MAIL_IMAP_PORT:-993}
+      RECRUITOPS_MAIL_IMAP_USERNAME: ${RECRUITOPS_MAIL_IMAP_USERNAME:-}
+      RECRUITOPS_MAIL_IMAP_PASSWORD: ${RECRUITOPS_MAIL_IMAP_PASSWORD:-}
+      RECRUITOPS_MAIL_IMAP_MAILBOX: ${RECRUITOPS_MAIL_IMAP_MAILBOX:-INBOX}
+      RECRUITOPS_MAIL_SYNC_ON_STARTUP: ${RECRUITOPS_MAIL_SYNC_ON_STARTUP:-true}
+      RECRUITOPS_WRITE_ENABLED: ${RECRUITOPS_WRITE_ENABLED:-false}
+      RECRUITOPS_CHECKPOINT_MODE: ${RECRUITOPS_CHECKPOINT_MODE:-both}
+      RECRUITOPS_CODEX_RUNTIME_ENABLED: ${RECRUITOPS_CODEX_RUNTIME_ENABLED:-false}
+      RECRUITOPS_CODEX_CLI_VERSION: "0.149.0"
+      RECRUITOPS_CODEX_COMMAND: '["/opt/codex-cli/node_modules/.bin/codex","app-server"]'
+      RECRUITOPS_CODEX_HOME: /app/.data/codex-home
+      CODEX_HOME: /app/.data/codex-home
+      RECRUITOPS_CODEX_MODEL_PROVIDER_ID: ${RECRUITOPS_CODEX_MODEL_PROVIDER_ID:-deepseek}
+      RECRUITOPS_CODEX_MODEL_BASE_URL: ${RECRUITOPS_CODEX_MODEL_BASE_URL:-https://api.deepseek.com}
+      RECRUITOPS_MODEL_API_BASE_URL: ${RECRUITOPS_MODEL_API_BASE_URL:-}
+      RECRUITOPS_CODEX_MODEL_API_KEY_ENV: ${RECRUITOPS_CODEX_MODEL_API_KEY_ENV:-RECRUITOPS_LLM_API_KEY}
+      RECRUITOPS_CODEX_REASONING_EFFORT: ${RECRUITOPS_CODEX_REASONING_EFFORT:-high}
+      RECRUITOPS_AUTOMATION_ENABLED: ${RECRUITOPS_AUTOMATION_ENABLED:-true}
+      RECRUITOPS_AUTOMATION_POLL_SECONDS: ${RECRUITOPS_AUTOMATION_POLL_SECONDS:-10}
+      RECRUITOPS_AUTOMATION_RUN_TIMEOUT_SECONDS: ${RECRUITOPS_AUTOMATION_RUN_TIMEOUT_SECONDS:-600}
+      RECRUITOPS_LLM_ENABLED: ${RECRUITOPS_LLM_ENABLED:-false}
+      RECRUITOPS_JOB_ANALYSIS_ENABLED: ${RECRUITOPS_JOB_ANALYSIS_ENABLED:-true}
+      RECRUITOPS_LLM_API_KEY: ${RECRUITOPS_LLM_API_KEY:-}
+      RECRUITOPS_LLM_TOOL_CALLING_ENABLED: ${RECRUITOPS_LLM_TOOL_CALLING_ENABLED:-true}
+      RECRUITOPS_LLM_AGENT_MAX_TOKENS: ${RECRUITOPS_LLM_AGENT_MAX_TOKENS:-1200}
+      RECRUITOPS_LLM_TIMEOUT_SECONDS: ${RECRUITOPS_LLM_TIMEOUT_SECONDS:-45}
+      RECRUITOPS_LLM_MAX_TOKENS: ${RECRUITOPS_LLM_MAX_TOKENS:-400}
+      RECRUITOPS_LLM_MATCHING_MAX_TOKENS: ${RECRUITOPS_LLM_MATCHING_MAX_TOKENS:-2000}
+      RECRUITOPS_LLM_MATCHING_THINKING_ENABLED: ${RECRUITOPS_LLM_MATCHING_THINKING_ENABLED:-false}
+      RECRUITOPS_LLM_MATCHING_REASONING_EFFORT: ${RECRUITOPS_LLM_MATCHING_REASONING_EFFORT:-high}
+      RECRUITOPS_VISION_ENABLED: ${RECRUITOPS_VISION_ENABLED:-true}
+      RECRUITOPS_VISION_MAX_IMAGE_BYTES: ${RECRUITOPS_VISION_MAX_IMAGE_BYTES:-6291456}
+      RECRUITOPS_VISION_TIMEOUT_SECONDS: ${RECRUITOPS_VISION_TIMEOUT_SECONDS:-45}
+      RECRUITOPS_MATCH_MAX_CONCURRENCY: ${RECRUITOPS_MATCH_MAX_CONCURRENCY:-8}
+      RECRUITOPS_BROWSER_CHANNEL: chromium
+      RECRUITOPS_BROWSER_EXECUTABLE_PATH: /usr/bin/chromium
+      HTTP_PROXY: ${RECRUITOPS_CONTAINER_HTTP_PROXY:-}
+      HTTPS_PROXY: ${RECRUITOPS_CONTAINER_HTTPS_PROXY:-}
+      NO_PROXY: 127.0.0.1,localhost,postgres,host.docker.internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - python scripts/apply_migrations.py && exec uvicorn apps.api.main:app --host 0.0.0.0 --port 8010
+    ports:
+      - "127.0.0.1:${RECRUITOPS_API_PORT:-8010}:8010"
+    volumes:
+      - type: bind
+        source: ./config
+        target: /app/config
+        read_only: true
+      - type: bind
+        source: ./.data/discovery
+        target: /app/.data/discovery
+      - recruitops-agent-state:/app/.data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 6
+    # 资源限制：防止爬虫和 API 占用过多资源
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'      # 最多使用 2 个 CPU 核心
+          memory: 3G       # 最多使用 3GB 内存（爬虫需要较多内存）
+        reservations:
+          cpus: '0.5'      # 保留 0.5 个 CPU 核心
+          memory: 512M     # 保留 512MB 内存
+
+volumes:
+  recruitops-postgres:
+  recruitops-agent-state:

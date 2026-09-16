@@ -1,0 +1,113 @@
+{
+  "captured_at": "2026-08-19",
+  "companies": [
+    {
+      "id": "fixture-company-1",
+      "name": "示例科技",
+      "aliases": ["Example Tech"],
+      "campus_url": "https://example.invalid/campus",
+      "crawler_key": "fixture",
+      "integration_status": "connected",
+      "source": "fixture",
+      "source_ref": "companies/1"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "fixture-job-1",
+      "company_id": "fixture-company-1",
+      "title": "C++机器人软件工程师",
+      "city": "上海",
+      "detail_url": "https://example.invalid/jobs/1",
+      "jd_raw": "岗位职责：负责机械臂 C++ 与 ROS 软件开发。\n任职要求：熟悉 Linux、C++、ROS。",
+      "cohort": 2027,
+      "cohort_status": "confirmed",
+      "batch": "formal",
+      "match_score": 88,
+      "first_seen_at": "2026-08-19T08:00:00+00:00",
+      "source": "fixture",
+      "source_ref": "jobs/1"
+    },
+    {
+      "id": "fixture-job-intern",
+      "company_id": "fixture-company-1",
+      "title": "机器人算法实习生",
+      "detail_url": "https://example.invalid/jobs/intern",
+      "jd_raw": "实习岗位",
+      "cohort": 2027,
+      "cohort_status": "confirmed",
+      "batch": "internship",
+      "first_seen_at": "2026-08-19T08:00:00+00:00",
+      "source": "fixture",
+      "source_ref": "jobs/intern"
+    },
+    {
+      "id": "fixture-job-unconfirmed",
+      "company_id": "fixture-company-1",
+      "title": "软件工程师",
+      "detail_url": "https://example.invalid/jobs/unknown",
+      "jd_raw": "届别待确认",
+      "cohort_status": "unconfirmed",
+      "batch": "unknown",
+      "first_seen_at": "2026-08-19T08:00:00+00:00",
+      "source": "fixture",
+      "source_ref": "jobs/unknown"
+    }
+  ],
+  "analyses": {
+    "fixture-job-1": {
+      "match_score": 88,
+      "advantages": ["C++", "ROS", "Linux"],
+      "gaps": ["量产部署经验待确认"],
+      "summary": "技能与机械臂软件开发方向匹配。",
+      "recommendation": "立即投递",
+      "score_breakdown": {"skills": 48, "experience": 40},
+      "evidence": [{"source": "resume", "source_ref": "resume://projects/robot-arm"}],
+      "evidence_level": "verified",
+      "matched_directions": ["C++软件开发", "机械臂开发"],
+      "primary_match_direction": "机械臂开发",
+      "analysis_status": "complete",
+      "model": "fixture"
+    }
+  },
+  "applications": [
+    {
+      "id": "fixture-application-1",
+      "company_name": "示例科技",
+      "job_title": "C++机器人软件工程师",
+      "job_id": "fixture-job-1",
+      "stage": "written",
+      "idempotency_key": "application:fixture-1",
+      "stage_history": [{"stage": "applied", "date": "2026-08-18"}],
+      "source_status": "笔试待完成",
+      "source": "fixture",
+      "source_ref": "applications/1"
+    },
+    {
+      "id": "fixture-application-2",
+      "company_name": "示例科技",
+      "job_title": "C++机器人软件工程师",
+      "job_id": null,
+      "stage": "applied",
+      "idempotency_key": "application:fixture-2",
+      "source": "fixture",
+      "source_ref": "applications/2"
+    }
+  ],
+  "schedule": [
+    {
+      "id": "fixture-event-1",
+      "title": "笔试 · 示例科技",
+      "event_date": "2026-08-19",
+      "event_time": "19:00:00",
+      "event_type": "笔试",
+      "company_name": "示例科技",
+      "job_title": "C++机器人软件工程师",
+      "application_stage": "written",
+      "application_id": "fixture-application-1",
+      "location_or_link": "线上",
+      "source": "fixture",
+      "source_ref": "schedule/1"
+    }
+  ]
+}

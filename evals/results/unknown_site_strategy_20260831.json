@@ -1,0 +1,134 @@
+{
+  "report_version": 1,
+  "evaluation": "unknown_site_strategy_live",
+  "result_type": "live",
+  "synthetic": false,
+  "fixture_id": "unknown-site-strategy-20260831-v1",
+  "frozen_at": "2026-08-31T10:33:09+08:00",
+  "observations": [
+    {
+      "case_id": "unknown-moka-ys4fun",
+      "company": "勇仕网络",
+      "strategy": "platform_adapter",
+      "crawler": "moka",
+      "url": "https://app.mokahr.com/campus-recruitment/ys4fun/45636/",
+      "job_count": 5,
+      "correct_titles": 5,
+      "unexpected_titles": [],
+      "title_recall": 1.0,
+      "title_precision": 1.0,
+      "elapsed_ms": 17861,
+      "safe_to_connect": true,
+      "error": null
+    },
+    {
+      "case_id": "unknown-moka-ys4fun",
+      "company": "勇仕网络",
+      "strategy": "generic_extraction",
+      "crawler": "render",
+      "url": "https://app.mokahr.com/campus-recruitment/ys4fun/45636/",
+      "job_count": 0,
+      "correct_titles": 0,
+      "unexpected_titles": [],
+      "title_recall": 0.0,
+      "title_precision": 0.0,
+      "elapsed_ms": 95350,
+      "safe_to_connect": false,
+      "error": null
+    },
+    {
+      "case_id": "unknown-moka-ys4fun",
+      "company": "勇仕网络",
+      "strategy": "verified_manual_candidate",
+      "crawler": "moka",
+      "url": "https://app.mokahr.com/campus-recruitment/ys4fun/45636/",
+      "job_count": 5,
+      "correct_titles": 5,
+      "unexpected_titles": [],
+      "title_recall": 1.0,
+      "title_precision": 1.0,
+      "elapsed_ms": 18047,
+      "safe_to_connect": true,
+      "error": null
+    },
+    {
+      "case_id": "unknown-self-built-ksw",
+      "company": "坤恒顺维",
+      "strategy": "platform_adapter",
+      "crawler": "manual_required",
+      "url": "https://www.ksw-tech.com/",
+      "job_count": 0,
+      "correct_titles": 0,
+      "unexpected_titles": [],
+      "title_recall": 0.0,
+      "title_precision": 0.0,
+      "elapsed_ms": 0,
+      "safe_to_connect": false,
+      "error": null
+    },
+    {
+      "case_id": "unknown-self-built-ksw",
+      "company": "坤恒顺维",
+      "strategy": "generic_extraction",
+      "crawler": "render",
+      "url": "https://www.ksw-tech.com/",
+      "job_count": 5,
+      "correct_titles": 0,
+      "unexpected_titles": [
+        "一台无线电综测仪如何带来不一样的测试体验？KSW-...",
+        "坤恒顺维参与编写的技术专著《国产信息通信仪表与测试...",
+        "无线通信测试平台",
+        "自动测试",
+        "软件无线电开发平台"
+      ],
+      "title_recall": 0.0,
+      "title_precision": 0.0,
+      "elapsed_ms": 61456,
+      "safe_to_connect": false,
+      "error": null
+    },
+    {
+      "case_id": "unknown-self-built-ksw",
+      "company": "坤恒顺维",
+      "strategy": "verified_manual_candidate",
+      "crawler": "static_html",
+      "url": "https://www.ksw-tech.com/information/campus-hiring.html",
+      "job_count": 6,
+      "correct_titles": 6,
+      "unexpected_titles": [],
+      "title_recall": 1.0,
+      "title_precision": 1.0,
+      "elapsed_ms": 29660,
+      "safe_to_connect": true,
+      "error": null
+    }
+  ],
+  "summaries": [
+    {
+      "strategy": "platform_adapter",
+      "cases": 2,
+      "safe_connections": 1,
+      "mean_title_recall": 0.5,
+      "mean_title_precision": 0.5,
+      "elapsed_ms": 17861
+    },
+    {
+      "strategy": "generic_extraction",
+      "cases": 2,
+      "safe_connections": 0,
+      "mean_title_recall": 0.0,
+      "mean_title_precision": 0.0,
+      "elapsed_ms": 156806
+    },
+    {
+      "strategy": "verified_manual_candidate",
+      "cases": 2,
+      "safe_connections": 2,
+      "mean_title_recall": 1.0,
+      "mean_title_precision": 1.0,
+      "elapsed_ms": 47707
+    }
+  ],
+  "conclusion": "Known ATS adapters should be preferred. Generic extraction is not a safe substitute for ATS routing; a verified listing URL plus deterministic acceptance remains required for unknown self-built sites.",
+  "boundary": "This is a two-company live holdout. It measures title extraction and false positives, not automatic web search, cohort confirmation, JD hydration, or arbitrary-site coverage."
+}
