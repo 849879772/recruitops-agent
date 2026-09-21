@@ -9,14 +9,14 @@ from time import perf_counter
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from packages.browser_bridge import BrowserBridgeStore
 from packages.browser_bridge.models import OperationStatus
 from packages.domain.urls import normalize_http_page_url
 from packages.repositories.base import RecruitmentRepository
 from packages.storage import Storage
-from packages.tools.application_status_evidence import has_unmapped_status
+from packages.tools.application_status_evidence import has_unmapped_status, supports_no_newer_status
 from packages.tools.browser_bridge import (
     ObserveApplicationStatusPageInput,
     observe_application_status_page_workflow,
@@ -24,6 +24,7 @@ from packages.tools.browser_bridge import (
 from packages.tools.browser_status_update import (
     BrowserStatusUpdateInput,
     UpdateStatus,
+    _normalise_status,
     browser_status_update,
 )
 from packages.tools.typed import (
@@ -36,10 +37,22 @@ from packages.tools.typed import (
 )
 
 
+_TRANSIENT_RETRY_DELAY_SECONDS = 1.5
+
+
 class BatchObserveApplicationStatusInput(ToolInput):
     """Applications to observe, bind to evidence, and safely reconcile."""
 
-    application_ids: list[str] = Field(min_length=1, max_length=50)
+    application_ids: list[str] = Field(default_factory=list, max_length=50)
+    run_id: str | None = Field(default=None, pattern=r"^status-review-[0-9a-f]{32}$")
+    all_non_terminal: bool = Field(
+        default=False,
+        description=(
+            "Select every persisted application except rejected and withdrawn records. "
+            "Use this for a complete current-status review instead of querying full application "
+            "records merely to collect their IDs."
+        ),
+    )
     timeout_per_application_ms: int = Field(default=45_000, ge=5_000, le=120_000)
     max_concurrent: int = Field(default=3, ge=1, le=10)
     include_vision: Literal[False] = Field(
@@ -68,12 +81,30 @@ class BatchObserveApplicationStatusInput(ToolInput):
                 normalized.append(application_id)
         return normalized
 
+    @model_validator(mode="after")
+    def validate_selection_mode(self) -> "BatchObserveApplicationStatusInput":
+        if self.run_id:
+            if self.all_non_terminal or self.application_ids:
+                raise ValueError("run_id cannot be combined with a new selection")
+            return self
+        if self.all_non_terminal and self.application_ids:
+            raise ValueError(
+                "application_ids must be empty when all_non_terminal is enabled"
+            )
+        if not self.all_non_terminal and not self.application_ids:
+            raise ValueError(
+                "provide application_ids or enable all_non_terminal"
+            )
+        return self
+
 
 class ApplicationStatusResult(ToolModel):
     """One application's truthful reconciliation outcome."""
 
     application_id: str
-    state: Literal["updated", "unchanged", "blocked", "unresolved", "failed"]
+    company_name: str | None = None
+    job_title: str | None = None
+    state: Literal["updated", "unchanged", "excluded", "blocked", "unresolved", "failed"]
     reason: str | None = None
     observed_status: str | None = None
     wrote: bool = False
@@ -89,6 +120,7 @@ class BatchObserveApplicationStatusResponse(ToolResponse[dict[str, Any]]):
     pages_total: int = Field(ge=0)
     updated: list[ApplicationStatusResult] = Field(default_factory=list)
     unchanged: list[ApplicationStatusResult] = Field(default_factory=list)
+    excluded: list[ApplicationStatusResult] = Field(default_factory=list)
     blocked: list[ApplicationStatusResult] = Field(default_factory=list)
     unresolved: list[ApplicationStatusResult] = Field(default_factory=list)
     failed: list[ApplicationStatusResult] = Field(default_factory=list)
@@ -187,11 +219,38 @@ def _identity_key(value: object) -> str:
     return "".join(character for character in str(value or "").casefold() if character.isalnum())
 
 
+def _origin_concurrency_key(normalized_url: str) -> str:
+    """Serialize tenants that share one ATS backend and throttling boundary."""
+
+    hostname = (urlparse(normalized_url).hostname or "").casefold()
+    if hostname.endswith(".jobs.feishu.cn"):
+        return "ats:feishu"
+    return hostname
+
+
+def _transient_empty_feishu_observation(
+    observation: object,
+    normalized_url: str,
+) -> bool:
+    """Detect an authenticated Feishu shell whose application list has not loaded."""
+
+    hostname = (urlparse(normalized_url).hostname or "").casefold()
+    if not hostname.endswith(".jobs.feishu.cn") or not isinstance(observation, dict):
+        return False
+    if observation.get("application_records") or observation.get("entries"):
+        return False
+    if _page_authentication_gate(observation):
+        return False
+    page = observation.get("page") if isinstance(observation.get("page"), dict) else {}
+    text = str(page.get("text") or "").strip()
+    return "/position/application" in normalized_url and len(text) < 80
+
+
 def _matching_record_only(
     application: object,
     records: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Return one exact target card that contains no newer status evidence."""
+    """Return one exact target card that contains no decisive newer status."""
 
     target = _identity_key(getattr(application, "job_title", ""))
     if not target:
@@ -201,15 +260,20 @@ def _matching_record_only(
         return None
     record = matches[0]
     signals = record.get("signals") if isinstance(record.get("signals"), dict) else {}
-    if record.get("status") or has_unmapped_status(record) or signals.get("conflicting_statuses"):
+    if signals.get("conflicting_statuses"):
+        return None
+    record_status = _normalise_status(record.get("status"))
+    if record_status not in {None, "applied"}:
+        return None
+    if record_status is None and not supports_no_newer_status(record):
         return None
     current_stage = _value(getattr(application, "stage", "")).casefold()
-    return record if current_stage == "applied" else None
+    return record if current_stage and current_stage != "interested" else None
 
 
 def _result(
     application_id: str,
-    state: Literal["updated", "unchanged", "blocked", "unresolved", "failed"],
+    state: Literal["updated", "unchanged", "excluded", "blocked", "unresolved", "failed"],
     *,
     started: float,
     reason: str | None = None,
@@ -236,20 +300,22 @@ def _error_response(
     started: float,
     reason: str,
     error_code: ToolErrorCode,
+    application_ids: list[str] | None = None,
 ) -> BatchObserveApplicationStatusResponse:
+    target_ids = request.application_ids if application_ids is None else application_ids
     failures = [
         _result(item, "failed", started=started, reason=reason)
-        for item in request.application_ids
+        for item in target_ids
     ]
     return BatchObserveApplicationStatusResponse(
         tool_name="batch_observe_application_status",
         status=ToolStatus.FAILURE,
         success=False,
-        total=len(request.application_ids),
+        total=len(target_ids),
         pages_total=0,
         failed=failures,
         data={"write_count": 0},
-        summary={"total": len(request.application_ids), "failed": len(failures), "write_count": 0},
+        summary={"total": len(target_ids), "failed": len(failures), "write_count": 0},
         evidence=[EvidenceSource(source="agent.application_snapshot")],
         error_code=error_code,
         error_message=reason,
@@ -270,6 +336,10 @@ async def batch_observe_application_status(
     started = perf_counter()
     if not isinstance(request, BatchObserveApplicationStatusInput):
         request = BatchObserveApplicationStatusInput.model_validate(request)
+    if request.all_non_terminal or request.run_id:
+        from .application_review_run import continue_application_review
+
+        return await continue_application_review(request, browser_bridge_store, repository)
     if browser_bridge_store is None:
         return _error_response(
             request,
@@ -289,7 +359,8 @@ async def batch_observe_application_status(
         )
 
     try:
-        applications = {str(item.id): item for item in repository.list_applications()}
+        application_rows = list(repository.list_applications())
+        applications = {str(item.id): item for item in application_rows}
     except Exception as exc:
         return _error_response(
             request,
@@ -298,15 +369,25 @@ async def batch_observe_application_status(
             error_code=ToolErrorCode.SOURCE_UNAVAILABLE,
         )
 
+    selected_application_ids = list(request.application_ids)
+
     immediate: list[ApplicationStatusResult] = []
     groups: dict[str, list[tuple[str, Any]]] = defaultdict(list)
     raw_urls: dict[str, str] = {}
-    for application_id in dict.fromkeys(request.application_ids):
+    for application_id in dict.fromkeys(selected_application_ids):
         item_started = perf_counter()
         application = applications.get(application_id)
         if application is None:
             immediate.append(_result(
                 application_id, "failed", started=item_started, reason="application_not_found"
+            ))
+            continue
+        if _value(getattr(application, "stage", "")).casefold() in {"rejected", "withdrawn"}:
+            immediate.append(_result(
+                application_id,
+                "excluded",
+                started=item_started,
+                reason="terminal_stage_excluded",
             ))
             continue
         normalized_url = normalize_http_page_url(application.record_url or "")
@@ -330,22 +411,22 @@ async def batch_observe_application_status(
     ) -> list[ApplicationStatusResult]:
         group_started = perf_counter()
         application_ids = [item[0] for item in members]
-        origin = urlparse(normalized_url).netloc.casefold()
-        async with semaphore, origin_locks[origin]:
-            observation_request = ObserveApplicationStatusPageInput(
-                application_id=application_ids[0],
-                application_ids=application_ids,
-                application_url=raw_urls[normalized_url],
-                timeout_ms=request.timeout_per_application_ms,
-                include_vision=False,
-                retain_on_pause=False,
-                idempotency_key=(
-                    f"batch-status-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-"
-                    f"{application_ids[0]}"
-                ),
-            )
-            try:
-                observed = await asyncio.wait_for(
+        concurrency_key = _origin_concurrency_key(normalized_url)
+        async with semaphore, origin_locks[concurrency_key]:
+            async def observe_once(attempt: int):
+                observation_request = ObserveApplicationStatusPageInput(
+                    application_id=application_ids[0],
+                    application_ids=application_ids,
+                    application_url=raw_urls[normalized_url],
+                    timeout_ms=request.timeout_per_application_ms,
+                    include_vision=False,
+                    retain_on_pause=False,
+                    idempotency_key=(
+                        f"batch-status-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-"
+                        f"{application_ids[0]}-{attempt}"
+                    ),
+                )
+                return await asyncio.wait_for(
                     observe_application_status_page_workflow(
                         observation_request,
                         browser_bridge_store,
@@ -353,6 +434,26 @@ async def batch_observe_application_status(
                     ),
                     timeout=request.timeout_per_application_ms / 1_000 + 5,
                 )
+
+            try:
+                observed = await observe_once(0)
+                first_data = getattr(observed, "data", None)
+                first_observation = getattr(first_data, "observation", None)
+                first_error = _value(
+                    getattr(first_data, "error_code", None) or getattr(observed, "error_code", None)
+                )
+                paused_for_user = (
+                    first_error in {"CAPTCHA_REQUIRED", "LOGIN_REQUIRED", "WAITING_FOR_LOGIN"}
+                    or getattr(first_data, "status", None) == OperationStatus.WAITING_FOR_LOGIN
+                    or _pause_reason(observed) in {"login_required", "captcha_required"}
+                )
+                retry_timeout = bool(getattr(observed, "timed_out", False)) and first_error == "timeout"
+                if not paused_for_user and (retry_timeout or _transient_empty_feishu_observation(first_observation, normalized_url)):
+                    if not retry_timeout:
+                        await asyncio.sleep(_TRANSIENT_RETRY_DELAY_SECONDS)
+                    # ACKed reads are not replayed by transport. The timed-out
+                    # operation is cancelled; one fresh observation may recover.
+                    observed = await observe_once(1)
             except asyncio.TimeoutError:
                 return [
                     _result(item, "failed", started=group_started, reason="observation_timeout")
@@ -390,7 +491,7 @@ async def batch_observe_application_status(
                 for item in application_ids
             ]
         if (
-            error_code == "WAITING_FOR_LOGIN"
+            error_code in {"LOGIN_REQUIRED", "WAITING_FOR_LOGIN"}
             or operation_status == OperationStatus.WAITING_FOR_LOGIN
             or pause_reason == "login_required"
         ):
@@ -492,15 +593,6 @@ async def batch_observe_application_status(
         results: list[ApplicationStatusResult] = []
         applications_by_id = {item[0]: item[1] for item in members}
         for application_id in application_ids:
-            if any(
-                _identity_key(record.get("title")) == _identity_key(getattr(applications_by_id[application_id], "job_title", ""))
-                and has_unmapped_status(record) for record in records
-            ):
-                results.append(_result(
-                    application_id, "unresolved", started=group_started, reason="status_unmapped",
-                    operation_id=operation_id, observation=_compact_observation(observation),
-                ))
-                continue
             if _matching_record_only(applications_by_id[application_id], records):
                 results.append(_result(
                     application_id,
@@ -509,6 +601,15 @@ async def batch_observe_application_status(
                     reason="no_newer_status_observed",
                     observed_status="applied",
                     operation_id=operation_id,
+                ))
+                continue
+            if any(
+                _identity_key(record.get("title")) == _identity_key(getattr(applications_by_id[application_id], "job_title", ""))
+                and has_unmapped_status(record) for record in records
+            ):
+                results.append(_result(
+                    application_id, "unresolved", started=group_started, reason="status_unmapped",
+                    operation_id=operation_id, observation=_compact_observation(observation),
                 ))
                 continue
             update = browser_status_update(
@@ -550,11 +651,12 @@ async def batch_observe_application_status(
     results = immediate + [item for group in grouped_results for item in group]
     buckets = {
         state: [item for item in results if item.state == state]
-        for state in ("updated", "unchanged", "blocked", "unresolved", "failed")
+        for state in ("updated", "unchanged", "excluded", "blocked", "unresolved", "failed")
     }
     reconciled = len(buckets["updated"]) + len(buckets["unchanged"])
+    settled = reconciled + len(buckets["excluded"])
     write_count = sum(item.wrote for item in buckets["updated"])
-    all_reconciled = len(results) == len(request.application_ids) and reconciled == len(results)
+    all_reconciled = len(results) == len(selected_application_ids) and settled == len(results)
     all_failed = bool(results) and len(buckets["failed"]) == len(results)
     status = (
         ToolStatus.SUCCESS
@@ -567,30 +669,36 @@ async def batch_observe_application_status(
         else ToolErrorCode.AMBIGUOUS_MATCH
     )
     summary = {
-        "total": len(request.application_ids),
+        "total": len(selected_application_ids),
         "pages_total": len(groups),
         "updated": len(buckets["updated"]),
         "unchanged": len(buckets["unchanged"]),
+        "excluded": len(buckets["excluded"]),
         "blocked": len(buckets["blocked"]),
         "unresolved": len(buckets["unresolved"]),
         "failed": len(buckets["failed"]),
         "write_count": write_count,
-        "completion_rate": round(reconciled / len(request.application_ids), 4),
-        "success_means": "every requested application was verified as updated or unchanged",
+        "completion_rate": round(settled / len(selected_application_ids), 4),
+        "selection": "all_non_terminal" if request.all_non_terminal else "explicit",
+        "success_means": (
+            "every non-terminal application was verified as updated or unchanged; "
+            "rejected and withdrawn applications were excluded before browser access"
+        ),
     }
     return BatchObserveApplicationStatusResponse(
         tool_name="batch_observe_application_status",
         status=status,
         success=status is ToolStatus.SUCCESS,
-        total=len(request.application_ids),
+        total=len(selected_application_ids),
         pages_total=len(groups),
         updated=buckets["updated"],
         unchanged=buckets["unchanged"],
+        excluded=buckets["excluded"],
         blocked=buckets["blocked"],
         unresolved=buckets["unresolved"],
         failed=buckets["failed"],
         succeeded=buckets["updated"] + buckets["unchanged"],
-        skipped=buckets["blocked"] + buckets["unresolved"],
+        skipped=buckets["excluded"] + buckets["blocked"] + buckets["unresolved"],
         summary=summary,
         data=summary,
         evidence=[

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from packages.config import Settings  # noqa: E402
+from packages.config import Settings, get_settings  # noqa: E402
 from packages.automation import AutomationStore  # noqa: E402
 from packages.browser_bridge import BrowserBridgeStore  # noqa: E402
 from packages.rag import (  # noqa: E402
@@ -72,7 +72,7 @@ def build_server(
     browser_bridge_store: BrowserBridgeStore | None = None,
     profile: str = "agent",
 ):
-    configured = settings or Settings()
+    configured = settings or get_settings()
     storage = Storage.from_url(configured.database_url)
     repo = repository or PostgresRecruitmentRepository(storage)
     store = mail_store or RecruitmentMailStore(
@@ -108,7 +108,10 @@ def build_server(
         crawler_runner=crawler_runner,
         oc_candidate_runner=oc_candidate_runner,
         operational_task_runner=operation_runner,
-        offerbiu_refresher=OfferBiuRefreshService(CompanySourceRegistry(storage)),
+        offerbiu_refresher=OfferBiuRefreshService(
+            CompanySourceRegistry(storage),
+            scope={"industry_groups": configured.offerbiu_industry_groups},
+        ),
         automation_scheduler=scheduler,
         automation_store=AutomationStore(storage),
         profile=profile,

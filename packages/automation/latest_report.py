@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from packages.security.boundaries import redact_sensitive
+
 
 def write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,7 +23,19 @@ def report_path(settings):
     return Path(settings.agent_root) / ".data" / "runtime" / "latest-scheduled-crawl.json"
 
 
-def summarize(result: dict, execution_id: str) -> dict:
+def _redact_diagnostic(value: str | None, settings) -> str | None:
+    if value is None:
+        return None
+    secrets = [getattr(settings, name, "") for name in (
+        "llm_api_key", "mail_imap_password", "database_url",
+    )]
+    # Replace whole configured values before generic redaction alters a DSN.
+    for secret in sorted((s for s in secrets if isinstance(s, str) and s), key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED:secret]")
+    return redact_sensitive(value)
+
+
+def summarize(result: dict, execution_id: str, *, settings=None) -> dict:
     daily = result.get("daily_sync") or {}
     pipeline = daily.get("pipeline") or {}
     discovery = daily.get("discovery") or {}
@@ -35,9 +49,18 @@ def summarize(result: dict, execution_id: str) -> dict:
         counts[status] += 1
     succeeded = result.get("status") == "completed"
     partial = counts["partial"] or counts["failed"] or pipeline.get("scoring_failed", 0)
+    # Early guards return diagnostics before a daily_sync payload exists.
+    error = daily.get("error") or result.get("error")
+    if not succeeded:
+        error = error or result.get("message") or f"全量任务执行失败（状态：{result.get('status') or 'unknown'}）"
+        if result.get("missing"):
+            error = f"{error}\n缺少配置项：{'、'.join(result['missing'])}"
     return {
         "execution_id": execution_id,
         "status": ("partial" if partial or result.get("sync_status") == "degraded" else "succeeded") if succeeded else "failed",
+        "source_status": result.get("status"),
+        "message": _redact_diagnostic(result.get("message"), settings),
+        "missing": result.get("missing", []),
         "started_at": daily.get("started_at"),
         "finished_at": daily.get("finished_at") or datetime.now(timezone.utc).isoformat(),
         "discovery_complete": discovery.get("complete"),
@@ -62,5 +85,5 @@ def summarize(result: dict, execution_id: str) -> dict:
         "scoring_failed": pipeline.get("scoring_failed"),
         "unscored_jobs": pipeline.get("unscored"),
         "failure_reasons": pipeline.get("failure_reasons", {}),
-        "error": daily.get("error"),
+        "error": _redact_diagnostic(error, settings),
     }

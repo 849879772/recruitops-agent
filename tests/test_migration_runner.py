@@ -114,3 +114,22 @@ def test_migrations_reject_sqlite_targets_inside_legacy_source(
         apply_migrations(f"sqlite:///{target}", migrations)
 
     assert target.exists() is False
+
+
+def test_source_inside_project_is_not_exempt_from_migration_guard(monkeypatch, tmp_path):
+    source = tmp_path / "legacy"
+    source.mkdir()
+    monkeypatch.setattr(migration_runner, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(migration_runner, "DEFAULT_SOURCE_ROOT", source)
+    with pytest.raises(UnsafeTargetError):
+        migration_runner._guard_database_target(f"sqlite:///{source / 'other.db'}")
+
+
+def test_nested_agent_state_remains_allowed_but_source_state_is_protected(monkeypatch, tmp_path):
+    project = tmp_path / "agent"
+    project.mkdir()
+    monkeypatch.setattr(migration_runner, "PROJECT_ROOT", project)
+    monkeypatch.setattr(migration_runner, "DEFAULT_SOURCE_ROOT", tmp_path)
+    migration_runner._guard_database_target(f"sqlite:///{project / 'agent.db'}")
+    with pytest.raises(UnsafeTargetError):
+        migration_runner._guard_database_target(f"sqlite:///{tmp_path / 'legacy.db'}")

@@ -315,7 +315,7 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
     let bestScore = -1;
     let stableAttempts = 0;
     const contexts = frameContexts.length ? frameContexts : [{frameId: 0, frameUrl: "", origin}];
-    for (let attempt = 1; attempt <= 16; attempt += 1) {
+    for (let attempt = 1; attempt <= 22; attempt += 1) {
       const settled = await Promise.allSettled(contexts.map((frame) => requestSemanticObservation(
         tabId,
         `${requestId}-${frame.frameId}-${attempt}`.slice(0, 128),
@@ -350,7 +350,7 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
       ) {
         return bestResponse;
       }
-      if (attempt < 16) await delay(1200);
+      if (attempt < 22) await delay(1200);
     }
     return bestResponse || lastResponse;
   }

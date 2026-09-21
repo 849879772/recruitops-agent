@@ -75,7 +75,8 @@ def test_title_screen_does_not_use_jd_or_other_job_fields() -> None:
         }
     )
 
-    assert target.eligible is True
+    assert target.eligible is False
+    assert target.analysis_status is AnalysisStatus.INTERNSHIP
     assert unknown.eligible is False
     assert unknown.analysis_status is AnalysisStatus.DIRECTION_OUT
 

@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections.abc import Mapping
 import time
 from typing import Any, Callable
 
 import requests
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from packages.storage.models import CompanySnapshot
 from packages.recruitment_core.entry import diagnose_candidate_entry
 
 from .company_registry import CompanySourceRecord, CompanySourceRegistry
-from .offerbiu_registry import INDUSTRY_GROUPS, import_offerbiu_sources
+from .offerbiu_registry import import_offerbiu_sources, selected_industry_groups
 from .reconciliation import normalize_company_name, source_identity_for_url
 
 
@@ -28,9 +29,11 @@ def capture_offerbiu_snapshot(
     delay_seconds: float = 0.25,
     session: Any | None = None,
     sleeper: Callable[[float], None] = time.sleep,
+    scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read a validated 2027 autumn-recruitment snapshot from the public API."""
 
+    groups = selected_industry_groups(scope)
     client = session or requests.Session()
     if session is None:
         # BIU is a public source and does not need the local browser proxy or cookies.
@@ -38,7 +41,7 @@ def capture_offerbiu_snapshot(
     params = [
         ("seasonYear", "2027"),
         ("recruitType", "秋招"),
-        *[("industryGroup", group) for group in sorted(INDUSTRY_GROUPS)],
+        *[("industryGroup", group) for group in sorted(groups)],
         ("size", str(page_size)),
     ]
     result: dict[str, Any] = {
@@ -49,7 +52,7 @@ def capture_offerbiu_snapshot(
         "filters": {
             "seasonYear": 2027,
             "recruitType": "秋招",
-            "industryGroups": sorted(INDUSTRY_GROUPS),
+            "industryGroups": sorted(groups),
         },
         "pages": [],
         "items": [],
@@ -102,7 +105,7 @@ def capture_offerbiu_snapshot(
             if any(
                 row.get("recruitType") != "秋招"
                 or 2027 not in row.get("targetYears", [])
-                or not INDUSTRY_GROUPS.intersection(row.get("industryGroupCodes", []))
+                or not groups.intersection(row.get("industryGroupCodes", []))
                 for row in rows
             ):
                 result["stop_reason"] = "source_filter_mismatch"
@@ -136,9 +139,11 @@ def capture_offerbiu_snapshot(
 class OfferBiuRefreshService:
     """Discover and register usable BIU company entries after full validation."""
 
-    def __init__(self, registry: CompanySourceRegistry, *, session: Any | None = None) -> None:
+    def __init__(self, registry: CompanySourceRegistry, *, session: Any | None = None,
+                 scope: Mapping[str, Any] | None = None) -> None:
         self.registry = registry
         self.session = session
+        self.scope = {"industry_groups": sorted(selected_industry_groups(scope))}
         self.last_registered_ids: tuple[str, ...] = ()
 
     def refresh(
@@ -154,6 +159,7 @@ class OfferBiuRefreshService:
             page_size=page_size,
             delay_seconds=delay_seconds,
             session=self.session,
+            scope=self.scope,
         )
         self.last_registered_ids = ()
         result: dict[str, Any] = {
@@ -170,6 +176,11 @@ class OfferBiuRefreshService:
             "out_of_scope": 0,
             "registered_ids": [],
             "pending_entries": [],
+            "registered_ids_sample_count": 0,
+            "registered_ids_limited": False,
+            "pending_entry_count": None,
+            "pending_entries_sample_count": 0,
+            "pending_entries_limited": False,
         }
         if not snapshot["complete"] or not apply:
             return result
@@ -182,7 +193,7 @@ class OfferBiuRefreshService:
                     CompanySourceRecord.source == "offerbiu"
                 )
             ))
-        imported = import_offerbiu_sources(self.registry, snapshot)
+        imported = import_offerbiu_sources(self.registry, snapshot, scope=self.scope)
         registered_ids = list(imported["ids"])
         self.last_registered_ids = tuple(registered_ids)
         new_entries = 0
@@ -201,9 +212,10 @@ class OfferBiuRefreshService:
             "excluded_unusable": int(imported["excluded_unusable"]),
             "excluded_reasons": imported.get("excluded_reasons", {}),
             "out_of_scope": int(imported["out_of_scope"]),
-            # Keep the model-facing payload bounded. The full ID set is already
-            # persisted in the registry; only pending_entries drive follow-up work.
+            # The full ID set is persisted; these IDs are only a bounded sample.
             "registered_ids": registered_ids[:20],
+            "registered_ids_sample_count": min(20, len(registered_ids)),
+            "registered_ids_limited": len(registered_ids) > 20,
         })
         company_ids_by_name: dict[str, set[str]] = {}
         with self.registry.storage.session() as db:
@@ -218,6 +230,7 @@ class OfferBiuRefreshService:
         with self.registry.storage.write_transaction() as db:
             unlinked_sources = list(db.scalars(select(CompanySourceRecord).where(
                 CompanySourceRecord.source == "offerbiu",
+                CompanySourceRecord.id.in_(registered_ids),
                 CompanySourceRecord.company_id.is_(None),
                 CompanySourceRecord.status != "unusable",
             )))
@@ -236,12 +249,17 @@ class OfferBiuRefreshService:
         result["linked_existing_entries"] = linked_existing
 
         with self.registry.storage.session() as db:
+            pending_filters = (
+                CompanySourceRecord.source == "offerbiu",
+                CompanySourceRecord.id.in_(registered_ids),
+                CompanySourceRecord.company_id.is_(None),
+                CompanySourceRecord.status != "unusable",
+            )
+            result["pending_entry_count"] = db.scalar(
+                select(func.count()).select_from(CompanySourceRecord).where(*pending_filters)
+            ) or 0
             pending_rows = list(db.scalars(
-                select(CompanySourceRecord).where(
-                    CompanySourceRecord.source == "offerbiu",
-                    CompanySourceRecord.company_id.is_(None),
-                    CompanySourceRecord.status != "unusable",
-                ).order_by(
+                select(CompanySourceRecord).where(*pending_filters).order_by(
                     CompanySourceRecord.updated_at.desc(),
                     CompanySourceRecord.id,
                 ).limit(100)
@@ -274,6 +292,8 @@ class OfferBiuRefreshService:
             }
             for row in pending
         ]
+        result["pending_entries_sample_count"] = len(pending)
+        result["pending_entries_limited"] = result["pending_entry_count"] > len(pending)
         return result
 
 

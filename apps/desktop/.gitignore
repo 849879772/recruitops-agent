@@ -1,0 +1,8 @@
+node_modules/
+dist/
+out/
+test-results/
+playwright-report/
+.cache/
+.package-staging/
+__pycache__/

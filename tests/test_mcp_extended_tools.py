@@ -188,7 +188,11 @@ def test_extended_mcp_surface_and_classification_are_explicit(tmp_path) -> None:
     } <= server.tools.keys()
 
 
-def test_extended_tools_bind_dependencies_and_preserve_typed_results(tmp_path) -> None:
+def test_extended_tools_bind_dependencies_and_preserve_typed_results(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "packages.mcp.server.get_settings",
+        lambda: type("Settings", (), {"write_enabled": True})(),
+    )
     repository = InMemoryRepository()
     repository.applications = []
     server = FakeMCPServer()
@@ -243,7 +247,11 @@ def test_extended_tools_bind_dependencies_and_preserve_typed_results(tmp_path) -
     assert operation.data is not None and operation.data.run_status == "success"
 
 
-def test_missing_mcp_dependencies_fail_closed_with_structured_errors() -> None:
+def test_missing_mcp_dependencies_fail_closed_with_structured_errors(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "packages.mcp.server.get_settings",
+        lambda: type("Settings", (), {"write_enabled": True})(),
+    )
     server = FakeMCPServer()
     register_tools(
         server,
@@ -274,7 +282,11 @@ def test_missing_mcp_dependencies_fail_closed_with_structured_errors() -> None:
     assert failures["operation_run"].read_only is False
 
 
-def test_mcp_keeps_async_handlers_and_structured_typed_response() -> None:
+def test_mcp_keeps_async_handlers_and_structured_typed_response(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "packages.mcp.server.get_settings",
+        lambda: type("Settings", (), {"write_enabled": True})(),
+    )
     server = FakeMCPServer()
     register_tools(
         server,

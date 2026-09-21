@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any, Mapping
 import yaml
 from sqlalchemy import select
 
-from packages.config import Settings
+from packages.config import DEFAULT_OFFERBIU_INDUSTRY_GROUPS, Settings, get_settings
 from packages.browser_bridge import BrowserBridgeStore
 from packages.domain.models import RecruitmentBatch
 from packages.discovery.company_registry import CompanySourceRecord, CompanySourceRegistry
@@ -43,8 +44,10 @@ from packages.storage.models import CompanySnapshot, JobSnapshot
 from packages.storage.sync import AgentStateStore
 from packages.tools.recruitment_mail import RecruitmentMailReviewInput, review_recruitment_mail
 from packages.tools.application_status_update import ApplicationStatusUpdateInput, update_application_status
+from packages.tools.typed import read_recruitment_persistence
 
 from .models import TaskCallable, TaskContext
+from .runner import _business_failure
 from .tasks import TaskType
 
 
@@ -307,7 +310,7 @@ def _prepare_full_offerbiu_scope(
     run_id: str,
     source_record_ids: tuple[str, ...],
 ) -> tuple[Path, int]:
-    """Build one full-run catalog from the current BIU snapshot and legacy config."""
+    """Build one full-run catalog from only the current BIU snapshot."""
 
     with storage.session() as db:
         source_rows = list(db.scalars(select(CompanySourceRecord).where(
@@ -356,13 +359,11 @@ def _prepare_full_offerbiu_scope(
         seen_ids.add(company_id)
 
     offerbiu_count = len(rows)
-    for company in load_companies(settings.companies_config):
-        name_key = normalize_company_name(company.name)
-        if name_key in seen_names or company.id in seen_ids:
-            continue
-        rows.append(company.crawler_config())
-        seen_names.add(name_key)
-        seen_ids.add(company.id)
+    if not rows:
+        raise ValueError(
+            "OfferBiu selected industry scope returned zero crawlable sources; "
+            "refusing legacy companies fallback"
+        )
 
     runtime_dir = Path(settings.agent_root) / ".data" / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -372,6 +373,16 @@ def _prepare_full_offerbiu_scope(
         encoding="utf-8",
     )
     return scope_path, offerbiu_count
+
+
+def _configured_discovery_scope(configured: Any) -> dict[str, list[str]] | None:
+    """Read explicit BIU industry selection without importing profile internals."""
+
+    values = getattr(configured, "offerbiu_industry_groups", None)
+    if not isinstance(values, (list, tuple, set)):
+        return None
+    groups = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+    return {"industry_groups": groups} if groups else None
 
 
 def _link_unambiguous_recruitment_mail(
@@ -516,7 +527,7 @@ def build_runtime_task_handlers(
     daily_sync: DailyRecruitmentSync | None = None,
     browser_bridge_store: BrowserBridgeStore | None = None,
 ) -> Mapping[str, TaskCallable]:
-    configured = settings or Settings()
+    configured = settings or get_settings()
     if repository is None:
         agent_storage = Storage.from_url(configured.database_url)
     elif (
@@ -540,6 +551,7 @@ def build_runtime_task_handlers(
             api_key=configured.llm_api_key,
             model=configured.llm_model,
             endpoint=configured.llm_endpoint,
+            api_style=configured.model_api_style,
             timeout=configured.llm_timeout_seconds,
             max_tokens=configured.llm_matching_max_tokens,
             thinking_enabled=configured.llm_matching_thinking_enabled,
@@ -708,6 +720,7 @@ def build_runtime_task_handlers(
         active_scope_path = Path(companies_path).expanduser() if companies_path else None
         current_offerbiu_source_ids = tuple(persisted_source_record_ids)
         offerbiu_company_count = 0
+        offerbiu_scope_attempted = False
         state_store = AgentStateStore(agent_storage) if agent_storage is not None else None
         state: dict[str, Any] = {
             "mode": (
@@ -846,13 +859,29 @@ def build_runtime_task_handlers(
 
         def discover(dry_run: bool = False):
             nonlocal current_offerbiu_source_ids, offerbiu_company_count, pipeline
+            nonlocal offerbiu_scope_attempted
             if effective_company_ids:
                 return {"source": "offerbiu", "status": "skipped_scoped_run"}
             if not getattr(configured, "discovery_enabled", False):
                 return {"source": "offerbiu", "status": "disabled"}
             if agent_storage is None:
                 return {"source": "offerbiu", "status": "storage_unavailable"}
-            service = OfferBiuRefreshService(CompanySourceRegistry(agent_storage))
+            offerbiu_scope_attempted = True
+            configured_scope = _configured_discovery_scope(configured)
+            service_parameters = inspect.signature(OfferBiuRefreshService).parameters
+            if configured_scope and "scope" in service_parameters:
+                service = OfferBiuRefreshService(
+                    CompanySourceRegistry(agent_storage),
+                    scope=configured_scope,
+                )
+            elif configured_scope and set(configured_scope["industry_groups"]) != set(
+                DEFAULT_OFFERBIU_INDUSTRY_GROUPS
+            ):
+                raise RuntimeError(
+                    "当前 OfferBiu 发现适配器不支持所选行业范围；已拒绝回退默认或 legacy 公司清单"
+                )
+            else:
+                service = OfferBiuRefreshService(CompanySourceRegistry(agent_storage))
             result = service.refresh(
                 apply=not dry_run,
                 max_pages=int(getattr(configured, "offerbiu_max_pages", 150)),
@@ -879,6 +908,11 @@ def build_runtime_task_handlers(
             return {
                 "source": "offerbiu",
                 "status": "preview" if dry_run else "registered",
+                "industry_groups": (
+                    list(configured_scope["industry_groups"])
+                    if configured_scope
+                    else list(DEFAULT_OFFERBIU_INDUSTRY_GROUPS)
+                ),
                 **result,
             }
 
@@ -982,6 +1016,11 @@ def build_runtime_task_handlers(
                 active_pipeline = build_pipeline()
                 pipeline = active_pipeline
             elif active_scope_path is None and agent_storage is not None and run_id is not None:
+                if offerbiu_scope_attempted:
+                    raise ValueError(
+                        "OfferBiu selected industry scope returned zero crawlable sources; "
+                        "refusing legacy companies fallback"
+                    )
                 fallback_path, fallback_ids = _prepare_configured_scope(
                     configured,
                     run_id,
@@ -1117,6 +1156,22 @@ def build_runtime_task_handlers(
                 raise ValueError("resume_run_id is only valid for resume mode")
             elif requested_mode not in _DAILY_MODES:
                 raise ValueError(f"unsupported daily mode: {requested_mode}")
+            if getattr(configured, "env", "development") == "desktop-isolated" and effective_mode in {"full", "crawl_only"}:
+                from packages.candidate_profile.loader import CandidateProfileError, load_candidate_profile
+                try:
+                    candidate = load_candidate_profile(configured.candidate_profile_config)
+                    keywords = candidate.matching.title_keywords
+                except CandidateProfileError:
+                    keywords = []
+                missing = []
+                if not keywords:
+                    missing.append("title_keywords")
+                if not configured.offerbiu_industry_groups:
+                    missing.append("industry_groups")
+                if missing:
+                    return {"status": "configuration_required", "missing": missing,
+                            "agent_write_performed": False,
+                            "message": "请先配置岗位标题关键词和行业范围；助理聊天不受此限制。"}
             result = build_daily_sync(
                 context.run_id,
                 () if requested_mode == "resume" else company_ids,
@@ -1143,13 +1198,48 @@ def build_runtime_task_handlers(
             payload = result.model_dump(mode="json")
             pipeline_payload = payload.get("pipeline")
             pipeline_metrics = pipeline_payload if isinstance(pipeline_payload, dict) else {}
-            return {
-                "status": "completed" if result.status is not DailySyncStatus.FAILED else "failed",
-                "sync_status": result.status.value,
+            discovery = payload.get("discovery")
+            discovery_metrics = discovery if isinstance(discovery, dict) else {}
+            offline = payload.get("offline_reconciliation")
+            offline_metrics = offline if isinstance(offline, dict) else {}
+            source_registration_written = bool(
+                discovery_metrics.get("applied")
+                and discovery_metrics.get("registered_entries", 0)
+            )
+            write_statistics = {
+                "source_registration_write_performed": source_registration_written,
+                "source_registered_entry_count": discovery_metrics.get("registered_entries"),
+                "pipeline_write_performed": bool(pipeline_metrics.get("written")),
+                "job_snapshot_write_count": None,
+                "offline_reconciliation_write_performed": bool(offline_metrics.get("written")),
+                "basis": (
+                    "Reported business-stage writes, excluding scheduler/checkpoint bookkeeping. "
+                    "Pipeline writes may include job snapshots and analysis; not a job row count. "
+                    "Per-run job write count is unknown without a row-level write receipt. "
+                    "False means no write receipt, not proof that no partial writes occurred. "
+                    "Registered entries count source rows, not distinct companies."
+                ),
+            }
+            response = {
                 **pipeline_metrics,
+                "status": (
+                    "failed" if result.status is DailySyncStatus.FAILED
+                    or _business_failure(pipeline_metrics) else "completed"
+                ),
+                "sync_status": result.status.value,
                 "daily_sync": payload,
-                "agent_write_performed": bool(pipeline_metrics.get("written")),
+                "error": payload.get("error") or _business_failure(pipeline_metrics),
+                "agent_write_performed": any((
+                    source_registration_written,
+                    write_statistics["pipeline_write_performed"],
+                    write_statistics["offline_reconciliation_write_performed"],
+                )),
+                "write_statistics": write_statistics,
+                "persistence": read_recruitment_persistence(
+                    agent_storage or getattr(repo, "storage", None),
+                ).model_dump(mode="json"),
                 "source_write_attempted": False,
+                "source_write_scope": "legacy_project_read_only",
                 "requested_mode": requested_mode,
                 "effective_mode": effective_mode,
                 "source_record_ids": list(
@@ -1159,6 +1249,15 @@ def build_runtime_task_handlers(
                 ),
                 "resumed_from": resume_run_id or None,
             }
+            if agent_storage is not None and not requested_dry_run:
+                state_store = AgentStateStore(agent_storage)
+                try:
+                    state = state_store.get_task_state(context.run_id) or {}
+                    state_store.save_task_state(context.run_id, {**state, "result": response})
+                except Exception as exc:
+                    # Keep the original receipt even if final bookkeeping fails.
+                    response["result_persistence_error"] = type(exc).__name__
+            return response
         page = repo.search_jobs(
             cohort=2027,
             cohort_status="confirmed",

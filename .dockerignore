@@ -1,6 +1,11 @@
 .git
 .github
 .venv
+.venv-desktop-tests
+.desktop-runtime-tests
+artifacts
+apps/desktop/node_modules
+apps/desktop/.cache
 __pycache__
 *.py[cod]
 .pytest_cache
@@ -15,6 +20,10 @@ build
 .data
 data
 reports
+outputs
+tmp
+work
+backups
 temp_test
 .env
 .env.*

@@ -67,6 +67,13 @@ def launch_browser(playwright, **kwargs):
 
     executable_path = os.getenv("RECRUITOPS_BROWSER_EXECUTABLE_PATH", "").strip()
     channel = os.getenv("RECRUITOPS_BROWSER_CHANNEL", "msedge").strip()
+    if os.getenv("RECRUITOPS_ENV") == "desktop-isolated":
+        # The isolated runtime owns the executable; never resolve installed Edge.
+        if not executable_path:
+            raise RuntimeError("desktop_browser_executable_missing")
+        kwargs.pop("channel", None)
+        kwargs["executable_path"] = executable_path
+        return playwright.chromium.launch(**kwargs)
     if executable_path:
         kwargs["executable_path"] = executable_path
     elif channel and channel.casefold() not in {"chromium", "bundled"}:

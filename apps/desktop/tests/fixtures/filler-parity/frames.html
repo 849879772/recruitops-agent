@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Anonymous frame routing</title><body>
+<label>Name <input id="name" name="fullName"></label>
+<iframe id="same-origin" title="Same origin" src="controls.html"></iframe>
+<iframe id="cross-origin" title="Cross origin" src="https://frame.example.test/controls.html"></iframe>
+<iframe id="nested" title="Nested" srcdoc="&lt;iframe title='Nested form' src='controls.html'&gt;&lt;/iframe&gt;"></iframe>
+<iframe id="restricted" title="Restricted" sandbox srcdoc="&lt;label&gt;Name &lt;input name='fullName'&gt;&lt;/label&gt;"></iframe>
+</body></html>

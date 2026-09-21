@@ -1,13 +1,16 @@
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from apps.api import main, local_ui
 from packages.storage import Storage, ApplicationSnapshot, CompanySnapshot, JobSnapshot
 from packages.storage.models import ScheduleEventSnapshot
+from packages.recruitment_mail.storage import RecruitmentMailRecord
 
 
 @pytest.fixture
@@ -18,13 +21,14 @@ def case(monkeypatch, tmp_path):
     monkeypatch.setattr(local_ui, "get_settings", lambda: settings)
     monkeypatch.chdir(tmp_path)
     storage = Storage.from_url(settings.database_url, initialize=True)
+    monkeypatch.setattr(main, "get_repository", lambda: main.PostgresRecruitmentRepository(storage))
     now = datetime.now(timezone.utc)
     with storage.write_transaction() as session:
         session.add(ApplicationSnapshot(id="fixture", company_name="Test", job_title="Engineer",
             stage="applied", stage_history=[], source="fixture", source_ref="fixture",
             idempotency_key="fixture", updated_at=now))
-    client = TestClient(main.app, base_url="http://127.0.0.1:8012")
-    headers = {"Origin": "http://127.0.0.1:8012", "X-RecruitOps-Local-UI": "1"}
+    client = TestClient(main.app, base_url="http://127.0.0.1:18010")
+    headers = {"Origin": "http://127.0.0.1:18010", "X-RecruitOps-Local-UI": "1"}
     return client, headers, now.isoformat(), storage, settings
 
 
@@ -41,7 +45,7 @@ def test_local_edit_without_token_and_stale_conflict(case):
     assert client.patch("/api/local-ui/applications/fixture", headers=headers, json=body).status_code == 409
 
 
-@pytest.mark.parametrize("origin", ["http://evil.example", "null", "http://localhost:8012", "http://127.0.0.1:9999"])
+@pytest.mark.parametrize("origin", ["http://evil.example", "null", "http://localhost:18010", "http://127.0.0.1:9999"])
 def test_external_origin_is_blocked(case, origin):
     client, headers, stamp, *_ = case
     headers["Origin"] = origin
@@ -59,6 +63,11 @@ def test_unmarked_request_and_readonly_blocked(case):
 
 def test_add_event_and_backed_up_delete(case, tmp_path):
     client, headers, stamp, storage, _ = case
+    with storage.write_transaction() as session:
+        session.add(RecruitmentMailRecord(id="linked-mail", dedupe_key="linked-mail",
+            dedupe_kind="message_id", mailbox="INBOX", message_id="fixture@example.test",
+            content_digest="a" * 64, category="interview", confidence=1,
+            requires_confirmation=False, application_id="fixture", body_text="Fixture mail"))
     response = client.post("/api/local-ui/applications/fixture/events", headers=headers,
         json=dict(event_type="interview", event_date="2026-10-01", event_time="09:00"))
     assert response.status_code == 200, response.text
@@ -70,7 +79,64 @@ def test_add_event_and_backed_up_delete(case, tmp_path):
     with storage.session() as session:
         assert session.get(ApplicationSnapshot, "fixture") is None
         assert not session.scalars(select(ScheduleEventSnapshot)).all()
-    assert len(list((tmp_path / '.data/backups').glob('manual-application-delete-*.json'))) == 1
+        mail = session.get(RecruitmentMailRecord, "linked-mail")
+        assert mail.application_id is None
+        assert mail.body_text == "Fixture mail"
+    backups = list((tmp_path / '.data/backups').glob('manual-application-delete-*.json'))
+    assert len(backups) == 1
+    backup = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert backup["application"]["id"] == "fixture"
+    assert len(backup["events"]) == 1
+    assert backup["mail_links"] == [{"id": "linked-mail", "application_id": "fixture"}]
+
+
+def test_delete_rejects_unmarked_readonly_and_stale_requests(case, tmp_path):
+    client, headers, stamp, storage, settings = case
+    path = "/api/local-ui/applications/fixture"
+    body = dict(expected_updated_at=stamp)
+    assert client.request("DELETE", path, json=body).status_code == 403
+    settings.write_enabled = False
+    assert client.request("DELETE", path, headers=headers, json=body).status_code == 403
+    settings.write_enabled = True
+    assert client.request("DELETE", path, headers=headers,
+        json=dict(expected_updated_at="2000-01-01T00:00:00Z")).status_code == 409
+    with storage.session() as session:
+        assert session.get(ApplicationSnapshot, "fixture") is not None
+    assert not list((tmp_path / '.data/backups').glob('manual-application-delete-*.json'))
+
+
+@pytest.mark.parametrize("stored,expected", [
+    ("2026-09-20T08:00:00.123456+08:00", "2026-09-20T08:00:00.123456+08:00"),
+    ("2026-09-20T08:00:00.123456+08:00", "2026-09-20T00:00:00.123456+00:00"),
+    ("2026-09-19T19:00:00.123456-05:00", "2026-09-20T00:00:00.123456+00:00"),
+    ("2026-09-20T00:00:00.123456", "2026-09-20T00:00:00.123456"),
+    ("2026-09-20T00:00:00.123456", "2026-09-20T08:00:00.123456+08:00"),
+])
+def test_application_version_compares_instants_not_timezone_labels(stored, expected):
+    row = SimpleNamespace(updated_at=datetime.fromisoformat(stored))
+    session = SimpleNamespace(scalar=lambda statement: row)
+    assert local_ui._row(session, "fixture", datetime.fromisoformat(expected)) is row
+    stale = datetime.fromisoformat(expected).replace(microsecond=123455)
+    with pytest.raises(HTTPException) as error:
+        local_ui._row(session, "fixture", stale)
+    assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("action", ["delete", "edit", "link"])
+def test_application_list_version_round_trips_into_manual_write(case, action):
+    client, headers, *_ = case
+    response = client.get("/api/applications/page", headers={**headers, "Authorization": "Bearer secret"})
+    assert response.status_code == 200, response.text
+    body = {"expected_updated_at": response.json()["items"][0]["updated_at"]}
+    path = "/api/local-ui/applications/fixture"
+    if action == "delete":
+        response = client.request("DELETE", path, headers=headers, json=body)
+    elif action == "edit":
+        response = client.patch(path, headers=headers, json={**body, "stage": "written"})
+    else:
+        response = client.patch(path + "/record-url", headers=headers,
+            json={**body, "record_url": "https://example.test/personal/applications"})
+    assert response.status_code == 200, response.text
 
 
 def test_token_bypass_is_scoped_to_local_ui():
@@ -113,6 +179,48 @@ def test_record_job_directly_and_idempotently(case):
         assert len(rows) == 1
         assert len(rows[0].stage_history) == 1
         assert rows[0].record_url is None
+
+
+def test_manual_application_is_idempotent_and_preserves_terminal_history(case):
+    client, headers, _, storage, _ = case
+    path = "/api/local-ui/applications/manual"
+    body = dict(company_name=" Example ", job_title=" Engineer ", stage="rejected", note="Fixture")
+    response = client.post(path, headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["created"] is True
+    repeat = client.post(path, headers=headers, json={**body, "stage": "applied", "note": "Changed"})
+    assert repeat.json() == {**result, "created": False}
+    with storage.session() as session:
+        row = session.get(ApplicationSnapshot, result["application_id"])
+        assert row.company_name == "Example"
+        assert row.job_title == "Engineer"
+        assert row.stage == "rejected" and row.note == "Fixture"
+        assert row.job_id is None and row.record_url is None
+        assert len(row.stage_history) == 1
+        assert row.stage_history[0]["result"] == "淘汰"
+
+
+@pytest.mark.parametrize("invalid", [
+    {"company_name": " "}, {"job_title": " "}, {"stage": "invented"},
+    {"record_url": "javascript:alert(1)"}, {"record_url": "https://user:secret@example.test/"},
+    {"record_url": "https://example.test/#/job/1"}, {"unexpected": True},
+])
+def test_manual_application_validation(case, invalid):
+    client, headers, *_ = case
+    response = client.post("/api/local-ui/applications/manual", headers=headers,
+        json={"company_name": "Example", "job_title": "Engineer", **invalid})
+    assert response.status_code == 422
+
+
+def test_manual_application_requires_same_origin_and_write_opt_in(case):
+    client, headers, _, _, settings = case
+    path = "/api/local-ui/applications/manual"
+    body = {"company_name": "Example", "job_title": "Engineer"}
+    assert client.post(path, json=body).status_code == 403
+    assert client.post(path, headers={**headers, "Origin": "https://evil.example"}, json=body).status_code == 403
+    settings.write_enabled = False
+    assert client.post(path, headers=headers, json=body).status_code == 403
 
 
 def test_record_job_preserves_existing_terminal_stage(case):

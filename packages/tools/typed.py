@@ -148,19 +148,100 @@ class JobDetailData(ToolModel):
     analysis: JobAnalysis | None = None
 
 
+class RecruitmentPersistenceStats(ToolModel):
+    status: Literal["available", "unavailable"] = "unavailable"
+    scope: Literal["all_agent_records", "company_name"] = "all_agent_records"
+    company_name: str | None = None
+    source_record_count: int | None = Field(default=None, ge=0)
+    company_snapshot_count: int | None = Field(default=None, ge=0)
+    job_snapshot_count: int | None = Field(default=None, ge=0)
+    offerbiu_unlinked_usable_entry_count: int | None = Field(default=None, ge=0)
+    observed_at: datetime | None = None
+    count_basis: str = (
+        "Current persisted row counts, not writes by this run or distinct companies. "
+        "Sources: company_source_records; companies: company_snapshots; jobs: job_snapshots. "
+        "OfferBiu entries: source=offerbiu, company_id IS NULL, status!=unusable; "
+        "all matching rows, not the pending_entries sample. "
+        "Counts use company_name scope only; integration_status and pagination do not apply."
+    )
+    unavailable_reason: str | None = None
+
+
+def read_recruitment_persistence(
+    storage: Any,
+    *,
+    company_name: str | None = None,
+    company_ids: tuple[str, ...] = (),
+    company_names: tuple[str, ...] = (),
+) -> RecruitmentPersistenceStats:
+    """Read Agent inventory only; missing storage/schema must never imply zero."""
+    from datetime import timezone
+    from sqlalchemy import func, or_, select
+    from packages.discovery.company_registry import CompanySourceRecord
+    from packages.storage import Storage
+    from packages.storage.models import CompanySnapshot, JobSnapshot
+
+    scope = {
+        "scope": "company_name" if company_name else "all_agent_records",
+        "company_name": company_name,
+    }
+    if not isinstance(storage, Storage):
+        return RecruitmentPersistenceStats(**scope, unavailable_reason="Agent storage not available")
+    try:
+        with storage.session() as db:
+            sources = select(func.count()).select_from(CompanySourceRecord)
+            companies = select(func.count()).select_from(CompanySnapshot)
+            jobs = select(func.count()).select_from(JobSnapshot)
+            if company_name:
+                names = {name.lower() for name in (company_name, *company_names)}
+                source_filter = or_(
+                    func.lower(CompanySourceRecord.company_name).in_(names),
+                    CompanySourceRecord.company_id.in_(company_ids),
+                )
+                sources = sources.where(source_filter)
+                companies = companies.where(CompanySnapshot.id.in_(company_ids))
+                linked_company_ids = select(CompanySourceRecord.company_id).where(source_filter)
+                jobs = jobs.where(or_(
+                    JobSnapshot.company_id.in_(company_ids),
+                    JobSnapshot.company_id.in_(linked_company_ids),
+                ))
+            pending = sources.where(
+                CompanySourceRecord.source == "offerbiu",
+                CompanySourceRecord.company_id.is_(None),
+                CompanySourceRecord.status != "unusable",
+            )
+            return RecruitmentPersistenceStats(
+                **scope, status="available", observed_at=datetime.now(timezone.utc),
+                source_record_count=db.scalar(sources),
+                company_snapshot_count=db.scalar(companies),
+                job_snapshot_count=db.scalar(jobs),
+                offerbiu_unlinked_usable_entry_count=db.scalar(pending),
+            )
+    except Exception as exc:
+        return RecruitmentPersistenceStats(
+            **scope, unavailable_reason=f"Persistence counts unavailable: {type(exc).__name__}",
+        )
+
+
 class CompanyCoverageData(ToolModel):
     companies: list[Company]
     total: int = Field(ge=0)
     connected: int = Field(ge=0)
     not_connected: int = Field(ge=0)
+    coverage_basis: Literal["company_snapshots"] = "company_snapshots"
+    coverage_note: str = (
+        "Coverage totals count company snapshots, not registered source entries. "
+        "Zero coverage does not mean company sources were not saved."
+    )
+    persistence: RecruitmentPersistenceStats | None = None
 
 
 class ApplicationQueryData(ToolModel):
     matches: list[Application] = Field(default_factory=list)
     application: Application | None = None
-    total: int = Field(default=0, ge=0)
+    total: int = Field(default=0, ge=0, description="Matched records AFTER all filters; do not subtract excluded_terminal again.")
     company_count: int = Field(default=0, ge=0)
-    excluded_terminal: int = Field(default=0, ge=0)
+    excluded_terminal: int = Field(default=0, ge=0, description="Already excluded before counting total; informational only.")
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -382,9 +463,11 @@ def describe_capabilities(request: CapabilitiesInput) -> CapabilitiesResponse:
                     "解释岗位匹配依据并检索爬虫接入经验",
                     "生成投递状态复核、邮件关联和定时计划的只读预览",
                     "按明确指令运行受控的本地招聘运营任务",
+                    "按明确指令直接后台执行全量抓取、筛选、JD补全、评分及入库，无需先建定时任务",
                 ],
                 safety_boundary=(
                     "默认只读；用户明确要求添加或修改本地待办即为该操作授权，无需额外审批。"
+                    "明确要求全量抓取即授权该次受控后台流水线，无需再次确认；仍须通过实例写入及配置校验。"
                     "投递阶段写入仍须通过证据校验；其他受控操作沿用既有审批规则。"
                 ),
             ),
@@ -480,6 +563,14 @@ def company_coverage(
                 if company.name.casefold() == needle
                 or any(alias.casefold() == needle for alias in company.aliases)
             ]
+        persistence = read_recruitment_persistence(
+            getattr(repository, "storage", None),
+            company_name=request.company_name,
+            company_ids=tuple(company.id for company in companies),
+            company_names=tuple(
+                name for company in companies for name in (company.name, *company.aliases)
+            ),
+        )
         if request.integration_status:
             status = request.integration_status.casefold()
             companies = [
@@ -494,13 +585,17 @@ def company_coverage(
             total=total,
             connected=connected,
             not_connected=total - connected,
+            persistence=persistence,
         )
         if not data.companies:
             return _outcome(
                 ToolStatus.NO_RESULTS,
                 data,
                 error_code=ToolErrorCode.NO_RESULTS,
-                error_message="No companies matched the coverage query.",
+                error_message=(
+                    "No company snapshots matched the coverage query. "
+                    "This does not establish absence of registered source entries; see persistence."
+                ),
             )
         return _outcome(ToolStatus.SUCCESS, data)
 

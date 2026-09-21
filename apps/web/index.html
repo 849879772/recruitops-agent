@@ -5,11 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f2f7ff">
     <title>秋招工作台 | RecruitOps Agent</title>
-    <link rel="stylesheet" href="./styles.css?v=0.4.20-20260915">
-    <script defer src="./app.js?v=0.4.20-20260915"></script>
-    <script defer src="./company-sources.js?v=0.4.20-20260915"></script>
-    <script defer src="./configuration.js?v=0.4.20-20260915"></script>
-    <script defer src="./knowledge.js?v=0.4.20-20260915"></script>
+    <link rel="stylesheet" href="./styles.css?v=public-ui-20260918">
+    <script defer src="./app.js?v=public-ui-20260918"></script>
+    <script defer src="./company-sources.js?v=public-ui-20260918"></script>
+    <script defer src="./configuration.js?v=public-ui-20260918"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -39,9 +38,6 @@
           <button class="nav-item" type="button" data-view="assistant">
             <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H8l-4 4z"></path></svg></span>
             <span>求职助理</span>
-          </button>
-          <button class="nav-item" type="button" data-view="knowledge">
-            <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 7v14m-9-3V3h6a3 3 0 0 1 3 3 3 3 0 0 1 3-3h6v15h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3H3Z"></path></svg></span><span>个人知识库</span>
           </button>
           <button class="nav-item" type="button" data-view="applications">
             <span class="nav-symbol" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 12h6M9 16h6"></path></svg></span>
@@ -117,6 +113,10 @@
         </header>
 
         <div class="content-wrap">
+          <div id="onboarding-notice" class="onboarding-notice" role="status" hidden>
+            <span id="onboarding-notice-text"></span>
+            <button type="button" class="text-button" id="onboarding-open">打开配置</button>
+          </div>
           <section class="view-panel" id="dashboard-view" data-view-panel="dashboard" aria-labelledby="dashboard-heading" hidden>
             <div class="section-heading">
               <div>
@@ -335,7 +335,7 @@
             <div class="section-heading">
               <div><h2 id="applications-heading">投递记录</h2><p class="section-description" id="application-page-description">步骤看所在列、卡面只看结果</p></div>
               <div class="section-actions">
-                <button class="button button--secondary" type="button" data-assistant-prompt="记录一条新的库外投递，请先询问我公司、岗位和投递地址。">添加投递</button>
+                <button class="button button--secondary" id="application-add-button" type="button">手动添加</button>
                 <button class="icon-button" id="applications-refresh-button" type="button" aria-label="刷新投递记录" title="刷新投递记录"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg></button>
               </div>
             </div>
@@ -411,51 +411,74 @@
           <section class="view-panel" id="configuration-view" data-view-panel="configuration" aria-labelledby="configuration-heading" hidden>
             <div class="section-heading"><h2 id="configuration-heading">个人配置</h2><button class="button button--secondary" id="configuration-reload" type="button">重新读取</button></div>
             <div id="configuration-message" role="status" aria-live="polite"></div>
+            <section class="configuration-onboarding" aria-label="首次配置" aria-live="polite">
+              <h3 id="configuration-readiness">配置状态尚未读取</h3>
+              <ul id="configuration-missing"></ul>
+            </section>
+            <div class="configuration-status" aria-label="核心能力状态">
+              <div><span>模型与求职助理</span><strong id="configuration-model-status">读取中</strong></div>
+              <div><span>抓取后评分</span><strong id="configuration-analysis-status">读取中</strong></div>
+              <div><span>招聘邮箱</span><strong id="configuration-mail-status">读取中</strong></div>
+            </div>
             <form id="configuration-form" class="configuration-form">
-              <fieldset><legend>DeepSeek V4.1 Flash</legend><div class="configuration-grid">
-                <label class="configuration-toggle"><input type="checkbox" name="llm_enabled">启用模型调用</label>
-                <label class="configuration-toggle"><input type="checkbox" name="job_analysis_enabled">抓取后自动评分</label>
-                <label class="configuration-toggle"><input type="checkbox" name="codex_runtime_enabled">启用求职助理</label>
-                <label>API 密钥<input name="llm_api_key" type="password" autocomplete="new-password"><span id="api-secret-state"></span></label>
-                <label>API 服务地址<input name="model_api_base_url" type="url" placeholder="https://api.deepseek.com" required></label>
-              </div></fieldset>
-              <fieldset><legend>简历与求职意向</legend><div class="configuration-grid">
-                <label>上传简历<input id="resume-upload" type="file" accept=".pdf,.txt,.md"></label>
-                <label>学历<input name="degree"></label>
-                <label>招聘类型<input name="job_type"></label>
-                <label>目标方向<input name="direction"></label>
-                <label>标题包含关键词<textarea name="title_keywords" rows="3" placeholder="每行一个；留空使用现有方向规则"></textarea></label>
-                <label>标题排除关键词<textarea name="excluded_title_keywords" rows="3" placeholder="每行一个；实习和博士岗位始终排除"></textarea></label>
-              </div>
-              <section id="resume-preview" hidden aria-label="简历解析确认">
-                <h3>确认简历资料</h3>
+              <fieldset><legend>模型连接</legend>
+                <div class="configuration-section-heading"><p>所有智能功能使用主连接；可以保留备用连接，切换后统一生效。</p><button class="button button--secondary" id="model-connection-add" type="button">添加连接</button></div>
+                <div class="model-connection-list" id="model-connection-list"></div>
+                <button class="button button--primary" id="model-connection-save" type="button">保存模型连接</button>
+                <details class="configuration-guide" id="assistant-advanced-options"><summary>高级：助理模式</summary>
+                  <label>求职助理<select id="configuration-assistant-mode"><option value="auto">随有效模型连接启用</option><option value="disabled">保持关闭</option></select></label>
+                </details>
+                <p class="configuration-hint">连接测试会真实验证鉴权、模型名称、结构化输出和求职助理接口，不会保存尚未提交的密钥。</p>
+              </fieldset>
+              <fieldset><legend>简历与岗位筛选</legend>
+                <p class="configuration-section-copy">上传简历后，模型生成技能、项目摘要和岗位筛选关键词。关键词可自行修改，保存后生效。</p>
                 <div class="configuration-grid">
-                  <label>学历<input id="resume-degree"></label>
-                  <label>技能<textarea id="resume-skills" rows="4"></textarea></label>
-                  <label>工程栈<textarea id="resume-stack" rows="4"></textarea></label>
-                  <label>项目经历<textarea id="resume-projects" rows="4" readonly></textarea></label>
+                  <label class="configuration-wide">上传简历<div class="configuration-file-row"><input id="resume-upload" type="file" accept=".pdf,.txt,.md"><button type="button" class="button button--secondary" id="resume-analyze">分析简历</button></div><small id="resume-file-state">支持文字版 PDF、TXT、Markdown，最大 10 MB</small></label>
+                  <label>学历<select name="degree"><option value="">尚未填写</option><option value="本科">本科</option><option value="硕士">硕士</option><option value="博士">博士</option></select></label>
+                  <label class="configuration-wide">岗位筛选关键词（必填）<textarea name="title_keywords" aria-required="true" rows="5" placeholder="上传简历后自动生成；每行一个，可自行增删"></textarea><small>至少填写一个关键词。先按岗位标题筛选相关岗位，再抓取详情并进行匹配度评分。</small></label>
                 </div>
-                <details><summary>原文依据</summary><pre id="resume-evidence"></pre></details>
-                <div class="resume-actions"><button type="button" id="resume-confirm" class="button button--primary">确认替换旧简历资料</button><button type="button" id="resume-cancel" class="button">取消</button></div>
-              </section>
-              <details class="configuration-advanced"><summary>高级设置与简历原文</summary><div class="configuration-grid">
-                <label>技能<textarea name="skills" rows="3"></textarea></label>
-                <label>主要方向<textarea name="primary_directions" rows="3"></textarea></label>
-                <label>次要方向<textarea name="secondary_directions" rows="3"></textarea></label>
-                <label>工程栈证据<textarea name="supporting_skills" rows="3"></textarea></label>
-                <label>学习目标<textarea name="learning_targets" rows="3"></textarea></label>
-                <label>未经验证的技能<textarea name="unverified_skills" rows="3"></textarea></label>
-                <label class="configuration-wide">简历正文与项目经历<textarea name="project_evidence" rows="12" maxlength="60000"></textarea></label>
-              </div></details></fieldset>
-              <fieldset><legend>邮箱</legend><div class="configuration-grid">
-                <label class="configuration-toggle"><input type="checkbox" name="mail_enabled">启用邮箱同步</label>
-                <label>邮箱账号<input name="mail_imap_username" autocomplete="username"></label>
-                <label>IMAP 服务器<input name="mail_imap_host"></label>
-                <label>SSL 端口<input name="mail_imap_port" type="number" min="1" max="65535" required></label>
-                <label>邮箱授权码<input name="mail_imap_password" type="password" autocomplete="new-password"><span id="mail-secret-state"></span></label>
-                <label>邮件文件夹<input name="mail_imap_mailbox"></label>
-              </div></fieldset>
+                <section id="resume-preview" hidden aria-label="简历分析结果">
+                  <h3>简历分析结果</h3>
+                  <p class="configuration-hint">以下内容都有简历原文依据。请重点检查岗位筛选关键词，确认后再保存整页配置。</p>
+                  <div class="configuration-grid">
+                    <label>学历<select id="resume-degree"><option value="">尚未填写</option><option value="本科">本科</option><option value="硕士">硕士</option><option value="博士">博士</option></select></label>
+                    <label>已验证技能<textarea id="resume-skills" rows="4" readonly></textarea></label>
+                    <label>工程与辅助技能<textarea id="resume-stack" rows="4" readonly></textarea></label>
+                    <label class="configuration-wide">项目依据<textarea id="resume-projects" rows="5" readonly></textarea></label>
+                    <label class="configuration-wide">岗位筛选关键词<textarea id="resume-title-keywords" rows="4" placeholder="每行一个，可自行增删"></textarea></label>
+                  </div>
+                  <details><summary>查看原文依据</summary><pre id="resume-evidence"></pre></details>
+                  <div class="resume-actions"><button type="button" id="resume-confirm" class="button button--primary">应用分析结果</button><button type="button" id="resume-cancel" class="button">取消</button></div>
+                </section>
+              </fieldset>
+              <fieldset><legend>岗位来源范围</legend>
+                <div class="configuration-policy"><strong>固定规则</strong><span>仅收集校招正式岗位，默认排除社招、实习和不符合当前学历要求的岗位。</span></div>
+                <div><span class="configuration-field-label">OfferBiu 行业大类</span><div class="configuration-industry-grid" id="configuration-industry-groups"></div></div>
+              </fieldset>
+              <fieldset><legend>招聘邮箱</legend>
+                <p class="configuration-section-copy">保存有效的 IMAP 连接后启用只读招聘邮件同步；不会发送、删除邮件，也不会主动标记为已读。</p>
+                <div class="configuration-grid">
+                  <label>邮箱服务商<select id="mail-provider"></select></label>
+                  <label>邮箱账号<input name="mail_imap_username" autocomplete="username"></label>
+                  <label>IMAP 服务器<input name="mail_imap_host"></label>
+                  <label>SSL 端口<input name="mail_imap_port" type="number" min="1" max="65535" required></label>
+                  <label>邮箱授权码<input name="mail_imap_password" type="password" autocomplete="new-password"><span id="mail-secret-state"></span></label>
+                  <label>邮件文件夹<input name="mail_imap_mailbox"></label>
+                </div>
+                <div class="configuration-inline-actions"><button class="button button--secondary" id="mail-connection-test" type="button">测试邮箱连接</button><span id="mail-test-result" role="status"></span></div>
+                <details class="configuration-guide"><summary>查看邮箱配置教程</summary><ol><li>登录邮箱网页版，在设置中开启 IMAP 服务。</li><li>创建授权码或应用专用密码，不要填写网页登录密码。</li><li>填写完整邮箱地址和授权码，点击“测试邮箱连接”。</li><li>Gmail、Outlook 等若强制要求 OAuth2，当前版本暂时无法连接。</li></ol></details>
+              </fieldset>
+              <details class="configuration-guide" id="configuration-runtime-options">
+                <summary>其他运行选项</summary>
+                <div class="configuration-choices">
+                  <label class="configuration-toggle"><input type="checkbox" name="vision_enabled">视觉辅助（需启用模型）</label>
+                  <label class="configuration-toggle"><input type="checkbox" name="mail_sync_on_startup">启动时同步邮箱（需配置邮箱）</label>
+                </div>
+                <p id="configuration-runtime-status" role="status">运行能力状态尚未读取</p>
+              </details>
+              <p class="configuration-hint" id="configuration-restart-policy">助理使用已保存的模型连接，无需先填写简历或关键词。需要重启的配置会另行提示；保存不会调用模型、同步邮箱，也不会自动重启。模型与邮箱就绪后，评分和定时任务能力默认开启；每条日程仍可单独启用或暂停。</p>
               <button class="button button--primary" id="configuration-save" type="submit">保存配置</button>
+              <button class="button button--secondary" id="configuration-complete" type="submit">保存并完成首次配置</button>
             </form>
             <section class="workspace-section configuration-import"><div class="section-heading"><h3>投递记录导入</h3><button type="button" class="button button--secondary" id="application-import-template">下载 CSV 模板</button></div>
               <label>CSV / JSON 文件<input id="application-import-file" type="file" accept=".csv,.json"></label>
@@ -463,18 +486,6 @@
             </section>
           </section>
 
-          <section class="view-panel" id="knowledge-view" data-view-panel="knowledge" aria-labelledby="knowledge-heading" hidden>
-            <div class="section-heading"><h2 id="knowledge-heading">个人资料</h2><button class="button button--ghost" id="knowledge-refresh" type="button">刷新</button></div>
-            <form id="knowledge-import-form" class="knowledge-import">
-              <label>上传资料<input id="knowledge-file" type="file" accept=".md,.txt,.pdf"><small>Markdown / TXT / 文字版 PDF · 最大 5 MB</small></label>
-              <label>资料类型<select id="knowledge-kind"><option value="notes">学习笔记</option><option value="personal">个人经历材料</option><option value="reference">外部参考</option></select></label>
-              <label>名称<input id="knowledge-name" maxlength="240" placeholder="粘贴笔记时填写"></label>
-              <label class="knowledge-wide">粘贴笔记<textarea id="knowledge-text" rows="4" maxlength="100000"></textarea></label>
-              <div class="knowledge-wide knowledge-actions"><button class="button button--primary" id="knowledge-import" type="submit">导入</button><button class="button button--ghost" id="knowledge-cancel-edit" type="button" hidden>取消更新</button><span id="knowledge-model"></span></div>
-            </form>
-            <p id="knowledge-message" role="status" aria-live="polite"></p>
-            <div class="table-scroll"><table class="data-table knowledge-table"><thead><tr><th>资料</th><th>类型</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="knowledge-documents"></tbody></table></div>
-          </section>
           <section class="view-panel agent-chat-view" id="assistant-view" data-view-panel="assistant" aria-labelledby="assistant-heading" hidden>
             <div class="agent-workspace">
               <aside class="conversation-rail" aria-label="历史会话">
@@ -520,6 +531,11 @@
                   </div>
                 </header>
 
+                <div class="assistant-availability" id="assistant-availability" role="status" hidden>
+                  <p id="assistant-availability-detail"></p>
+                  <button type="button" class="text-button" id="assistant-open-configuration">配置模型连接</button>
+                  <button type="button" class="text-button" id="assistant-recheck">重新检查</button>
+                </div>
                 <div class="message-list agent-message-list" id="assistant-messages" aria-live="polite" aria-relevant="additions" aria-atomic="false">
                   <article class="message message--assistant">
                     <div class="message-meta"><strong>求职助理</strong><span>待命</span></div>
@@ -534,9 +550,7 @@
 
                 <form class="chat-composer" id="assistant-form" novalidate>
                   <input id="assistant-job-id" name="job_id" type="hidden">
-                  <div class="knowledge-chat-context">
-                    <label class="knowledge-toggle"><input type="checkbox" id="assistant-knowledge-enabled">个人知识库</label>
-                    <select id="assistant-knowledge-document" aria-label="知识库资料范围"><option value="">全部资料</option></select>
+                  <div class="assistant-job-context">
                     <span id="assistant-selected-job" hidden></span><button class="button button--ghost" id="assistant-clear-job" title="移除当前岗位" aria-label="移除当前岗位" type="button" hidden>×</button>
                   </div>
                   <label class="sr-only" for="assistant-message">向求职助理提问</label>
@@ -716,6 +730,11 @@
       </main>
     </div>
 
+    <dialog class="job-detail-dialog configuration-keywords-dialog" id="configuration-keywords-dialog" aria-labelledby="configuration-keywords-heading">
+      <h2 id="configuration-keywords-heading">请填写岗位筛选关键词</h2>
+      <p>岗位筛选关键词不能为空，请至少填写一个关键词后再保存。</p>
+      <button class="button button--primary" type="button" id="configuration-keywords-dismiss">返回填写</button>
+    </dialog>
     <dialog class="job-detail-dialog" id="job-detail-dialog" aria-labelledby="job-detail-title">
       <div class="job-detail-shell">
         <header class="job-detail-header">
@@ -723,6 +742,20 @@
           <button class="icon-button" id="job-detail-close" type="button" aria-label="关闭岗位详情" title="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6 6 12 12M18 6 6 18"></path></svg></button>
         </header>
         <div class="job-detail-content" id="job-detail-content" data-state="loading"><div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div></div>
+      </div>
+    </dialog>
+
+<dialog class="job-detail-dialog automation-detail-dialog" id="automation-detail-dialog" aria-labelledby="automation-detail-title">
+      <div class="job-detail-shell">
+        <header class="job-detail-header">
+          <div><p class="eyebrow">最近一次执行</p><h2 id="automation-detail-title">任务详情</h2></div>
+          <button class="icon-button" id="automation-detail-close" type="button" aria-label="关闭任务详情" title="关闭"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6 6 12 12M18 6 6 18"></path></svg></button>
+        </header>
+        <div class="job-detail-content automation-detail-content" id="automation-detail-content"></div>
+        <footer class="automation-detail-actions">
+          <button class="button button--primary" id="automation-explain-button" type="button" hidden>让助理解释</button>
+          <button class="button button--ghost" id="automation-detail-dismiss" type="button">关闭</button>
+        </footer>
       </div>
     </dialog>
 
@@ -753,11 +786,29 @@
       </div>
     </dialog>
 
-    <dialog id="knowledge-preview" class="job-detail-dialog knowledge-preview">
-      <div class="job-detail-header"><h2 id="knowledge-preview-title">资料原文</h2><button class="button button--ghost" id="knowledge-preview-close" type="button" aria-label="关闭资料原文">×</button></div>
-      <p id="knowledge-preview-meta"></p><pre id="knowledge-preview-text"></pre>
-      <div class="knowledge-actions"><button class="button button--ghost" id="knowledge-page-prev" type="button">上一页</button><span id="knowledge-page-label"></span><button class="button button--ghost" id="knowledge-page-next" type="button">下一页</button></div>
+    <dialog id="application-create-dialog" class="job-detail-dialog schedule-editor-dialog" aria-labelledby="application-create-heading">
+      <div class="job-detail-shell">
+        <header class="job-detail-header">
+          <h2 id="application-create-heading">手动添加投递</h2>
+          <button class="icon-button" id="application-create-close" type="button" aria-label="关闭手动添加" title="关闭">×</button>
+        </header>
+        <form id="application-create-form" class="schedule-editor-form">
+          <div class="schedule-editor-grid">
+            <label>公司名称<input name="company_name" maxlength="255" required></label>
+            <label>岗位名称<input name="job_title" maxlength="512" required></label>
+            <label>当前阶段<select name="stage"></select></label>
+            <label class="schedule-editor-field--wide">官网投递进度页地址（选填）<input name="record_url" type="url" maxlength="2048"></label>
+            <label class="schedule-editor-field--wide">备注（选填）<textarea name="note" rows="3" maxlength="4000"></textarea></label>
+            <p id="application-create-error" class="schedule-editor-field--wide" role="alert" hidden></p>
+          </div>
+          <div class="job-detail-actions schedule-editor-actions">
+            <button class="button button--ghost" id="application-create-cancel" type="button">取消</button>
+            <button class="button button--primary" id="application-create-submit" type="submit">保存投递</button>
+          </div>
+        </form>
+      </div>
     </dialog>
+
     <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
     <noscript>
       <div class="noscript-message">需要启用 JavaScript 才能读取 RecruitOps API。</div>

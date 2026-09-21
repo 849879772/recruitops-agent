@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "version": "0.11.5",
+  "auditedOn": "2026-09-19",
+  "redistribution": "unconfirmed-do-not-bundle",
+  "hashes": {
+    "manifest.json":"d23e526d99f999f4962914122748e085eeeba225d1e3c1211440899e69ea31f9",
+    "sidepanel.html":"1f4f9c0bf9cb15a0ef99504afd53c3641e9917980e446e3d914c2090bb200d19",
+    "sidepanel.js":"baa8f334df47097b5b0e6784dc702089c7d1a19540b6d3544e6ca45ad7eebd7e",
+    "background.js":"78540b88d22d65bbef7e077d817224a011d20b9c1dbb1fa90e0b29000c39b390",
+    "core.js":"377e6a6edbb758e1640e30de3d0e75514a31f3c5a4a6f385a28a35ddd4d83524",
+    "content.js":"9dcede88cf96fcb61254cb006dd72e123ad3452c7e6bc7cdc560869d935bcb11",
+    "repeater-engine.js":"17e322953e1c61b499c2979a329e4cffaaac41d42dc54075eabaaa8c1b771ac6",
+    "frame-routing.js":"c32550d3e95c1bca8d711ef27c354d800f32d7e5e79867cfa4e5f2533dd3e327"
+  },
+  "profileFields": {
+    "basic":["fullName","gender","age","birthDate","nationality","countryRegion","height","weight","idNumber","phone","phoneType","email","nativePlace","currentResidence","studyMode","applicantStatus","failedCourses","passedCET4","englishLevel","englishScore","emergencyContact","emergencyPhone","recruitmentSource","relativesAtCompany","healthStatus","interviewSite","acceptLocationTransfer","acceptRoleTransfer","desiredSalary","targetRole","preferredCity"],
+    "education":["school","college","major","degree","studyMode","startDate","endDate","overseasStudy","gpa","gpaPersonalScore","gpaFullScore","gradeRank","advisor"],
+    "projects":["name","role","organization","startDate","endDate","summary","results"],
+    "awards":["level","date","name","description"],
+    "publications":["name","type","date","authorOrder"],
+    "certificates":["type","name","date"],
+    "scalar":["skills","honors","selfIntroduction"]
+  },
+  "repeaterSections":["education","career","internship","project","award","paper","patent","practice","language","certificate","skill"],
+  "controlKinds":["moka-location","brick-radio","brick-select","moka-month","moka-select","element-radio","element-dropdown","element-cascader","element-date","element-select","phoenix-radio","ud-radio","atsx-radio","feishu-month","feishu-year","phoenix-select","ant-date","ud-date","calendar-date","multi-select","ant-select","ud-select","atsx-select","combobox","select","textarea","file","radio","checkbox","input","contenteditable","unknown"]
+}

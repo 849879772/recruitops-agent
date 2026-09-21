@@ -25,6 +25,8 @@ config/rag_sources.local.yaml
 *.pfx
 
 # Stateful and generated data
+.desktop-runtime-tests/
+artifacts/
 .data/
 data/
 outputs/

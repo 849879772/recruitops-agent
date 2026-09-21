@@ -12,6 +12,12 @@ from packages.storage import AutomationExecution, AutomationSchedule, Storage
 
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+_BLOCKED_MESSAGES = {
+    "codex_runtime_disabled": "本地助理尚未在当前桌面实例启用；启用模型/助理后需重启，再创建计划。",
+    "automation_disabled": "全局定时任务开关已关闭，请先在配置中启用。",
+    "mail_disabled": "招聘邮箱任务需要启用并完成邮箱连接配置。",
+    "write_disabled": "此任务需要当前实例具备本地写入权限。",
+}
 
 
 def _utc(value: datetime | None = None) -> datetime:
@@ -33,6 +39,25 @@ def next_daily_run(
     if candidate <= local_now:
         candidate += timedelta(days=1)
     return candidate.astimezone(timezone.utc)
+
+
+def automation_blocked_reason(task_id: str | None, settings) -> str | None:
+    """Return the capability gate relevant to this engine or task."""
+    if not getattr(settings, "codex_runtime_enabled", False):
+        return "codex_runtime_disabled"
+    if not getattr(settings, "automation_enabled", False):
+        return "automation_disabled"
+    if task_id == "recruitment_mailbox" and not getattr(settings, "mail_enabled", False):
+        return "mail_disabled"
+    if task_id in {"daily_recruitment_intelligence", "application_progress"} and not getattr(
+        settings, "write_enabled", False
+    ):
+        return "write_disabled"
+    return None
+
+
+def automation_blocked_message(reason: str) -> str:
+    return _BLOCKED_MESSAGES.get(reason, "计划所需能力当前不可用。")
 
 
 @dataclass(frozen=True)
@@ -68,13 +93,18 @@ class AutomationStore:
     ) -> AutomationSchedule:
         timestamp = _utc(now)
         target_key = target_id or "*"
-        schedule_key = f"{task_id}:{target_key}"
+        schedule_key = (
+            f"{task_id}:{target_key}:{timezone_name}:"
+            f"{start_time.strftime('%H:%M:%S')}"
+        )
         schedule_id = f"automation-{sha256(schedule_key.encode('utf-8')).hexdigest()[:24]}"
         with self.storage.transaction(write=True) as session:
             row = session.scalar(
                 select(AutomationSchedule).where(
                     AutomationSchedule.task_id == task_id,
                     AutomationSchedule.target_key == target_key,
+                    AutomationSchedule.start_time == start_time,
+                    AutomationSchedule.timezone_name == timezone_name,
                 )
             )
             if row is None:
@@ -100,8 +130,6 @@ class AutomationStore:
                 row.target_kind = target_kind
                 row.target_id = target_id
                 row.target_label = target_label
-                row.start_time = start_time
-                row.timezone_name = timezone_name
                 row.active = active
                 row.next_run_at = next_daily_run(start_time, timezone_name, now=timestamp)
                 row.updated_at = timestamp
@@ -130,6 +158,31 @@ class AutomationStore:
             session.flush()
             session.refresh(row)
             return row
+
+    def skip_missed_occurrences(self, *, now: datetime | None = None) -> int:
+        """Advance overdue schedules at worker startup without replaying them."""
+        timestamp = _utc(now)
+        with self.storage.transaction(write=True) as session:
+            statement = (
+                select(AutomationSchedule)
+                .where(
+                    AutomationSchedule.active.is_(True),
+                    AutomationSchedule.next_run_at <= timestamp,
+                )
+                .order_by(AutomationSchedule.next_run_at)
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            rows = list(session.scalars(statement))
+            for row in rows:
+                row.next_run_at = next_daily_run(
+                    row.start_time,
+                    row.timezone_name,
+                    now=timestamp,
+                )
+                row.updated_at = timestamp
+            session.flush()
+            return len(rows)
 
     def claim_due(self, *, now: datetime | None = None) -> ClaimedAutomation | None:
         timestamp = _utc(now)
@@ -288,5 +341,7 @@ __all__ = [
     "AutomationStore",
     "ClaimedAutomation",
     "DEFAULT_TIMEZONE",
+    "automation_blocked_message",
+    "automation_blocked_reason",
     "next_daily_run",
 ]

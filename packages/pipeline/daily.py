@@ -23,6 +23,7 @@ from threading import Event
 from typing import Any, Protocol
 import unicodedata
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import yaml
 from pydantic import BaseModel, ValidationError
@@ -85,6 +86,7 @@ DEFAULT_COMPANIES_PATH = Path(__file__).resolve().parents[2] / "config" / "compa
 DEFAULT_DETAIL_REUSE_TTL_HOURS = 24.0
 _FINGERPRINT_RE = re.compile(r":fp:(?P<fingerprint>[0-9a-f]{64})$")
 _TITLE_FIRST_PENDING_ANALYSIS_VERSION = "title-first-pending-v1"
+_TITLE_FIRST_CAPTURE_POLICY = "title_first_v2"
 _FILTERED_STATUSES = {
     "cohort_unconfirmed",
     "early_batch",
@@ -649,6 +651,7 @@ class _CompanyWork:
     detail_success_count: int = 0
     detail_failure_count: int = 0
     detail_failure_reasons: Counter[str] = field(default_factory=Counter)
+    hydration_results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 _COMPANY_CHECKPOINT_VERSION = 1
@@ -702,6 +705,9 @@ def _work_from_checkpoint(
     raw_jd_results = payload.get("jd_results") or []
     jd_results = [dict(item) for item in raw_jd_results if isinstance(item, Mapping)]
     raw_titles = payload.get("observed_titles") or []
+    hydration_results = payload.get("hydration_results") or {}
+    if not isinstance(hydration_results, Mapping):
+        raise PipelineError(f"company checkpoint has invalid hydration results: {company.id}")
     try:
         raw_job_count = int(payload.get("raw_job_count") or 0)
     except (TypeError, ValueError):
@@ -726,6 +732,11 @@ def _work_from_checkpoint(
         detail_success_count=max(0, int(payload.get("detail_success_count") or 0)),
         detail_failure_count=max(0, int(payload.get("detail_failure_count") or 0)),
         detail_failure_reasons=_checkpoint_counter(payload.get("detail_failure_reasons")),
+        hydration_results={
+            str(key): dict(value)
+            for key, value in hydration_results.items()
+            if isinstance(value, Mapping)
+        },
     )
 
 
@@ -1710,6 +1721,7 @@ class DailyRecruitmentPipeline:
         )
         self.resume_from_checkpoint = bool(resume_from_checkpoint)
         self._checkpoint_company_ids: tuple[str, ...] = ()
+        self._hydration_checkpoint_id = uuid4().hex
         self.progress_callback = progress_callback
         self.clock = clock
 
@@ -1765,6 +1777,36 @@ class DailyRecruitmentPipeline:
                             f"resume checkpoint has invalid work: {company.id}"
                         )
                     parsed[company.id] = _work_from_checkpoint(company, work_payload)
+            hydration_id = payload.get("hydration_checkpoint_id")
+            if hydration_id is not None:
+                if not isinstance(hydration_id, str) or not re.fullmatch(r"[0-9a-f]{32}", hydration_id):
+                    raise PipelineError("resume checkpoint has an invalid hydration reference")
+                self._hydration_checkpoint_id = hydration_id
+                for company_id, work in parsed.items():
+                    sidecar = self._hydration_checkpoint_path(company_id)
+                    if not sidecar.is_file():
+                        sidecar = self._legacy_hydration_checkpoint_path(company_id)
+                    if not sidecar.is_file():
+                        continue
+                    try:
+                        details = json.loads(sidecar.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                        raise PipelineError(f"unreadable hydration checkpoint: {company_id}") from exc
+                    if not isinstance(details, Mapping) or details.get("company_id") != company_id:
+                        raise PipelineError(f"invalid hydration checkpoint: {company_id}")
+                    restored = _work_from_checkpoint(work.company, details)
+                    work.hydration_results = restored.hydration_results
+                    work.jd_results = restored.jd_results
+                    work.detail_success_count = restored.detail_success_count
+                    work.detail_failure_count = restored.detail_failure_count
+                    work.detail_failure_reasons = restored.detail_failure_reasons
+            elif not dry_run:
+                # Upgrade an old list-only checkpoint once, without changing its
+                # version or receipts. Subsequent JD batches only write sidecars.
+                payload["hydration_checkpoint_id"] = self._hydration_checkpoint_id
+                temporary = self.checkpoint_path.with_name(self.checkpoint_path.name + ".tmp")
+                temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+                temporary.replace(self.checkpoint_path)
             return {str(key): dict(value) for key, value in entries.items() if isinstance(value, Mapping)}, parsed
 
         if not dry_run:
@@ -1772,6 +1814,7 @@ class DailyRecruitmentPipeline:
             self._checkpoint_company_ids = tuple(item.id for item in selected)
             payload = {
                 "version": _COMPANY_CHECKPOINT_VERSION,
+                "hydration_checkpoint_id": self._hydration_checkpoint_id,
                 "company_ids": [item.id for item in selected],
                 "companies": {},
             }
@@ -1794,6 +1837,7 @@ class DailyRecruitmentPipeline:
         if self.checkpoint_path is None or dry_run:
             return
         status = (
+            # This is list coverage only, not hydration or run completion.
             "complete"
             if not work.failure_reason and work.list_complete
             else "partial"
@@ -1807,6 +1851,7 @@ class DailyRecruitmentPipeline:
         }
         payload = {
             "version": _COMPANY_CHECKPOINT_VERSION,
+            "hydration_checkpoint_id": self._hydration_checkpoint_id,
             "company_ids": list(self._checkpoint_company_ids),
             "companies": dict(entries),
         }
@@ -1817,6 +1862,40 @@ class DailyRecruitmentPipeline:
             encoding="utf-8",
         )
         temporary.replace(self.checkpoint_path)
+
+    def _hydration_checkpoint_path(self, company_id: str) -> Path:
+        assert self.checkpoint_path is not None
+        # Keep the complete path comfortably below Windows MAX_PATH. Desktop
+        # instance roots are already long, so repeating the checkpoint name and
+        # two full SHA-256 values can make an otherwise valid write fail with a
+        # misleading FileNotFoundError.
+        directory = self.checkpoint_path.parent / f".jd-{self._hydration_checkpoint_id[:12]}"
+        digest = hashlib.sha256(company_id.encode("utf-8")).hexdigest()[:32]
+        return directory / f"{digest}.json"
+
+    def _legacy_hydration_checkpoint_path(self, company_id: str) -> Path:
+        assert self.checkpoint_path is not None
+        directory = self.checkpoint_path.with_name(
+            f"{self.checkpoint_path.name}.hydration-{self._hydration_checkpoint_id}"
+        )
+        return directory / (hashlib.sha256(company_id.encode("utf-8")).hexdigest() + ".json")
+
+    def _write_hydration_checkpoint(self, work: _CompanyWork, *, dry_run: bool) -> None:
+        if self.checkpoint_path is None or dry_run:
+            return
+        path = self._hydration_checkpoint_path(work.company.id)
+        payload = {
+            "company_id": work.company.id,
+            "hydration_results": _dump(work.hydration_results),
+            "jd_results": _dump(work.jd_results),
+            "detail_success_count": work.detail_success_count,
+            "detail_failure_count": work.detail_failure_count,
+            "detail_failure_reasons": dict(work.detail_failure_reasons),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
 
     @staticmethod
     def _merge_partial_checkpoint_work(
@@ -2266,6 +2345,8 @@ class DailyRecruitmentPipeline:
 
         def checkpoint_company(work: _CompanyWork) -> None:
             previous = checkpoint_works.get(work.company.id)
+            if previous is not None:
+                work.hydration_results = dict(previous.hydration_results)
             merged = self._merge_partial_checkpoint_work(previous, work)
             checkpoint_works[work.company.id] = merged
             previous_entry = checkpoint_entries.get(work.company.id)
@@ -2280,6 +2361,9 @@ class DailyRecruitmentPipeline:
                 attempts=previous_attempts + 1,
                 dry_run=dry_run,
             )
+
+        def checkpoint_details(work: _CompanyWork) -> None:
+            self._write_hydration_checkpoint(work, dry_run=dry_run)
 
         works.extend(
             self._crawl_companies(
@@ -2404,6 +2488,7 @@ class DailyRecruitmentPipeline:
                     rejected_ids.append(_compact(job.get("id")))
                     continue
 
+                job = dict(job)
                 job["title_key"] = title_key
                 job["capture_status"] = "pending"
                 job["capture_failure_reason"] = ""
@@ -2431,7 +2516,33 @@ class DailyRecruitmentPipeline:
                     ):
                         inactive_ids.append(existing.job.id)
 
-        self._hydrate_title_first_candidates(candidates)
+        self._hydrate_title_first_candidates(
+            candidates,
+            checkpoint_callback=checkpoint_details if self.checkpoint_path is not None else None,
+        )
+        # Details can reveal internship evidence absent from the listing title.
+        # Recheck before both persistence and scoring; never store new rejected rows.
+        retained_candidates = []
+        for candidate in candidates:
+            screening = screen_title_job(candidate.job, self.profile)
+            if screening.eligible:
+                candidate.screening = screening
+                retained_candidates.append(candidate)
+                continue
+            company_id = candidate.work.company.id
+            reason = (screening.reasons or [screening.analysis_status.value])[0]
+            filtered_reasons[company_id][reason] += 1
+            rejection_reasons[reason] += 1
+            job_id = _compact(candidate.job.get("id"))
+            rejected_ids.append(job_id)
+            if job_id in new_ids:
+                new_ids.remove(job_id)
+                metrics[company_id]["new"] -= 1
+        candidates = retained_candidates
+        for work in works:
+            work.detail_success_count = 0
+            work.detail_failure_count = 0
+            work.detail_failure_reasons.clear()
         for candidate in candidates:
             if _capture_status(candidate.job.get("capture_status")) == "failed":
                 failed_ids.append(_compact(candidate.job.get("id")))
@@ -2465,42 +2576,6 @@ class DailyRecruitmentPipeline:
                 and _capture_status(candidate.job.get("capture_status")) == "failed"
             }
             unresolved_detail_titles[company_id].update(new_failed_titles)
-
-        for work in works:
-            company_id = work.company.id
-            history_has_failure = bool(unresolved_detail_titles[company_id])
-            detail_pending = len(unresolved_detail_titles[company_id])
-            if source_registry is not None:
-                if source_records[work.company.id] in unusable_source_records:
-                    continue
-                if work.failure_reason:
-                    status = "partial" if work.raw_job_count else "failed"
-                    reason = work.failure_reason
-                elif not work.list_complete:
-                    status = "partial" if work.raw_job_count else "failed"
-                    reason = work.run_reason or "crawl_incomplete"
-                elif history_has_failure or work.detail_failure_count:
-                    status = "partial"
-                    reason = "detail_capture_failed"
-                else:
-                    status = "complete"
-                    reason = ""
-                self._record_title_first_source_attempt(
-                    source_registry,
-                    source_records[work.company.id],
-                    status=status,
-                    company=work.company,
-                    reason_code=reason,
-                    reason=reason or work.run_reason,
-                    job_count=metrics[work.company.id]["new"]
-                    + metrics[work.company.id]["reused"],
-                    jd_pending_count=detail_pending,
-                    pagination_complete=work.list_complete,
-                    final_url=_text(
-                        work.crawl_evidence.get("crawl_source_url")
-                        or work.crawl_evidence.get("source_url")
-                    ),
-                )
 
         # Persist a durable marker for successful new captures before calling
         # the matcher.  A restart can resume only these explicit pending rows;
@@ -2538,6 +2613,42 @@ class DailyRecruitmentPipeline:
             inactive_ids=inactive_ids,
             dry_run=dry_run,
         )
+
+        # Source bookkeeping must not gate durable jobs or pending score markers.
+        # Let errors propagate after persistence, never report a successful run.
+        for work in works:
+            company_id = work.company.id
+            detail_pending = len(unresolved_detail_titles[company_id])
+            if source_registry is not None:
+                if source_records[company_id] in unusable_source_records:
+                    continue
+                if work.failure_reason:
+                    status = "partial" if work.raw_job_count else "failed"
+                    reason = work.failure_reason
+                elif not work.list_complete:
+                    status = "partial" if work.raw_job_count else "failed"
+                    reason = work.run_reason or "crawl_incomplete"
+                elif detail_pending or work.detail_failure_count:
+                    status = "partial"
+                    reason = "detail_capture_failed"
+                else:
+                    status = "complete"
+                    reason = ""
+                self._record_title_first_source_attempt(
+                    source_registry,
+                    source_records[company_id],
+                    status=status,
+                    company=work.company,
+                    reason_code=reason,
+                    reason=reason or work.run_reason,
+                    job_count=metrics[company_id]["new"] + metrics[company_id]["reused"],
+                    jd_pending_count=detail_pending,
+                    pagination_complete=work.list_complete,
+                    final_url=_text(
+                        work.crawl_evidence.get("crawl_source_url")
+                        or work.crawl_evidence.get("source_url")
+                    ),
+                )
 
         for candidate in candidates:
             candidate.analysis = None
@@ -2802,12 +2913,18 @@ class DailyRecruitmentPipeline:
             )
         return result
 
-    def _hydrate_title_first(self, candidate: _TitleFirstCandidate) -> None:
+    def _hydrate_title_first(
+        self,
+        candidate: _TitleFirstCandidate,
+        checkpoint_result: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         job = candidate.job
-        job["detail_capture_policy"] = "title_first_v2"
+        job["detail_capture_policy"] = _TITLE_FIRST_CAPTURE_POLICY
         job_id = _compact(job.get("id"))
         diagnostic: dict[str, Any] = {"job_id": job_id}
-        if self.jd_hydrator is None:
+        if checkpoint_result is not None:
+            ok, detail, reason, capture, response = _detail_capture_result(job, checkpoint_result)
+        elif self.jd_hydrator is None:
             ok, detail, reason, capture, response = (
                 False,
                 "",
@@ -2863,29 +2980,61 @@ class DailyRecruitmentPipeline:
             job["capture_failure_reason"] = reason or "detail_capture_failed"
             diagnostic["status"] = "failed"
             diagnostic["failure_reason"] = job["capture_failure_reason"]
-        candidate.work.jd_results.append(diagnostic)
+        return diagnostic
 
     def _hydrate_title_first_candidates(
         self,
         candidates: Sequence[_TitleFirstCandidate],
+        *,
+        checkpoint_callback: Callable[[_CompanyWork], None] | None = None,
     ) -> None:
         """Hydrate new candidates in the same bounded pool as legacy details."""
 
         if not candidates:
             return
+        dirty: dict[str, _CompanyWork] = {}
+        inputs: dict[int, tuple[str, Mapping[str, Any] | None]] = {}
+        for candidate in candidates:
+            # Bind receipts to the exact listing input, not just a shared title.
+            candidate.job["detail_capture_policy"] = _TITLE_FIRST_CAPTURE_POLICY
+            key = hashlib.sha256(
+                json.dumps(_dump(candidate.job), sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            receipt = candidate.work.hydration_results.get(key)
+            if receipt is not None and (
+                receipt.get("status") != "complete"
+                or receipt.get("job_id") != _compact(candidate.job.get("id"))
+                or receipt.get("detail_sha256") != hashlib.sha256(
+                    _raw_detail(receipt.get("detail")).encode("utf-8")
+                ).hexdigest()
+                or not _detail_capture_result(candidate.job, receipt)[0]
+            ):
+                receipt = None
+            inputs[id(candidate)] = (key, receipt)
+        for work in {item.work.company.id: item.work for item in candidates}.values():
+            active_keys = {
+                inputs[id(item)][0] for item in candidates if item.work is work
+            }
+            work.hydration_results = {
+                key: value for key, value in work.hydration_results.items() if key in active_keys
+            }
+            work.jd_results = []
+            work.detail_success_count = 0
+            work.detail_failure_count = 0
+            work.detail_failure_reasons.clear()
         total = len(candidates)
         if self.progress_callback is not None:
             self.progress_callback("jd", 0, total)
         completed = 0
         with ThreadPoolExecutor(max_workers=min(self.max_concurrency, total)) as executor:
             futures = {
-                executor.submit(self._hydrate_title_first, candidate): candidate
+                executor.submit(self._hydrate_title_first, candidate, inputs[id(candidate)][1]): candidate
                 for candidate in candidates
             }
             for future in as_completed(futures):
                 candidate = futures[future]
                 try:
-                    future.result()
+                    diagnostic = future.result()
                 except Exception as exc:
                     # Keep the row visible even if the injected worker itself
                     # fails outside the hydrator's normal result contract.
@@ -2897,15 +3046,33 @@ class DailyRecruitmentPipeline:
                             "capture_failure_reason": reason,
                         }
                     )
-                    candidate.work.jd_results.append(
-                        {
-                            "job_id": _compact(candidate.job.get("id")),
-                            "status": "failed",
-                            "detail_url": candidate.job.get("detail_url"),
-                            "failure_reason": reason,
-                        }
-                    )
+                    diagnostic = {
+                        "job_id": _compact(candidate.job.get("id")),
+                        "status": "failed",
+                        "detail_url": candidate.job.get("detail_url"),
+                        "failure_reason": reason,
+                    }
+                # Only the coordinator mutates checkpoint work; other workers
+                # may still be updating their private candidate copies.
+                work = candidate.work
+                work.jd_results.append(diagnostic)
+                work.hydration_results[inputs[id(candidate)][0]] = {
+                    **diagnostic,
+                    "detail": candidate.job.get("jd_raw"),
+                    "capture_evidence": candidate.job.get("capture_evidence") or {},
+                }
+                if diagnostic.get("status") == "complete":
+                    work.detail_success_count += 1
+                else:
+                    work.detail_failure_count += 1
+                    work.detail_failure_reasons[diagnostic.get("failure_reason") or "detail_capture_failed"] += 1
+                dirty[work.company.id] = work
                 completed += 1
+                if completed % self.checkpoint_batch_size == 0 or completed == total:
+                    if checkpoint_callback is not None:
+                        for work in dirty.values():
+                            checkpoint_callback(work)
+                    dirty.clear()
                 if (
                     self.progress_callback is not None
                     and (

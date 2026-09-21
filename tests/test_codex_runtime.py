@@ -113,6 +113,59 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.mark.parametrize("failure", [None, "timeout", "error"])
+def test_bundled_skills_registered_before_ready_and_on_restart(tmp_path, failure):
+    async def scenario():
+        processes = []
+
+        async def factory(command, cwd, environment):
+            process = FakeProcess()
+
+            async def respond(message):
+                if "id" not in message:
+                    return
+                if message["method"] == "skills/extraRoots/set":
+                    if failure == "timeout":
+                        return
+                    if failure == "error":
+                        await process.stdout.push({"id": message["id"], "error": {
+                            "code": -32601, "message": "unsupported skills registration",
+                        }})
+                        return
+                await process.stdout.push({"id": message["id"], "result": {}})
+
+            process.stdin.on_message = respond
+            processes.append(process)
+            return process
+
+        root = tmp_path / "installed app/.agents/skills"
+        supervisor = CodexSupervisor(CodexRuntimeConfig(
+            command=("fixture",), working_dir=tmp_path / "instance",
+            skill_roots=(root,), startup_timeout_seconds=0.2,
+        ), process_factory=factory)
+        try:
+            if failure:
+                with pytest.raises(Exception, match="skills"):
+                    await supervisor.start()
+                assert supervisor.state is SupervisorState.FAILED
+                assert processes[0].stdin.closed
+            else:
+                await supervisor.start()
+                await supervisor.restart()
+                assert supervisor.state is SupervisorState.RUNNING
+                assert len(processes) == 2
+            for process in processes:
+                messages = process.stdin.messages
+                assert [message["method"] for message in messages[:3]] == [
+                    "initialize", "initialized", "skills/extraRoots/set",
+                ]
+                assert messages[2]["params"] == {"extraRoots": [str(root.resolve())]}
+        finally:
+            await supervisor.stop()
+
+    asyncio.run(scenario())
+
+
 def test_runtime_config_validates_launch_and_model_settings(tmp_path: Path) -> None:
     config = CodexRuntimeConfig(
         command=["codex", "app-server"],

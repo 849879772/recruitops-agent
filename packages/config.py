@@ -1,10 +1,104 @@
 from functools import lru_cache
+import json
+import os
+import re
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
-from pydantic import Field, model_validator
+import yaml
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from packages.user_settings import DEFAULT_ON_CAPABILITY_FIELDS
+
 UNIFIED_MODEL = "deepseek-flash"
+DESKTOP_CAPABILITY_FIELDS = (
+    "llm_enabled", "job_analysis_enabled", "codex_runtime_enabled", "mail_enabled",
+    "mail_sync_on_startup", "automation_enabled", "vision_enabled",
+)
+DEFAULT_OFFERBIU_INDUSTRY_GROUPS = (
+    "internet-tech",
+    "manufacturing-equipment",
+    "auto-transport-equipment",
+)
+OFFERBIU_INDUSTRY_GROUP_OPTIONS = (
+    ("internet-tech", "互联网/软件/AI"),
+    ("semiconductor-hardware", "半导体/电子硬件"),
+    ("finance", "金融/银行/证券/保险"),
+    ("professional-services", "咨询/法律/专业服务"),
+    ("manufacturing-equipment", "制造/装备/工业自动化"),
+    ("auto-transport-equipment", "汽车/新能源车/交通设备"),
+    ("energy-chemical-environment", "能源/电力/化工/环保"),
+    ("biotech-healthcare", "生物医药/医疗健康"),
+    ("consumer-retail", "消费/零售/电商/快消"),
+    ("construction-real-estate", "建筑地产/市政工程"),
+    ("media-education-culture", "传媒/文娱/教育"),
+    ("public-research-nonprofit", "政府/事业单位/科研/公益"),
+    ("logistics-supply-chain", "物流/供应链/交通运输"),
+    ("other", "其他/待归类"),
+)
+_OFFERBIU_INDUSTRY_GROUP_CODES = frozenset(
+    code for code, _label in OFFERBIU_INDUSTRY_GROUP_OPTIONS
+)
+
+
+def anonymous_profile_payload() -> dict[str, object]:
+    """Return a fresh, developer-neutral profile for first-run bootstrap."""
+
+    return {
+        "profile": {
+            "degree": None,
+            "job_type": None,
+            "direction": None,
+            "skills": [],
+            "matching": {
+                "title_keywords": [],
+                "excluded_title_keywords": [],
+                "direction_policy": "parallel",
+                "primary_directions": [],
+                "secondary_directions": [],
+                "project_evidence": [],
+                "supporting_skills": [],
+                "learning_targets": [],
+                "unverified_skills": [],
+            },
+        }
+    }
+
+
+def _write_yaml_if_missing(path: Path, payload: dict[str, object]) -> bool:
+    if path.is_file():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
+def ensure_anonymous_configuration(settings: "Settings") -> dict[str, bool]:
+    """Create only missing, anonymous config files; never copy example data."""
+
+    companies_created = _write_yaml_if_missing(
+        settings.companies_config,
+        {"companies": []},
+    )
+    profile_path = Path(settings.agent_root) / "config" / "candidate_profile.yaml"
+    local_profile = Path(settings.agent_root) / ".data" / "settings" / "candidate_profile.yaml"
+    profile_created = False
+    if not local_profile.is_file():
+        profile_created = _write_yaml_if_missing(profile_path, anonymous_profile_payload())
+    return {
+        "companies_created": companies_created,
+        "profile_created": profile_created,
+    }
 
 
 class Settings(BaseSettings):
@@ -18,9 +112,11 @@ class Settings(BaseSettings):
     agent_root: Path = Field(
         default_factory=lambda: Path(__file__).resolve().parents[1]
     )
-    source_root: Path = Field(default=Path("D:/秋招系统"))
+    source_root: Path = Field(default=Path(".data/legacy-source"))
     source_python_executable: str = "python"
-    database_url: str = "postgresql+psycopg://recruitops:recruitops@localhost:5433/recruitops"
+    # A fresh checkout must not probe a developer's local PostgreSQL instance.
+    # Desktop/runtime launchers may supply an isolated database URL explicitly.
+    database_url: str = "sqlite+pysqlite:///./.data/recruitops.sqlite"
     api_host: str = "127.0.0.1"
     api_port: int = 8010
     api_token: str = ""
@@ -35,6 +131,9 @@ class Settings(BaseSettings):
     codex_home: Path = Path(".data/codex-home")
     codex_startup_timeout_seconds: float = 15.0
     codex_model_provider_id: str = "deepseek"
+    model_provider_name: str = "DeepSeek"
+    model_api_style: Literal["anthropic", "openai"] = "anthropic"
+    model_name: str = UNIFIED_MODEL
     model_api_base_url: str | None = None
     codex_model_base_url: str = "https://api.deepseek.com"
     codex_model_api_key_env: str = "RECRUITOPS_LLM_API_KEY"
@@ -42,11 +141,11 @@ class Settings(BaseSettings):
     codex_reasoning_effort: str = "high"
     codex_model_context_window: int = 1_000_000
     codex_model_auto_compact_token_limit: int = 96_000
-    automation_enabled: bool = True
+    automation_enabled: bool = "automation_enabled" in DEFAULT_ON_CAPABILITY_FIELDS
     automation_poll_seconds: float = 10.0
     automation_run_timeout_seconds: float = 600.0
     llm_enabled: bool = False
-    job_analysis_enabled: bool = True
+    job_analysis_enabled: bool = "job_analysis_enabled" in DEFAULT_ON_CAPABILITY_FIELDS
     llm_endpoint: str = "https://api.deepseek.com/anthropic/v1/messages"
     llm_api_key: str = ""
     llm_model: str = "deepseek-flash"
@@ -70,6 +169,9 @@ class Settings(BaseSettings):
     offerbiu_max_pages: int = 150
     offerbiu_page_size: int = 50
     offerbiu_delay_seconds: float = 0.05
+    offerbiu_industry_groups: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_OFFERBIU_INDUSTRY_GROUPS)
+    )
     offline_reconciliation_enabled: bool = True
     offline_grace_runs: int = 2
     offline_grace_days: float = 3.0
@@ -77,11 +179,7 @@ class Settings(BaseSettings):
     embedding_api_key: str = ""
     embedding_model: str = "BAAI/bge-m3"
     embedding_dimension: int = 1024
-    knowledge_embedding_endpoint: str = ""
-    knowledge_embedding_api_key: str = ""
-    knowledge_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
-    knowledge_embedding_dimension: int = 1024
-    mail_enabled: bool = False
+    mail_enabled: bool = "mail_enabled" in DEFAULT_ON_CAPABILITY_FIELDS
     mail_imap_host: str = "imap.163.com"
     mail_imap_port: int = 993
     mail_imap_username: str = ""
@@ -90,21 +188,56 @@ class Settings(BaseSettings):
     mail_sync_on_startup: bool = True
     mail_sync_ttl_seconds: int = 300
 
+    @field_validator("offerbiu_industry_groups", mode="before")
+    @classmethod
+    def normalize_offerbiu_industry_groups(cls, value: object) -> list[str]:
+        if value is None:
+            values = list(DEFAULT_OFFERBIU_INDUSTRY_GROUPS)
+        elif isinstance(value, str):
+            values = [item.strip() for item in value.split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            values = [str(item).strip() for item in value]
+        else:
+            raise ValueError("offerbiu_industry_groups must be a list of codes")
+        values = list(dict.fromkeys(item for item in values if item))
+        if not values:
+            raise ValueError("at least one OfferBiu industry group is required")
+        unknown = sorted(set(values) - _OFFERBIU_INDUSTRY_GROUP_CODES)
+        if unknown:
+            raise ValueError("unsupported OfferBiu industry group: " + ", ".join(unknown))
+        return values
+
     @model_validator(mode="after")
     def unified_flash_model(self):
         from urllib.parse import urlsplit
         base = (self.model_api_base_url or self.codex_model_base_url).strip().rstrip("/")
-        if base.endswith("/v1"):
+        if self.model_api_style == "anthropic" and base.endswith("/v1"):
             base = base[:-3]
         parsed = urlsplit(base)
-        if (parsed.scheme not in {"http", "https"} or not parsed.hostname or
+        local_http = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+        if ((parsed.scheme != "https" and not local_http) or not parsed.hostname or
                 parsed.username or parsed.password or parsed.query or parsed.fragment):
             raise ValueError("Model API base must be an HTTP/HTTPS URL without credentials, query or fragment")
         self.model_api_base_url = base
         self.codex_model_base_url = base
-        self.llm_endpoint = base + "/anthropic/v1/messages"
+        self.llm_endpoint = base + (
+            "/anthropic/v1/messages"
+            if self.model_api_style == "anthropic"
+            else "/chat/completions"
+        )
         self.vision_endpoint = base + "/chat/completions"
-        self.llm_model = self.codex_model = self.vision_model = UNIFIED_MODEL
+        self.llm_model = self.codex_model = self.vision_model = self.model_name
+        from packages.desktop_runtime.capabilities import saved_mail_configured
+
+        mail_settings = {
+            "mail_imap_host": self.mail_imap_host,
+            "mail_imap_port": self.mail_imap_port,
+            "mail_imap_username": self.mail_imap_username,
+            "mail_imap_password": self.mail_imap_password,
+        }
+        if not saved_mail_configured(mail_settings):
+            self.mail_enabled = False
+            self.mail_sync_on_startup = False
         return self
 
     @property
@@ -132,8 +265,8 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    import json
     settings = Settings()
+    overrides = {}
     local = settings.agent_root / ".data" / "settings" / "preferences.json"
     if local.is_file():
         from packages.user_settings import CONFIG_FIELDS
@@ -142,5 +275,45 @@ def get_settings() -> Settings:
         values.update({key: value for key, value in overrides.items() if key in CONFIG_FIELDS})
         if "model_api_base_url" not in overrides and overrides.get("codex_model_base_url"):
             values["model_api_base_url"] = overrides["codex_model_base_url"]
+        settings = Settings.model_validate(values)
+    if os.environ.get("RECRUITOPS_ENV") == "desktop-isolated":
+        try:
+            mask = json.loads(os.environ.get("RECRUITOPS_DESKTOP_CAPABILITIES", "{}"))
+        except (ValueError, TypeError):
+            mask = {}
+        if not isinstance(mask, dict):
+            mask = {}
+        values = settings.model_dump()
+        for key in DESKTOP_CAPABILITY_FIELDS:
+            values[key] = bool(values[key] and mask.get(key) is True)
+        instance_id = os.environ.get("RECRUITOPS_DESKTOP_INSTANCE_ID", "")
+        # Mail is separately authorized below, never by a stale startup mask.
+        values["mail_enabled"] = False
+        values["mail_sync_on_startup"] = False
+        if (os.environ.get("RECRUITOPS_DESKTOP_LAUNCH_MODE") == "packaged"
+                and re.fullmatch(r"[0-9a-f]{32}", instance_id)
+                and os.environ.get("RECRUITOPS_DESKTOP_WRITE_OPTIN") == instance_id
+                and settings.write_enabled):
+            from packages.desktop_runtime.capabilities import saved_mail_configured, saved_model_configured
+            model_configured = saved_model_configured(overrides)
+            values["llm_enabled"] = model_configured and overrides.get("llm_enabled") is True
+            values["codex_runtime_enabled"] = (
+                values["llm_enabled"]
+                and overrides.get("codex_runtime_enabled") is True
+            )
+            values["job_analysis_enabled"] = (
+                values["llm_enabled"] and mask.get("job_analysis_enabled") is True
+            )
+            values["automation_enabled"] = (
+                values["codex_runtime_enabled"] and mask.get("automation_enabled") is True
+            )
+            values["mail_enabled"] = (
+                saved_mail_configured(overrides) and mask.get("mail_enabled") is True
+            )
+            values["mail_sync_on_startup"] = (
+                values["mail_enabled"]
+                and overrides.get("mail_sync_on_startup") is True
+                and mask.get("mail_sync_on_startup") is True
+            )
         settings = Settings.model_validate(values)
     return settings

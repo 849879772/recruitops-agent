@@ -200,17 +200,19 @@ class LocalTaskScheduler:
                     )
 
                 if state.error is None:
+                    business_error = _business_failure(state.value)
                     return TaskRunResult(
                         task_id=definition.task_id,
                         task_label=definition.label,
                         run_id=actual_run_id,
-                        status=RunStatus.SUCCESS,
+                        status=RunStatus.FAILED if business_error else RunStatus.SUCCESS,
                         attempts=attempt,
                         read_only=True,
                         run_metadata=run_metadata,
                         started_at=started_at,
                         finished_at=self._not_before(started_at),
                         value=state.value,
+                        error=business_error,
                     )
 
                 if attempt < max_attempts and definition.retry_backoff_seconds:
@@ -316,3 +318,24 @@ def _format_exception(error: BaseException | None) -> str:
         return "task failed without an exception"
     message = str(error).strip()
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+def _business_failure(value: Any) -> str | None:
+    """Returned failures are terminal receipts, not permission to replay writes."""
+    if not isinstance(value, Mapping):
+        return None
+    daily_sync = value.get("daily_sync")
+    receipts = [value]
+    if isinstance(daily_sync, Mapping):
+        receipts.append(daily_sync)
+    for receipt in receipts:
+        for key in ("status", "sync_status"):
+            status = receipt.get(key)
+            if isinstance(status, str) and status in {"failed", "failure", "configuration_required"}:
+                return str(
+                    receipt.get("error") or receipt.get("reason")
+                    or receipt.get("message")
+                    or (daily_sync.get("error") if isinstance(daily_sync, Mapping) else None)
+                    or f"task returned {key}={status}"
+                )
+    return None

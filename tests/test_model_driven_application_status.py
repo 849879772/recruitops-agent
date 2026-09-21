@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
+import pytest
 
 from packages.browser_bridge import BrowserBridgeStore, OperationStatus
 from packages.storage import ApplicationSnapshot, Storage
@@ -62,20 +63,21 @@ def _observed_operation(
     page_url: str,
     *,
     observation: dict | None = None,
+    device_id: str = "edge-1",
 ):
     created = observe_application_status_page(
         ObserveApplicationStatusPageInput(
             application_id="24",
             application_url=page_url,
-            device_id="edge-1",
+            device_id=device_id,
             idempotency_key="observe-24",
         ),
         store,
     )
     assert created.success and created.data is not None
     operation_id = created.data.operation_id
-    dispatch = store.fetch_unacked_outbox("edge-1")[0]
-    store.ack("edge-1", dispatch.sequence, operation_id=operation_id)
+    dispatch = store.fetch_unacked_outbox(device_id)[0]
+    store.ack(device_id, dispatch.sequence, operation_id=operation_id)
     store.append_event(operation_id, "validating", OperationStatus.VALIDATING)
     return store.terminal_result(
         operation_id,
@@ -100,6 +102,48 @@ def _observed_operation(
     )
 
 
+@pytest.mark.parametrize("fault", [None, "missing_binding", "foreign_origin", "wrong_request", "wrong_capture", "old_record_url", "non_desktop"])
+def test_owned_navigation_keeps_actual_capture_and_binds_original_application(tmp_path, fault):
+    store, target = _prepared_store(tmp_path)
+    observed = "https://ats.example/applications/24#/app/application_center"
+    if fault == "foreign_origin":
+        observed = "https://foreign.example/applications/24"
+    captured = datetime.now(timezone.utc)
+    observation = {
+        "application_ids": ["24"], "page_url": observed, "captured_at": captured.isoformat(),
+        "page": {"page_url": observed, "text": "软件开发工程师 笔试中"},
+        "entries": [{"application_id": "24", "status": "written", "label": "笔试中", "context": "软件开发工程师 笔试中", "confidence": 0.99}],
+        "navigation_binding": {"source": "desktop_owned_navigation_v1", "requested_page_url": target, "observed_page_url": observed},
+    }
+    if fault == "missing_binding":
+        observation.pop("navigation_binding")
+    if fault == "wrong_request":
+        observation["navigation_binding"]["requested_page_url"] = "https://ats.example/another-application"
+    if fault == "wrong_capture":
+        observation["page"]["page_url"] = target
+    operation = _observed_operation(store, target, observation=observation,
+                                    device_id="edge-1" if fault == "non_desktop" else "desktop-fixture")
+    if fault == "old_record_url":
+        with store.storage.write_transaction() as session:
+            session.get(ApplicationSnapshot, "24").record_url = "https://ats.example/new-record-url"
+    result = verify_application_status_evidence(VerifyApplicationStatusEvidenceInput(
+        application_id="24", observation_operation_id=operation.operation_id,
+        observed_status="written", observed_label="笔试中", evidence="软件开发工程师 笔试中",
+        confidence=0.99, captured_at=captured,
+    ), store)
+    with store.storage.session() as session:
+        row = session.get(ApplicationSnapshot, "24")
+        if fault:
+            assert not result.success
+            assert result.error_code == VerificationError.OBSERVATION_BINDING_MISMATCH
+            assert row.stage == "applied"
+        else:
+            assert result.success, result
+            assert row.stage == "written"
+            assert row.record_url == target
+    assert store.get_operation(operation.operation_id).result["page_url"] == observed
+
+
 def test_model_evidence_can_verify_a_high_confidence_unchanged_status(tmp_path) -> None:
     store, page_url = _prepared_store(tmp_path)
     operation = _observed_operation(store, page_url)
@@ -122,6 +166,41 @@ def test_model_evidence_can_verify_a_high_confidence_unchanged_status(tmp_path) 
     assert result.verification is not None
     assert result.verification.data is not None
     assert result.verification.data.reason_code == "unchanged"
+
+
+def test_generic_testing_label_overrides_model_written_guess_and_retains_history(tmp_path) -> None:
+    store, page_url = _prepared_store(tmp_path)
+    with store.storage.write_transaction() as session:
+        session.get(ApplicationSnapshot, "24").stage = "written"
+    evidence = "软件开发工程师 测试中"
+    operation = _observed_operation(store, page_url, observation={
+        "page_url": page_url,
+        "captured_at": "2026-08-22T12:00:00Z",
+        "page": {"title": "应聘记录", "text": evidence},
+        "semantic_nodes": [{"tag": "td", "text": "测试中"}],
+        "entries": [],
+        "application_records": [],
+    })
+
+    result = verify_application_status_evidence(
+        VerifyApplicationStatusEvidenceInput(
+            application_id="24",
+            observation_operation_id=operation.operation_id,
+            observed_status="written",
+            observed_label="测试中",
+            evidence=evidence,
+            confidence=0.85,
+            captured_at=datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc),
+        ),
+        store,
+    )
+
+    assert result.success is True
+    assert result.status == "unchanged"
+    assert result.verification is not None and result.verification.data is not None
+    assert result.verification.data.reason_code == "historical_stage_retained"
+    assert result.verification.data.current_stage.value == "written"
+    assert result.verification.data.target_stage.value == "written"
 
 
 def test_exact_submission_card_is_read_only_unchanged_despite_low_model_confidence(tmp_path):
@@ -314,6 +393,32 @@ def test_observation_workflow_returns_a_typed_timeout_response(tmp_path) -> None
     operation = store.get_by_idempotency_key("observe-timeout-24")
     assert operation is not None
     assert operation.status == OperationStatus.CANCELLED
+
+
+def test_observation_workflow_refuses_closed_application_before_browser_access(tmp_path) -> None:
+    store, page_url = _prepared_store(tmp_path)
+    repository = SimpleNamespace(
+        list_applications=lambda: [
+            SimpleNamespace(id="24", record_url=page_url, stage="rejected")
+        ]
+    )
+
+    result = asyncio.run(
+        observe_application_status_page_workflow(
+            ObserveApplicationStatusPageInput(
+                application_id="24",
+                device_id="edge-closed",
+                idempotency_key="observe-closed-24",
+            ),
+            store,
+            repository,
+        )
+    )
+
+    assert result.success is False
+    assert result.error_code is not None and result.error_code.value == "invalid_input"
+    assert "closed" in str(result.error_message).lower()
+    assert store.get_by_idempotency_key("observe-closed-24") is None
 
 
 def test_observation_default_timeout_covers_spa_and_vision_latency() -> None:

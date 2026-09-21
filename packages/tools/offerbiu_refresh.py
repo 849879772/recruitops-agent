@@ -49,6 +49,14 @@ class OfferBiuSourceRefreshData(ToolModel):
     out_of_scope: int = Field(ge=0)
     registered_ids: list[str] = Field(default_factory=list, max_length=20)
     pending_entries: list[OfferBiuPendingEntry] = Field(default_factory=list)
+    registered_ids_sample_count: int = Field(default=0, ge=0)
+    registered_ids_limited: bool = False
+    pending_entry_count: int | None = Field(
+        default=None, ge=0,
+        description="Unlinked usable source-entry total in this snapshot, not a distinct-company count; unknown before registration.",
+    )
+    pending_entries_sample_count: int = Field(default=0, ge=0)
+    pending_entries_limited: bool = False
 
 
 class OfferBiuSourceRefreshResponse(ToolResponse[OfferBiuSourceRefreshData]):

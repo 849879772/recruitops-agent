@@ -155,12 +155,24 @@ def test_resume_persists_scope_and_does_not_expand_or_refresh(
     scope_ref = first_state["metadata"]["scope_ref"]
     assert Path(scope_ref).is_file()
     assert first_state["metadata"]["checkpoint_ref"]
+    frozen_catalog = yaml.safe_load(Path(scope_ref).read_text(encoding="utf-8"))
+    frozen_ids = tuple(row["id"] for row in frozen_catalog["companies"])
+    assert len(frozen_ids) == 1
+    assert "legacy-only" not in frozen_ids  # Fresh BIU discovery is strict.
+    assert frozen_catalog["companies"][0]["source_record_id"] == source["source_record_id"]
+    checkpoint_ref = Path(first_state["metadata"]["checkpoint_ref"])
+    checkpoint_before = checkpoint_ref.read_bytes()
+    assert json.loads(checkpoint_before)["company_ids"] == list(frozen_ids)
+
+    # Changing current discovery inputs must not change a recovered run's scope.
+    _source(storage, "newly-discovered-after-checkpoint")
+    (tmp_path / "config" / "companies.yaml").write_text("companies: []\n", encoding="utf-8")
 
     # Simulate process recovery while the original run was in company crawling.
     state = AgentStateStore(storage).get_task_state("original-run")
     assert state is not None
-    state["current_step"] = "companies:1/2"
-    state["details"]["stage"] = "companies:1/2"
+    state["current_step"] = "companies:0/1"
+    state["details"]["stage"] = "companies:0/1"
     AgentStateStore(storage).save_task_state("original-run", state)
 
     second = handlers[TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value](
@@ -175,8 +187,10 @@ def test_resume_persists_scope_and_does_not_expand_or_refresh(
     resumed = observed[-1]
     assert resumed["resume_from_checkpoint"] is True
     assert resumed["companies_path"] == Path(scope_ref)
-    assert "legacy-only" in set(resumed["company_ids"])
-    assert len(resumed["company_ids"]) == 2
+    assert tuple(resumed["company_ids"]) == frozen_ids
+    assert resumed["checkpoint_path"] == checkpoint_ref
+    assert checkpoint_ref.read_bytes() == checkpoint_before
+    assert yaml.safe_load(Path(scope_ref).read_text(encoding="utf-8")) == frozen_catalog
 
     # A resumed run may itself be resumed.  Keep the original effective mode
     # authoritative even if an adapter records the wrapper request as "resume".

@@ -1,0 +1,6 @@
+The observation adapter loads source from this repository's extension/src.
+Those sources are licensed under the repository MIT License:
+Copyright (c) 2026 RecruitOps contributors.
+
+Redistribution must include the repository LICENSE alongside the adapter and
+its packaged resources. No third-party filler source is included or implied.

@@ -25,6 +25,7 @@ class CodexRuntimeConfig(BaseModel):
 
     command: tuple[str, ...] = Field(min_length=1)
     working_dir: Path | None = None
+    skill_roots: tuple[Path, ...] = ()
     startup_timeout_seconds: float = Field(default=10.0, gt=0)
     restart_policy: RestartPolicy = RestartPolicy.ON_FAILURE
     max_restarts: int = Field(default=3, ge=0)

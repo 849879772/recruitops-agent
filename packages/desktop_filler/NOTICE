@@ -1,0 +1,29 @@
+# Desktop Filler Notice
+
+The default desktop DOM engine reuses core.js, repeater-engine.js and content.js
+from the user's local resume-filler browser extension, version 0.11.5. File hashes
+and provenance are recorded in browser-engine/provenance.json (upstream hashes).
+Local content.js patches: native-select verification uses the selected option value
+instead of comparing an internal value against its display label; desktop repeat
+preparation accepts only validated add-only plans and checks cancellation/deadlines
+between additions, without invoking the extension's full-page prepare defaults.
+Read-only registration context can disable host-name fallback; desktop drafts use
+the original company/title extractors without guessing company names from domains.
+Explicitly branded recruitment titles take priority over loose header/navigation text.
+Company-label cleanup also removes the leading Chinese welcome-to-join phrase.
+The desktop safety
+adapter and compact compatibility engine are maintained separately in index.cjs.
+No original license file was supplied. This notice records provenance, not a new
+license grant; confirm the source owner's redistribution rights before publishing.
+
+The import excludes personal resume data, browser storage, attachments, service
+bindings, cookies, tokens, background and SMS/native-messaging components. Dormant
+extension message branches are not exposed by the desktop's allowlisted dispatcher.
+
+`loadLocalFiller()` remains an optional compatibility adapter for a user-selected,
+trusted local source directory. It is not used by the packaged default workflow and
+does not grant any license to redistribute that selected source.
+
+The bundled engine never handles passwords, SMS/OTP fields, CAPTCHA, or final form
+submission. File upload and field filling require an explicit user action. Website
+compatibility varies and must be reported as supported, partial, or unsupported.

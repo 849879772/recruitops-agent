@@ -5,6 +5,7 @@ from functools import lru_cache
 import importlib
 import json
 import logging
+import os
 from pathlib import Path
 from secrets import compare_digest
 from typing import Any, Literal, Mapping
@@ -84,7 +85,13 @@ from packages.browser_bridge import BrowserBridgeServer, BrowserBridgeStore
 from packages.codex_runtime.telemetry import JsonlTraceRecorder as CodexJsonlTraceRecorder
 from packages.vision import VisionError, VisionResult, VisionService
 from packages.vision.observation import analyze_observation
-from packages.automation import AutomationStore, LocalAutomationWorker
+from packages.automation import (
+    AutomationRunResult,
+    AutomationStore,
+    LocalAutomationWorker,
+    automation_blocked_message,
+    automation_blocked_reason,
+)
 from apps.api.automation import CodexAutomationExecutor
 
 
@@ -155,17 +162,146 @@ async def _run_startup_mail_sync(app_state: Any) -> None:
         print(f"startup mailbox sync failed: {type(exc).__name__}", flush=True)
 
 
+def _recover_desktop_browser_operations(settings: Any, storage: Storage) -> int:
+    # The desktop supervisor owns an exclusive instance lock before API startup.
+    # Other servers and read-only launches must not cancel another owner's work.
+    instance_id = os.environ.get("RECRUITOPS_DESKTOP_INSTANCE_ID", "")
+    if (getattr(settings, "env", None) != "desktop-isolated"
+            or getattr(settings, "write_enabled", False) is not True
+            or not instance_id
+            or os.environ.get("RECRUITOPS_ENV") != "desktop-isolated"
+            or os.environ.get("RECRUITOPS_WRITE_ENABLED") != "true"
+            or os.environ.get("RECRUITOPS_DESKTOP_WRITE_OPTIN") != instance_id):
+        return 0
+    return BrowserBridgeStore(storage).recover_interrupted_operations()
+
+
+def _build_automation_worker(settings: Any):
+    storage = Storage.from_url(settings.database_url)
+    try:
+        store = AutomationStore(storage)
+        executor = CodexAutomationExecutor(
+            get_codex_bff_service(),
+            store,
+            timeout_seconds=getattr(settings, "automation_run_timeout_seconds", 600.0),
+        )
+        worker = LocalAutomationWorker(
+            store,
+            lambda task: _execute_automation_if_authorized(executor, task),
+            poll_seconds=getattr(settings, "automation_poll_seconds", 10.0),
+        )
+        return storage, store, worker
+    except BaseException:
+        storage.engine.dispose()
+        raise
+
+
+async def _execute_automation_if_authorized(executor: Any, task: Any) -> AutomationRunResult:
+    settings = get_settings()
+    reason = automation_blocked_reason(task.task_id, settings)
+    if reason is not None:
+        return AutomationRunResult(status="blocked", error=reason)
+    return await executor(task)
+
+
+class _AutomationWorkerLifecycle:
+    def __init__(self, app_state: Any, *, codex_runtime_started: bool):
+        self.app_state = app_state
+        self.codex_runtime_started = codex_runtime_started
+        self.storage = None
+        self.store = None
+        self.worker = None
+        self.task = None
+        self.retry_after = 0.0
+
+    def _status(self, value: str) -> None:
+        self.app_state.automation_worker_status = value
+
+    async def _release_worker(self) -> None:
+        storage = self.storage
+        self.storage = self.store = self.worker = self.task = None
+        if storage is not None:
+            storage.engine.dispose()
+
+    async def reconcile(self) -> None:
+        settings = get_settings()
+        enabled = (
+            self.codex_runtime_started
+            and bool(getattr(settings, "codex_runtime_enabled", False))
+            and bool(getattr(settings, "automation_enabled", False))
+        )
+        loop = asyncio.get_running_loop()
+
+        if self.task is not None and self.task.done():
+            error = None if self.task.cancelled() else self.task.exception()
+            await self._release_worker()
+            if error is not None:
+                self.retry_after = loop.time() + 5.0
+                logger.error("local automation worker exited: %s", type(error).__name__)
+
+        if not enabled:
+            if self.worker is not None:
+                self.worker.stop()
+                self._status("stopping")
+                if self.task is not None and not self.task.done():
+                    return
+                await self._release_worker()
+            self._status("disabled")
+            return
+
+        if self.worker is not None:
+            self._status("running")
+            return
+        if loop.time() < self.retry_after:
+            self._status("retry_wait")
+            return
+
+        storage, store, worker = _build_automation_worker(settings)
+        try:
+            await asyncio.to_thread(store.recover_interrupted)
+            await asyncio.to_thread(store.skip_missed_occurrences)
+        except BaseException:
+            storage.engine.dispose()
+            raise
+        self.storage, self.store, self.worker = storage, store, worker
+        self.task = asyncio.create_task(worker.run_forever(), name="local-automation-worker")
+        self._status("running")
+
+    async def close(self) -> None:
+        if self.worker is not None:
+            self.worker.stop()
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+        if self.task is not None:
+            await asyncio.gather(self.task, return_exceptions=True)
+        await self._release_worker()
+
+
+async def _watch_automation_configuration(lifecycle: _AutomationWorkerLifecycle) -> None:
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            await lifecycle.reconcile()
+        except Exception as exc:
+            logger.warning("automation configuration refresh failed: %s", type(exc).__name__)
+            await asyncio.sleep(4.0)
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     settings = get_settings()
-    from packages.personal_knowledge import get_knowledge_service
-    await asyncio.to_thread(get_knowledge_service().recover_interrupted)
-    recovery_storage = Storage.from_url(settings.database_url)
-    try:
-        recovered_runs = AgentStateStore(recovery_storage).recover_interrupted_task_runs()
-    finally:
-        recovery_storage.engine.dispose()
+    database_url = getattr(settings, "database_url", None)
+    recovered_runs = 0
+    recovered_browser_operations = 0
+    if database_url:
+        recovery_storage = Storage.from_url(database_url)
+        try:
+            recovered_runs = AgentStateStore(recovery_storage).recover_interrupted_task_runs()
+            recovered_browser_operations = _recover_desktop_browser_operations(settings, recovery_storage)
+        finally:
+            recovery_storage.engine.dispose()
     _app.state.recovered_task_runs = recovered_runs
+    _app.state.recovered_browser_operations = recovered_browser_operations
     if recovered_runs:
         logger.warning("marked %s interrupted task runs as recoverable", recovered_runs)
     bridge_enabled = bool(str(getattr(settings, "api_token", "")).strip())
@@ -173,8 +309,11 @@ async def app_lifespan(_app: FastAPI):
         await browser_bridge_server.start()
     if getattr(settings, "codex_runtime_enabled", False):
         await get_codex_bff_service().start()
-    automation_worker = None
-    automation_task = None
+    automation_lifecycle = _AutomationWorkerLifecycle(
+        _app.state,
+        codex_runtime_started=bool(getattr(settings, "codex_runtime_enabled", False)),
+    )
+    automation_lifecycle_task = None
     startup_mail_task = None
     if getattr(settings, "mail_enabled", False) and getattr(settings, "mail_sync_on_startup", True):
         _app.state.startup_mail_sync_status = "scheduled"
@@ -184,30 +323,18 @@ async def app_lifespan(_app: FastAPI):
             name="startup-mail-sync",
         )
         _app.state.startup_mail_sync_task = startup_mail_task
-    if getattr(settings, "codex_runtime_enabled", False) and getattr(settings, "automation_enabled", False):
-        automation_store = AutomationStore(Storage.from_url(settings.database_url))
-        await asyncio.to_thread(automation_store.recover_interrupted)
-        automation_worker = LocalAutomationWorker(
-            automation_store,
-            CodexAutomationExecutor(
-                get_codex_bff_service(),
-                automation_store,
-                timeout_seconds=getattr(settings, "automation_run_timeout_seconds", 600.0),
-            ),
-            poll_seconds=getattr(settings, "automation_poll_seconds", 10.0),
-        )
-        automation_task = asyncio.create_task(
-            automation_worker.run_forever(),
-            name="local-automation-worker",
-        )
+    await automation_lifecycle.reconcile()
+    automation_lifecycle_task = asyncio.create_task(
+        _watch_automation_configuration(automation_lifecycle),
+        name="automation-configuration-watch",
+    )
     try:
         yield
     finally:
-        if automation_worker is not None:
-            automation_worker.stop()
-        if automation_task is not None:
-            automation_task.cancel()
-            await asyncio.gather(automation_task, return_exceptions=True)
+        if automation_lifecycle_task is not None:
+            automation_lifecycle_task.cancel()
+            await asyncio.gather(automation_lifecycle_task, return_exceptions=True)
+        await automation_lifecycle.close()
         if startup_mail_task is not None and not startup_mail_task.done():
             startup_mail_task.cancel()
             await asyncio.gather(startup_mail_task, return_exceptions=True)
@@ -228,8 +355,6 @@ app.include_router(local_ui_router)
 app.include_router(schedule_items_router)
 from apps.api.configuration import router as configuration_router
 app.include_router(configuration_router)
-from apps.api.knowledge import router as knowledge_router
-app.include_router(knowledge_router)
 from apps.api.resume_filler import router as resume_filler_router
 app.include_router(resume_filler_router)
 app.include_router(company_sources_router)
@@ -262,7 +387,7 @@ async def local_ui_boundary(request, call_next):
     try:
         response = await call_next(request)
         if request.url.path in {
-            "/", "/index.html", "/app.js", "/company-sources.js", "/configuration.js", "/knowledge.js", "/styles.css"
+            "/", "/index.html", "/app.js", "/company-sources.js", "/configuration.js", "/styles.css"
         }:
             # Revalidate HTML and its mutable assets together after deployment.
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
@@ -295,15 +420,12 @@ class CodexTurnStartRequest(BaseModel):
 
     text: str = Field(min_length=1, max_length=40_000)
     job_id: str | None = Field(default=None, max_length=255)
-    knowledge_enabled: bool = False
-    knowledge_document_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
 
     def prompt(self):
-        if not (self.job_id or self.knowledge_enabled or self.knowledge_document_id):
+        if not self.job_id:
             return self.text
-        context = {"job_id": self.job_id, "personal_knowledge": self.knowledge_enabled or bool(self.knowledge_document_id),
-                   "document_id": self.knowledge_document_id}
-        return self.text + "\n\n[本轮页面上下文，仅当前选择有效；岗位内容请用 job_detail 核对，个人资料请用 knowledge_search(domain=personal) 查询]\n" + json.dumps(context, ensure_ascii=False)
+        context = {"job_id": self.job_id}
+        return self.text + "\n\n[本轮页面上下文，仅当前选择有效；岗位内容请用 job_detail 核对]\n" + json.dumps(context, ensure_ascii=False)
 
 
 class CodexTurnInterruptRequest(BaseModel):
@@ -819,7 +941,12 @@ def _require_local_api_token(
         raise HTTPException(status_code=401, detail="Local API token is required")
 
 
-def _automation_payload(store: AutomationStore, row: Any) -> dict[str, Any]:
+def _automation_payload(
+    store: AutomationStore,
+    row: Any,
+    *,
+    blocked_reason: str | None = None,
+) -> dict[str, Any]:
     executions = store.executions(row.id, limit=1)
     latest = executions[0] if executions else None
     return {
@@ -833,6 +960,8 @@ def _automation_payload(store: AutomationStore, row: Any) -> dict[str, Any]:
         "start_time": row.start_time.strftime("%H:%M"),
         "timezone": row.timezone_name,
         "active": bool(row.active),
+        "runnable": bool(row.active and blocked_reason is None),
+        "blocked_reason": blocked_reason,
         "next_run_at": row.next_run_at,
         "last_run_at": row.last_run_at,
         "last_status": row.last_status,
@@ -847,6 +976,7 @@ def _automation_payload(store: AutomationStore, row: Any) -> dict[str, Any]:
                 "result_summary": latest.result_summary,
                 "error": latest.error,
                 "thread_id": latest.thread_id,
+                    "turn_id": getattr(latest, "turn_id", None),
             }
             if latest is not None
             else None
@@ -856,11 +986,37 @@ def _automation_payload(store: AutomationStore, row: Any) -> dict[str, Any]:
 
 @app.get("/api/automations", tags=["automations"])
 def list_local_automations(active_only: bool = False) -> dict[str, Any]:
-    store = AutomationStore(Storage.from_url(get_settings().database_url))
+    settings = get_settings()
+    store = AutomationStore(Storage.from_url(settings.database_url))
     rows = store.list(active_only=active_only)
+    worker_status = getattr(app.state, "automation_worker_status", "not_started")
+    engine_blocked_code = automation_blocked_reason(None, settings)
+    engine_blocked_reason = (
+        automation_blocked_message(engine_blocked_code)
+        if engine_blocked_code is not None
+        else (None if worker_status == "running" else f"调度 worker 状态：{worker_status}")
+    )
+    items = []
+    for row in rows:
+        task_blocked_code = automation_blocked_reason(row.task_id, settings)
+        blocked_reason = (
+            automation_blocked_message(task_blocked_code)
+            if task_blocked_code is not None
+            else (
+                f"调度 worker 状态：{worker_status}"
+                if row.active and worker_status != "running"
+                else None
+            )
+        )
+        items.append(_automation_payload(store, row, blocked_reason=blocked_reason))
     return {
-        "items": [_automation_payload(store, row) for row in rows],
+        "items": items,
         "total": len(rows),
+        "engine": {
+            "enabled": engine_blocked_reason is None,
+            "status": worker_status,
+            "blocked_reason": engine_blocked_reason,
+        },
     }
 
 

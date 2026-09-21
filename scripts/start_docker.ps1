@@ -15,7 +15,6 @@ if ($DryRun) {
     Write-Output 'No image build, database reset, volume removal, or scheduled task creation.'
     exit 0
 }
-& (Join-Path $PSScriptRoot 'start_embedding.ps1')
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw 'Docker CLI was not found. No files or services were changed.'
 }

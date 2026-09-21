@@ -52,7 +52,16 @@ _STATUS_ALIASES = {
     "withdrawn": "withdrawn",
     "已投递": "applied",
     "投递成功": "applied",
-    "测评": "assessment",
+    "筛选阶段": "applied",
+    "筛选中": "applied",
+    "测试中": "applied",
+    "测试阶段": "applied",
+    "进行中": "applied",
+    "测评": "applied",
+    "测评中": "applied",
+    "在线测评": "applied",
+    "线上测评": "applied",
+    "线上测评_进行中": "applied",
     "笔试": "written",
     "笔试中": "written",
     "面试": "interview",
@@ -1329,7 +1338,14 @@ def browser_status_update(
                 confidence=confidence,
                 match_method=match.method,
             )
-        if confidence < _AUTO_CONFIDENCE:
+        target_stage = _target_stage(current_stage, observed_status)
+        retained_historical_stage = (
+            current_stage not in _TERMINAL_STAGES
+            and target_stage not in _TERMINAL_STAGES
+            and _STAGE_ORDER[target_stage] < _STAGE_ORDER[current_stage]
+        )
+        no_write_stage_confirmation = target_stage is current_stage or retained_historical_stage
+        if confidence < _AUTO_CONFIDENCE and not retained_historical_stage:
             return _persist_decision(
                 storage,
                 request=request,
@@ -1354,17 +1370,16 @@ def browser_status_update(
                 match_method=match.method,
             )
 
-        target_stage = _target_stage(current_stage, observed_status)
         after_preview = {
             "application_id": application.id,
             "record_url": record_url,
-            "stage": target_stage.value,
+            "stage": current_stage.value if retained_historical_stage else target_stage.value,
             "source_stage": observed_status,
             "source_status": match.entry.label,
             "confidence": confidence,
             "match_method": match.method.value,
         }
-        if target_stage is current_stage:
+        if no_write_stage_confirmation:
             audit = _new_audit(
                 request=request,
                 audit_id=audit_id,
@@ -1412,8 +1427,14 @@ def browser_status_update(
                 audit_id=audit_id,
                 idempotency_key=idempotency_key,
                 status=UpdateStatus.UNCHANGED,
-                reason_code="unchanged",
-                reason="The verified Edge status already matches the Agent stage.",
+                reason_code=(
+                    "historical_stage_retained" if retained_historical_stage else "unchanged"
+                ),
+                reason=(
+                    "The observed page status is lower than the previously confirmed stage; the historical stage was retained."
+                    if retained_historical_stage
+                    else "The verified Edge status already matches the Agent stage."
+                ),
                 application=application,
                 record_url=record_url,
                 current_stage=current_stage,

@@ -982,7 +982,7 @@ async def capture_oc_snapshot_workflow(
     )  # type: ignore[return-value]
 
 
-async def observe_application_status_page_workflow(
+async def _observe_application_status_page_workflow(
     request: ObserveApplicationStatusPageInput,
     browser_bridge_store: BrowserBridgeStore | None,
     repository: RecruitmentRepository,
@@ -1006,6 +1006,29 @@ async def observe_application_status_page_workflow(
             started=started,
             error_code=BrowserErrorCode.INVALID_INPUT,
             error_message="Every application id must identify one persisted application.",
+            application_id=request.application_id,
+            idempotency_key=request.idempotency_key,
+            operation_id=request.operation_id,
+            task_id=request.task_id,
+        )  # type: ignore[return-value]
+    terminal_ids = [
+        str(item.id)
+        for item in matches
+        if str(getattr(item, "stage", "") or "").casefold() in {"rejected", "withdrawn"}
+    ]
+    if terminal_ids:
+        return _response(
+            ObserveApplicationStatusPageResponse,
+            tool_name=tool_name,
+            operation=OperationName.OBSERVE_APPLICATION_STATUS_PAGE.value,
+            read_only=False,
+            request=request,
+            started=started,
+            error_code=BrowserErrorCode.INVALID_INPUT,
+            error_message=(
+                "Rejected or withdrawn applications are closed and cannot be opened for "
+                "progress review."
+            ),
             application_id=request.application_id,
             idempotency_key=request.idempotency_key,
             operation_id=request.operation_id,
@@ -1085,7 +1108,7 @@ async def observe_application_status_page_workflow(
             data = ObserveApplicationStatusPageData(
                 **_operation_data(operation).model_dump(),
                 idempotent_replay=created.data.idempotent_replay,
-                observation=_redacted_mapping(observation),
+                observation=_redacted_mapping(operation.result),
             )
             return _response(
                 ObserveApplicationStatusPageResponse,
@@ -1103,9 +1126,11 @@ async def observe_application_status_page_workflow(
                 idempotent_replay=created.data.idempotent_replay,
             )  # type: ignore[return-value]
         if status in TERMINAL_STATUSES:
+            observed = status is OperationStatus.SUCCEEDED and isinstance(operation.result, dict)
             data = ObserveApplicationStatusPageData(
                 **_operation_data(operation).model_dump(),
                 idempotent_replay=created.data.idempotent_replay,
+                observation=_redacted_mapping(operation.result) if observed else None,
             )
             return _response(
                 ObserveApplicationStatusPageResponse,
@@ -1115,13 +1140,14 @@ async def observe_application_status_page_workflow(
                 request=request,
                 started=started,
                 data=data,
-                error_code=(BrowserErrorCode.OPERATION_FAILED if status is OperationStatus.FAILED else BrowserErrorCode.OPERATION_STATE_UNCLEAR),
-                error_message="Edge could not return a usable observation.",
+                error_code=None if observed else (BrowserErrorCode.OPERATION_FAILED if status is OperationStatus.FAILED else BrowserErrorCode.OPERATION_STATE_UNCLEAR),
+                error_message=None if observed else "Edge could not return a usable observation.",
                 operation_id=operation_id,
                 application_id=request.application_id,
                 device_id=operation.device_id,
                 idempotency_key=request.idempotency_key,
                 task_id=request.task_id,
+                idempotent_replay=created.data.idempotent_replay,
             )  # type: ignore[return-value]
         await asyncio.sleep(poll_seconds)
     try:
@@ -1266,7 +1292,7 @@ def review_and_update_application_status(
     )  # type: ignore[return-value]
 
 
-async def review_and_update_application_status_workflow(
+async def _review_and_update_application_status_workflow(
     request: ReviewAndUpdateApplicationStatusInput,
     browser_bridge_store: BrowserBridgeStore | None,
     repository: RecruitmentRepository,
@@ -1434,11 +1460,18 @@ async def review_and_update_application_status_workflow(
             )  # type: ignore[return-value]
 
         if operation_status in TERMINAL_STATUSES:
+            verification = (operation.result or {}).get("verification")
+            verified = (
+                operation_status is OperationStatus.SUCCEEDED
+                and isinstance(verification, dict)
+                and verification.get("status") in {"updated", "unchanged"}
+            )
             operation_data = _operation_data(operation)
             data = ReviewAndUpdateApplicationStatusData(
                 **operation_data.model_dump(),
                 idempotent_replay=created.data.idempotent_replay,
                 requires_confirmation=False,
+                verification=verification if isinstance(verification, dict) else None,
             )
             return _response(
                 ReviewAndUpdateApplicationStatusResponse,
@@ -1448,17 +1481,18 @@ async def review_and_update_application_status_workflow(
                 request=request,
                 started=started,
                 data=data,
-                error_code=(
+                error_code=None if verified else (
                     BrowserErrorCode.OPERATION_STATE_UNCLEAR
                     if operation_status is OperationStatus.STATE_UNCLEAR
                     else BrowserErrorCode.OPERATION_FAILED
                 ),
-                error_message="The Edge operation ended without a verified database update.",
+                error_message=None if verified else "The Edge operation ended without a verified database update.",
                 operation_id=operation_id,
                 application_id=request.application_id,
                 device_id=operation.device_id,
                 idempotency_key=request.idempotency_key,
                 task_id=request.task_id,
+                idempotent_replay=created.data.idempotent_replay,
             )  # type: ignore[return-value]
         await asyncio.sleep(poll_seconds)
 
@@ -1480,7 +1514,48 @@ async def review_and_update_application_status_workflow(
         device_id=created.data.device_id,
         idempotency_key=request.idempotency_key,
         task_id=request.task_id,
+        timed_out=True,
     )  # type: ignore[return-value]
+
+
+async def _guard_status_workflow(workflow, request, store, repository):
+    try:
+        return await workflow(request, store, repository)
+    except (asyncio.CancelledError, Exception):
+        # Outer wave deadlines cancel this coroutine before its own timeout.
+        # Only status reads/reviews are eligible; never replay browser writes.
+        if store is not None:
+            operation = store.get_by_idempotency_key(request.idempotency_key)
+            if operation is not None and operation.operation in {
+                OperationName.OBSERVE_APPLICATION_STATUS_PAGE.value,
+                OperationName.REVIEW_AND_UPDATE_APPLICATION_STATUS.value,
+            } and normalize_status(operation.status) not in TERMINAL_STATUSES:
+                try:
+                    store.cancel(operation.operation_id, reason="status_workflow_interrupted")
+                except (KeyError, ValueError):
+                    # A concurrent terminal result already owns completion.
+                    pass
+        raise
+
+
+async def observe_application_status_page_workflow(
+    request: ObserveApplicationStatusPageInput,
+    browser_bridge_store: BrowserBridgeStore | None,
+    repository: RecruitmentRepository,
+) -> ObserveApplicationStatusPageResponse:
+    return await _guard_status_workflow(
+        _observe_application_status_page_workflow, request, browser_bridge_store, repository,
+    )
+
+
+async def review_and_update_application_status_workflow(
+    request: ReviewAndUpdateApplicationStatusInput,
+    browser_bridge_store: BrowserBridgeStore | None,
+    repository: RecruitmentRepository,
+) -> ReviewAndUpdateApplicationStatusResponse:
+    return await _guard_status_workflow(
+        _review_and_update_application_status_workflow, request, browser_bridge_store, repository,
+    )
 
 
 def browser_operation_status(

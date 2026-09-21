@@ -446,7 +446,8 @@ def test_browser_bridge_waits_for_spa_content_and_uses_vision_after_dom_only_obs
 
     assert "waitForSemanticObservation" in background
     assert "usableSemanticObservation" in background
-    assert "attempt <= 16" in background
+    assert "attempt <= 22" in background
+    assert "attempt < 22" in background
     assert "semanticObservationScore" in background
     assert "stableAttempts >= 2" in background
     assert "canRequestVision" in background
@@ -461,6 +462,21 @@ def test_browser_bridge_waits_for_spa_content_and_uses_vision_after_dom_only_obs
     assert "sender?.tab?.id" not in content
     assert 'sender?.id !== chrome.runtime.id' in content
     assert 'bridgeFailure("ACTION_EXECUTION_FAILED", {detail})' in background
+
+
+def test_migrated_status_labels_keep_assessment_at_applied() -> None:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = launch_fixture_browser(playwright)
+        try:
+            page = browser.new_page()
+            page.add_script_tag(path=str(SRC / "application-records.js"))
+            actual = page.evaluate("""() => ["assessment", "在线测评", "筛选阶段", "测试中", "测试阶段", "进行中", "笔试", "编程测试"].map(
+                value => RecruitOpsApplicationRecords.normalizedStatus(value))""")
+        finally:
+            browser.close()
+    assert actual == ["applied"] * 6 + ["written", "written"]
 
 
 def test_oc_link_resolution_classifies_non_job_entries_before_persistence() -> None:

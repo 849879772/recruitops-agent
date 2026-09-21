@@ -58,6 +58,58 @@ UTC = timezone.utc
 NOW = datetime(2026, 8, 19, 8, 0, tzinfo=UTC)
 
 
+@pytest.mark.parametrize("name", MCP_ACTION_TOOL_NAMES)
+def test_mcp_actions_fail_closed_before_dependencies_or_input(name, monkeypatch):
+    import asyncio
+    import inspect
+    from types import SimpleNamespace
+    from packages.mcp.server import _build_handler
+
+    monkeypatch.setattr("packages.mcp.server.get_settings", lambda: SimpleNamespace(write_enabled=False))
+    definition = next(item for item in TOOL_DEFINITIONS if item.name == name)
+    handler = _build_handler(definition, None)
+    with pytest.raises(PermissionError, match="disabled"):
+        if inspect.iscoroutinefunction(handler):
+            asyncio.run(handler({}))
+        else:
+            handler({})
+
+
+def test_read_only_registration_matches_the_real_implementation():
+    from packages.mcp.server import register_read_only_tools
+
+    class Registrar:
+        def __init__(self):
+            self.handlers = {}
+
+        def tool(self, *, name, description):
+            def register(handler):
+                assert name not in self.handlers
+                self.handlers[name] = handler
+                return handler
+            return register
+
+    registrar = Registrar()
+    names = register_read_only_tools(registrar, None, None)
+    assert set(names) == set(registrar.handlers) == set(MCP_READ_ONLY_TOOL_NAMES)
+    assert not set(registrar.handlers).intersection(MCP_ACTION_TOOL_NAMES)
+
+
+def test_default_write_setting_and_mail_reads_do_not_refresh(monkeypatch):
+    from types import SimpleNamespace
+    from packages.config import Settings
+    from packages.mcp.server import _sync_mail_before_read
+
+    assert Settings.model_fields["write_enabled"].default is False
+    monkeypatch.setattr("packages.mcp.server.get_settings", lambda: SimpleNamespace(write_enabled=False))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Read-only mail access must not synchronize or persist messages")
+
+    monkeypatch.setattr("packages.recruitment_mail.freshness.ensure_mail_fresh", forbidden)
+    assert _sync_mail_before_read(None)["status"] == "disabled"
+
+
 def _approval_preview(**updates: object) -> ApprovalPreview:
     values: dict[str, object] = {
         "task_id": "security-task-1",
@@ -156,10 +208,10 @@ def test_mcp_tool_surface_is_current_and_explicitly_classified() -> None:
         definition.name for definition in TOOL_DEFINITIONS if not definition.read_only
     }
 
-    assert MCP_TOOL_PROTOCOL_VERSION == "22"
-    assert len(MCP_TOOL_NAMES) == 37
+    assert MCP_TOOL_PROTOCOL_VERSION == "24"
+    assert len(MCP_TOOL_NAMES) == 38
     assert len(MCP_READ_ONLY_TOOL_NAMES) == 24
-    assert len(MCP_ACTION_TOOL_NAMES) == 13
+    assert len(MCP_ACTION_TOOL_NAMES) == 14
     assert set(MCP_TOOL_NAMES) == definition_names
     assert set(MCP_READ_ONLY_TOOL_NAMES) == definition_read_only
     assert set(MCP_ACTION_TOOL_NAMES) == definition_actions

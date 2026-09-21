@@ -10,6 +10,11 @@ stored in PostgreSQL.
 
 For a bounded new-company workflow, a complete `offerbiu_source_refresh` returns
 at most twenty readable, distinct unregistered companies in `pending_entries`.
+`pending_entry_count` is the total number of unlinked usable source entries in
+that refreshed snapshot, not the number of distinct companies. It is unknown
+before registration. `pending_entries_sample_count` and `pending_entries_limited`
+describe the bounded, deduplicated sample; do not report its length as the total.
+Registered IDs are similarly bounded, with explicit sample count and limit flags.
 Pass up to ten of those `record_id` values directly to
 `daily_recruitment_sync(source_record_ids=[...])`. The runtime creates a
 run-scoped company configuration and executes the same formal title-first crawl,

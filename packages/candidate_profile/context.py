@@ -43,6 +43,8 @@ def build_scoring_context(profile: CandidateProfile) -> CandidateScoringContext:
         job_type=profile.job_type,
         direction_policy=profile.matching.direction_policy,
         target_directions=directions,
+        title_keywords=profile.matching.title_keywords,
+        excluded_title_keywords=profile.matching.excluded_title_keywords,
         evidence=evidence,
         learning_targets=profile.matching.learning_targets,
         excluded_unverified_skills=profile.matching.unverified_skills,

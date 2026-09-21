@@ -108,6 +108,8 @@ def profile_content_payload(profile: Any) -> dict[str, Any]:
         "primary_directions",
         "secondary_directions",
         "target_directions",
+        "title_keywords",
+        "excluded_title_keywords",
         "skills",
         "project_evidence",
         "supporting_skills",

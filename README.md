@@ -1,6 +1,6 @@
 # RecruitOps Agent
 
-> 面向校园招聘的本地优先智能工作台：从招聘源发现、岗位抓取与匹配评分，到投递记录、招聘邮件、待办日程和个人知识库，统一交给可审计的 Agent 工具链处理。
+> 面向校园招聘的本地优先智能工作台：从招聘源发现、岗位抓取与匹配评分，到投递记录、招聘邮件、待办日程，统一交给可审计的 Agent 工具链处理。
 
 [![CI](https://github.com/849879772/recruitops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/849879772/recruitops-agent/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -34,9 +34,8 @@
 | 投递管理 | 看板化管理已投递、笔试、面试、Offer 与已挂，保留阶段历史 |
 | 招聘邮件 | IMAP 同步、招聘邮件分类、公司与岗位宽松匹配、状态事件提取 |
 | 待办与日程 | 无日期事件进入待办，明确时间的测评/笔试/面试进入日程 |
-| 个人知识库 | PDF/Markdown/文本摄取，混合检索，为岗位问答补充个人项目证据 |
 | Agent 工具链 | MCP typed tools、只读默认、显式写入开关、运行心跳与崩溃恢复 |
-| 浏览器桥接 | 可选 Edge 扩展读取已登录页面，在人工登录边界内核验投递状态 |
+| 内置招聘浏览器 | 在桌面软件中登录招聘网站、简历闪填、登记投递并核验官网进度 |
 | 自动化任务 | 支持抓取、评分、邮件处理等周期任务，并显示最近一次运行统计 |
 
 ## 运行界面
@@ -69,29 +68,37 @@ flowchart LR
 
     J[招聘邮箱] --> K[邮件分类与应用绑定]
     K --> L[阶段事件 / 待办 / 日程]
-    M[浏览器扩展] --> N[已登录投递页证据]
+    M[内置招聘浏览器] --> N[已登录投递页证据]
     N --> L
     L --> G
 
-    P[简历与个人资料] --> Q[个人知识库]
-    Q --> R[混合检索]
+    P[简历配置] --> H
     G --> S[MCP 工具服务]
-    R --> S
     S --> T[Codex / MCP Client]
 ```
 
 ## 技术架构
 
-- **应用层**：FastAPI、原生 Web UI、REST API。
+- **应用层**：Electron 桌面壳、FastAPI、原生 Web UI、REST API。
 - **Agent 层**：Codex App Server（可选）、MCP Server、领域技能与结构化工具契约。
 - **数据层**：PostgreSQL 16、SQLAlchemy、pgvector、不可变阶段历史与任务检查点。
-- **检索层**：Qwen3-Embedding-0.6B（可选本地服务）、BM25/关键词与向量混合检索。
 - **采集层**：Playwright、Requests、BeautifulSoup，以及招聘平台适配器。
 - **可靠性**：幂等写入、批次检查点、任务心跳、失败归因、崩溃恢复和冻结评测集。
 
-核心业务数据始终通过结构化数据库查询；RAG 只用于简历、项目文档和个人材料等非结构化知识，不替代岗位与投递状态查询。
+核心业务数据通过结构化数据库查询；简历解析用于岗位筛选和匹配评分。
 
-## 快速开始
+## Windows 桌面版
+
+桌面版适合普通用户，不需要预先安装 Docker、Python、Node.js 或 PostgreSQL：
+
+1. 从 GitHub Releases 下载 `RecruitOps.zip`。
+2. 完整解压到可写的短路径，例如 `D:\RecruitOps`，不要直接在压缩包内运行。
+3. 双击唯一入口 `RecruitOps-Desktop-Preview.exe`。
+4. 首次启动后在“配置”中添加模型连接、测试连接、上传简历并确认岗位关键词与行业方向。
+
+软件将运行数据保存在程序旁的 `.data/`，升级前可备份该目录。发布包内的 PostgreSQL、Chromium、Python 和 Node.js 都是内部运行组件，不是额外启动入口。
+
+## 源码部署
 
 ### 前置条件
 
@@ -158,7 +165,7 @@ RECRUITOPS_MAIL_IMAP_PASSWORD=application-password
 python scripts/run_mcp_server.py
 ```
 
-工具覆盖岗位查询、公司来源、匹配评分、投递记录、招聘邮件、待办日程、自动化任务和个人知识库。所有写操作都经过统一权限边界；详细契约见 [MCP 文档](docs/MCP.md)。
+工具覆盖岗位查询、公司来源、匹配评分、投递记录、招聘邮件、待办日程、自动化任务。所有写操作都经过统一权限边界；详细契约见 [MCP 文档](docs/MCP.md)。
 
 项目内置领域技能：
 
@@ -168,25 +175,15 @@ python scripts/run_mcp_server.py
 - `application-status`：投递状态核验
 - `schedule-management`：待办和日程管理
 
-## 个人知识库
-
-将简历、项目文档或 Markdown 放入本地知识目录，并在 `config/rag_sources.yaml` 中声明来源：
-
-```bash
-python scripts/reindex_personal_knowledge.py
-```
-
-检索采用结构化过滤、关键词/BM25 与向量召回的组合，并返回来源引用。岗位数据仍走 SQL，避免用语义检索替代精确筛选。详见 [个人知识库](docs/PERSONAL_KNOWLEDGE.md) 与 [Qwen Embedding](docs/QWEN_EMBEDDING.md)。
-
 ## 项目结构
 
 ```text
 apps/                 FastAPI 与 Web 工作台
-packages/             领域模型、工具、抓取、评分、邮件与知识库
+apps/desktop/         Electron 桌面应用与内置招聘浏览器
+packages/             领域模型、工具、抓取、评分、邮件与流程编排
 migrations/           PostgreSQL 数据库迁移
 .agents/skills/       Agent 领域技能说明
-extension/            可选 Edge/Chromium 浏览器扩展
-services/embedding/   本地 Embedding 服务
+extension/            旧版可选 Edge/Chromium 浏览器扩展
 scripts/              启动、迁移、诊断、备份与索引脚本
 evals/                冻结评测集与可靠性评估
 tests/                单元和契约测试

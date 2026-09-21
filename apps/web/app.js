@@ -59,8 +59,10 @@
     companyPage: 1,
     companyPageSize: 30,
     applications: [],
+    applicationsRequestId: 0,
     schedules: [],
     allSchedules: [],
+    scheduleRequestId: 0,
     scheduleView: "todo",
     scheduleStatus: "pending",
     scheduleDateFilter: "",
@@ -77,6 +79,8 @@
     codexHealth: null,
     codexEnabled: null,
     codexReady: false,
+    assistantConfiguration: null,
+    assistantHealthRequestId: 0,
     codexThreadId: storedConversation.codexThreadId || "",
     codexThreadMetadata: null,
     codexThreadCursor: "",
@@ -196,13 +200,30 @@
   };
 
   const text = (value, fallback = "—") => String(value ?? fallback);
-  const setText = (id, value) => { if ($(id)) $(id).textContent = text(value); };
+  const localizeCodexRuntimeMessage = (value) => {
+    const raw = text(value, "");
+    return raw
+      .replace(
+        /Codex turn interrupted after reaching the runtime time limit\.?/gi,
+        "本次对话回合达到运行时限并已结束；已经启动的后台任务不会因此自动取消，请按运行编号查询实际状态。中断前已经完成的写入会保留。",
+      )
+      .replace(
+        /Codex turn interrupted after reaching the tool-call budget\.?/gi,
+        "本次任务达到工具调用次数上限，已被运行时中断；中断前已经完成的写入会保留。",
+      )
+      .replace(
+        /Codex turn interrupted after repeated events without progress\.?/gi,
+        "本次任务连续多次没有产生新进展，已被运行时中断；中断前已经完成的写入会保留。",
+      );
+  };
+  const setText = (id, value) => { const node = $(id); if (node) node.textContent = text(value); };
   const clear = (node) => { while (node?.firstChild) node.removeChild(node.firstChild); };
   const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
+
   function appendInlineMarkdown(node, value) {
     const source = text(value, "");
-    const pattern = /(\*\*([^*]+)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)|(\/\?knowledge=[a-f0-9]{32}&page=\d+&revision=[a-f0-9]{32}))/g;
+    const pattern = /(\*\*([^*]+)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\))/g;
     let cursor = 0;
     for (const match of source.matchAll(pattern)) {
       if (match.index > cursor) node.appendChild(document.createTextNode(source.slice(cursor, match.index)));
@@ -216,10 +237,10 @@
         node.appendChild(code);
       } else {
         let target = null;
-        try { target = new URL(match[5] || match[6], window.location.href); } catch (_) { target = null; }
+        try { target = new URL(match[5], window.location.href); } catch (_) { target = null; }
         if (target && SAFE_LINK_PROTOCOLS.has(target.protocol)) {
           const link = document.createElement("a");
-          link.textContent = match[4] || "查看资料原文";
+          link.textContent = match[4];
           link.href = target.href;
           link.target = "_blank";
           link.rel = "noopener noreferrer";
@@ -480,9 +501,36 @@
     setCodexEventStatus("error", "无", "");
   }
 
+  function assistantAvailability() {
+    const status = state.assistantConfiguration?.status;
+    const messages = {
+      missing_model: "尚未配置模型连接。请填写服务地址、模型名称和 API 密钥并保存；无需先上传简历或填写岗位关键词。",
+      disabled: "求职助理已在高级配置中关闭。可在模型连接的高级设置中改为随模型启用。",
+      restart_required: "模型配置已保存，重启桌面后生效。请先保存当前工作；不会自动重启。",
+    };
+    if (messages[status]) return {status, message: messages[status]};
+    if (state.codexEnabled === true && state.codexReady === true) return {status: "ready", message: "求职助理已就绪"};
+    if (["failed", "error", "unavailable"].includes(state.codexHealth?.state)) {
+      return {status: "runtime_failed", message: "本地助理服务连接失败。请重新检查；若仍失败，请查看桌面服务诊断。无需重复填写简历或模型密钥。"};
+    }
+    return {status: "checking", message: "正在等待助理配置和本地服务就绪，可重新检查或查看模型连接。"};
+  }
+
   function codexUnavailableMessage() {
-    if (state.codexEnabled === false) return "Codex 运行时不可用，请启用 Codex App Server。";
-    return text(state.codexHealth?.detail, "Codex 运行时尚未就绪，请稍后重试。");
+    return assistantAvailability().message;
+  }
+
+  async function refreshAssistantAvailability() {
+    const requestId = ++state.assistantHealthRequestId;
+    let health;
+    try { health = await api("/api/codex/health"); }
+    catch (_) { health = {enabled: false, ready: false, state: "unavailable"}; }
+    if (requestId !== state.assistantHealthRequestId) return;
+    state.codexHealth = health;
+    state.codexEnabled = health?.enabled === true;
+    state.codexReady = state.codexEnabled && health?.ready === true;
+    renderCodexRuntimeStatus();
+    if (!state.messages.length) renderConversation();
   }
 
   function setCodexControlsEnabled(enabled) {
@@ -500,8 +548,15 @@
   function renderCodexRuntimeStatus() {
     const strip = $("assistant-codex-event-strip");
     const contextPolicy = $("assistant-context-policy");
-    const available = state.codexEnabled === true && state.codexReady === true;
-    if (strip) strip.hidden = false;
+    const diagnostic = assistantAvailability();
+    const available = diagnostic.status === "ready";
+    if (strip) strip.hidden = !available;
+    if ($("assistant-thread-label")) $("assistant-thread-label").hidden = !available;
+    const availability = $("assistant-availability");
+    if (availability) { availability.hidden = available; availability.dataset.state = diagnostic.status; }
+    setText("assistant-availability-detail", diagnostic.message);
+    setText("assistant-open-configuration", diagnostic.status === "missing_model" ? "配置模型连接" : "查看模型配置");
+    if (contextPolicy) contextPolicy.hidden = !available;
     if (contextPolicy) {
       const context = state.codexHealth?.context_management || {};
       const compactLimit = Number(context.auto_compact_token_limit);
@@ -520,9 +575,10 @@
       const detail = codexUnavailableMessage();
       setCodexEventStatus("thread", detail, "warn");
       setCodexEventStatus("error", detail, "error");
-      setAssistantStatus(state.codexEnabled === false ? "Codex 运行时不可用" : "Codex 运行时未就绪", "error");
+      setAssistantStatus(({missing_model: "待配置模型", disabled: "助理已关闭", restart_required: "配置待重启", runtime_failed: "本地服务异常"})[diagnostic.status] || "正在检查助理", "error");
       return;
     }
+    setAssistantStatus("助理已就绪", "success");
     if (!Object.keys(state.codexEventState).length) resetCodexEventStatuses();
     if (!state.codexReady) {
       setCodexEventStatus("thread", state.codexHealth?.detail || "运行时未就绪", "warn");
@@ -707,9 +763,14 @@
     return button;
   }
 
+  function visibleJobs(items) {
+    const excluded = new Set(["excluded", "direction_out", "doctorate_only", "internship", "cohort_unconfirmed"]);
+    return Array.isArray(items) ? items.filter((job) => job && !excluded.has(job.analysis_status)) : [];
+  }
+
   function renderJobs(items) {
     const node = $("today-new-jobs"); clear(node);
-    state.jobs = Array.isArray(items) ? items : [];
+    state.jobs = visibleJobs(items);
     if (!state.jobs.length) return empty(node, "今天没有新的确认岗位", "只显示已确认的 2027 校招岗位。");
 
     state.jobs.slice(0, 8).forEach((job) => {
@@ -786,6 +847,8 @@
       const labels = {
         eligible: "待评分", jd_incomplete: "待补全 JD", direction_out: "方向不符",
         doctorate_only: "博士限定", internship: "实习岗位", cohort_unconfirmed: "届别待核查",
+        master_only: "硕士限定",
+        not_target_track: "非目标批次",
         failed: "评分失败", refused: "未能评分",
       };
       label.textContent = labels[status] || "未评分";
@@ -1003,10 +1066,11 @@
       ["company", $("job-company-filter")?.value],
       ["category", $("job-category-filter")?.value],
       ["platform", $("job-platform-filter")?.value],
-      ["evaluation", $("job-evaluation-filter")?.value],
       ["score_band", $("job-score-filter")?.value],
     ];
     fields.forEach(([key, value]) => { if (value) params.set(key, value); });
+    const evaluation = $("job-evaluation-filter")?.value;
+    if (["scored", "unscored", "pending", "jd_incomplete"].includes(evaluation)) params.set("evaluation", evaluation);
     return params;
   }
 
@@ -1082,7 +1146,7 @@
   }
 
   function renderJobTable(payload = {}) {
-    state.jobBrowseItems = Array.isArray(payload.items) ? payload.items : [];
+    state.jobBrowseItems = visibleJobs(payload.items);
     state.jobBrowse.total = payload.total || 0;
     const body = $("jobs-table-body");
     clear(body);
@@ -1107,7 +1171,7 @@
   function renderFeaturedJobs(items = []) {
     const node = $("featured-job-list");
     clear(node);
-    state.featuredJobs = Array.isArray(items) ? items : [];
+    state.featuredJobs = visibleJobs(items);
     setText("featured-jobs-count", `${state.featuredJobs.length} 个岗位`);
     if (!state.featuredJobs.length) return empty(node, "暂无高匹配岗位", "当前范围内没有 70 分及以上的岗位。");
     state.featuredJobs.forEach((job) => {
@@ -1563,21 +1627,68 @@
     });
     editor.appendChild(eventForm);
     const deleteForm = document.createElement("form");
-    submit(deleteForm, "删除投递记录", async () => {
-      if (!window.confirm(`删除 ${application.company_name} 的这条投递记录及关联日程？邮件会保留。`)) return;
-      await request("DELETE", { expected_updated_at: application.updated_at });
-      showToast("投递记录已删除", "success");
-      await loadApplications();
+    const deleteConfirmation = element("div", "application-delete-confirmation");
+    deleteConfirmation.hidden = true;
+    deleteConfirmation.setAttribute("role", "group");
+    deleteConfirmation.setAttribute("aria-label", "确认删除投递记录");
+    deleteConfirmation.append(
+      element("strong", "", `${application.company_name} · ${application.job_title}`),
+      element("p", "", "将删除这条投递记录及关联日程；邮件保留，仅解除关联。"),
+    );
+    const deleteError = element("p", "inline-error application-delete-error");
+    deleteError.hidden = true;
+    deleteError.setAttribute("role", "alert");
+    const deleteActions = element("div", "application-delete-actions");
+    const cancelDelete = element("button", "button button--secondary", "取消");
+    cancelDelete.type = "button";
+    const confirmDelete = element("button", "button application-delete-submit", "确认删除");
+    confirmDelete.type = "button";
+    cancelDelete.addEventListener("click", () => {
+      deleteConfirmation.hidden = true;
+      deleteError.hidden = true;
+      deleteForm.querySelector('button[type="submit"]').focus();
     });
+    confirmDelete.addEventListener("click", async () => {
+      if (confirmDelete.disabled) return;
+      confirmDelete.disabled = true;
+      cancelDelete.disabled = true;
+      confirmDelete.textContent = "正在删除…";
+      deleteError.hidden = true;
+      try {
+        await request("DELETE", { expected_updated_at: application.updated_at });
+        showToast("投递记录已删除", "success");
+        deleteConfirmation.hidden = true;
+        await Promise.all([loadApplications(), loadFullSchedule()]);
+      } catch (error) {
+        deleteError.textContent = `删除未完成：${error.message}`;
+        deleteError.hidden = false;
+      } finally {
+        confirmDelete.disabled = false;
+        cancelDelete.disabled = false;
+        confirmDelete.textContent = "确认删除";
+      }
+    });
+    deleteActions.append(cancelDelete, confirmDelete);
+    deleteConfirmation.append(deleteError, deleteActions);
+    submit(deleteForm, "删除投递记录", async () => {
+      deleteConfirmation.hidden = false;
+      deleteError.hidden = true;
+      cancelDelete.focus();
+    });
+    deleteForm.appendChild(deleteConfirmation);
     editor.appendChild(deleteForm);
     return editor;
   }
 
   async function loadApplications() {
+    const requestId = ++state.applicationsRequestId;
     try {
-      renderApplications(await api("/api/applications/page?limit=200&offset=0"));
+      const payload = await api("/api/applications/page?limit=200&offset=0");
+      if (requestId !== state.applicationsRequestId) return false;
+      renderApplications(payload);
       return true;
     } catch (error) {
+      if (requestId !== state.applicationsRequestId) return false;
       empty($("application-kanban"), "投递记录加载失败", error.message);
       showToast(`投递记录加载失败：${error.message}`, "error");
       return false;
@@ -1764,12 +1875,19 @@
   }
 
   async function loadFullSchedule() {
+    const requestId = ++state.scheduleRequestId;
     try {
       const payload = await api("/api/schedule");
+      if (requestId !== state.scheduleRequestId) return false;
       state.allSchedules = Array.isArray(payload) ? payload : [];
       renderFullSchedule();
+      state.schedules = state.allSchedules.filter((event) => event.event_date === localDate() && normalizeScheduleStatus(event.status) === "pending");
+      renderSchedule(state.schedules);
+      setText("metric-schedule", state.schedules.length);
+      renderDashboardTodos();
       return true;
     } catch (error) {
+      if (requestId !== state.scheduleRequestId) return false;
       errorState($("schedule-todo-view"), "日程加载失败", error.message);
       errorState($("schedule-calendar-grid"), "日程加载失败", error.message);
       showToast(`日程加载失败：${error.message}`, "error");
@@ -1970,6 +2088,82 @@
     });
   }
 
+  function automationDuration(startedAt, completedAt) {
+    if (!startedAt || !completedAt) return "—";
+    const started = new Date(startedAt);
+    const completed = new Date(completedAt);
+    const seconds = Math.max(0, Math.round((completed.getTime() - started.getTime()) / 1000));
+    if (!Number.isFinite(seconds)) return "—";
+    if (seconds < 60) return `${seconds} 秒`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
+  }
+
+  function automationExplanationPrompt(automation) {
+    const latest = automation?.latest_execution || {};
+    const status = text(latest.status || automation?.last_status, "未知");
+    const prompt = [
+      `请解释定时任务“${text(automation?.task_label, automation?.task_id || "未命名任务")}”最近一次执行为什么显示“${AUTOMATION_STATUS_LABELS[status] || status}”。`,
+      `执行 ID：${text(latest.id, "无")}`,
+      `执行状态：${status}`,
+      `开始时间：${automationDateTime(latest.started_at)}`,
+      `结束时间：${automationDateTime(latest.completed_at)}`,
+      `系统错误：${text(latest.error || automation?.last_error, "无")}`,
+      `执行摘要：\n${text(latest.result_summary, "无")}`,
+      "只根据上述这一次执行记录解释，不要重新运行任务。请用中文说明直接原因、实际完成情况、影响范围和下一步操作，并区分任务失败与部分记录需要人工处理。",
+    ].join("\n");
+    return prompt.slice(0, 7000);
+  }
+
+  function openAutomationDetail(scheduleId) {
+    const automation = state.automations.find((item) => text(item.id, "") === text(scheduleId, ""));
+    if (!automation) return;
+    const latest = automation.latest_execution || null;
+    const content = $("automation-detail-content");
+    clear(content);
+    setText("automation-detail-title", text(automation.task_label, "任务详情"));
+
+    const facts = element("dl", "automation-detail-facts");
+    const addFact = (label, value) => {
+      const group = element("div", "automation-detail-fact");
+      group.append(element("dt", "", label), element("dd", "", value));
+      facts.appendChild(group);
+    };
+    const status = text(latest?.status || automation.last_status, automation.active ? "active" : "inactive");
+    addFact("执行状态", AUTOMATION_STATUS_LABELS[status] || (automation.active ? "已启用" : "已停用"));
+    addFact("执行目标", text(automation.target_label, automation.target_kind === "all" ? "全部目标" : "目标待确认"));
+    addFact("计划时间", `${automation.frequency === "daily" ? "每天" : text(automation.frequency)} ${text(automation.start_time, "--:--")} · ${text(automation.timezone, "Asia/Shanghai")}`);
+    addFact("计划触发", automationDateTime(latest?.scheduled_for));
+    addFact("开始时间", automationDateTime(latest?.started_at));
+    addFact("结束时间", automationDateTime(latest?.completed_at));
+    addFact("执行耗时", automationDuration(latest?.started_at, latest?.completed_at));
+    addFact("执行 ID", text(latest?.id, "尚未执行"));
+    content.appendChild(facts);
+
+    const error = text(latest?.error || automation.last_error, "");
+    if (error) {
+      const alert = element("section", "automation-detail-alert");
+      alert.append(element("h3", "", "错误信息"), element("p", "", error));
+      content.appendChild(alert);
+    }
+
+    const result = element("section", "automation-detail-result");
+    result.append(
+      element("h3", "", "执行结果"),
+      element("pre", "", text(latest?.result_summary, latest ? "本次执行没有返回摘要。" : "该任务尚未执行。")),
+    );
+    content.appendChild(result);
+
+    const explain = $("automation-explain-button");
+    const abnormal = ["failed", "blocked"].includes(status);
+    explain.hidden = !abnormal;
+    explain.dataset.automationExplain = abnormal ? automation.id : "";
+    const dialog = $("automation-detail-dialog");
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
+  }
+
   function renderAutomations(payload = {}) {
     const node = $("automation-list");
     if (!node) return;
@@ -2012,10 +2206,14 @@
       const detailText = text(latest.error || automation.last_error || latest.result_summary, "尚无执行结果");
       const detail = element("p", "automation-result", detailText.length > 240 ? `${detailText.slice(0, 240)}…` : detailText);
       const actions = element("div", "automation-actions");
+      const inspect = element("button", "button button--secondary", "详情");
+      inspect.type = "button";
+      inspect.dataset.automationDetail = automation.id;
+      inspect.setAttribute("aria-label", `查看定时任务详情：${text(automation.task_label)}`);
       const edit = element("button", "button button--ghost", "交给助理调整");
       edit.type = "button";
       edit.dataset.assistantPrompt = `调整定时任务“${text(automation.task_label, automation.task_id)}”，当前为每天 ${text(automation.start_time)} 执行。请先说明准备如何修改。`;
-      actions.appendChild(edit);
+      actions.append(inspect, edit);
       if (automation.active) {
         const disable = element("button", "button button--secondary", "停用");
         disable.type = "button";
@@ -2849,7 +3047,7 @@
     if (reasons.length) {
       const reason = document.createElement("div"); reason.className = "result-reason";
       const label = document.createElement("strong"); label.textContent = "失败或停止原因";
-      const detail = document.createElement("p"); detail.textContent = [...new Set(reasons.map((item) => text(item)))].join(" · ");
+      const detail = document.createElement("p"); detail.textContent = [...new Set(reasons.map((item) => localizeCodexRuntimeMessage(item)))].join(" · ");
       reason.append(label, detail); node.appendChild(reason);
     }
 
@@ -2897,9 +3095,9 @@
     const time = document.createElement("span"); time.textContent = "待命";
     meta.append(author, time);
     const copy = document.createElement("p");
-    copy.textContent = state.codexEnabled === false
-      ? "Codex 运行时不可用，当前对话入口已停用。"
-      : "这个 Codex 会话还没有消息，发送第一条问题开始对话。";
+    copy.textContent = assistantAvailability().status !== "ready"
+      ? codexUnavailableMessage()
+      : "发送第一条问题开始对话。简历和岗位关键词可稍后配置。";
     article.append(meta, copy); node.appendChild(article);
   }
 
@@ -2912,7 +3110,7 @@
     const time = document.createElement("span"); time.textContent = record.created_at ? new Date(record.created_at).toLocaleTimeString() : "刚刚";
     meta.append(author, time);
     const copy = document.createElement("div"); copy.className = "message-copy";
-    if (record.role === "assistant") renderMarkdown(copy, record.body);
+    if (record.role === "assistant") renderMarkdown(copy, localizeCodexRuntimeMessage(record.body));
     else {
       const paragraph = document.createElement("p"); paragraph.textContent = text(record.body, "");
       copy.appendChild(paragraph);
@@ -3325,7 +3523,7 @@
   async function runCodexAssistantQuery(message, jobId = "", streamingMessageId = "") {
     if (state.codexEnabled === false) throw new Error(codexUnavailableMessage());
     if (state.codexEnabled !== true || state.codexReady !== true) throw new Error(codexUnavailableMessage());
-    if (!state.codexThreadId) throw new Error("Codex 会话尚未建立，请稍后重试。");
+    if (!state.codexThreadId) await createCodexThread();
     const controller = new AbortController();
     state.activeAssistantController = controller;
     state.codexStopRequested = false;
@@ -3342,6 +3540,9 @@
     setCodexEventStatus("error", "无", "");
     const streamPath = `/api/codex/threads/${encodeURIComponent(state.codexThreadId)}/turns/stream`;
     const eventPath = `/api/codex/threads/${encodeURIComponent(state.codexThreadId)}/events`;
+    const requestBody = jobId ? {
+      body: JSON.stringify({ text: message, job_id: jobId }),
+    } : { body: JSON.stringify({ text: message }) };
     let response;
     try {
       response = await fetch(streamPath, {
@@ -3351,9 +3552,7 @@
           "Content-Type": "application/json",
         },
         signal: controller.signal,
-        body: JSON.stringify({ text: message, job_id: jobId || null,
-          knowledge_enabled: $("assistant-knowledge-enabled")?.checked || false,
-          knowledge_document_id: $("assistant-knowledge-enabled")?.checked ? ($("assistant-knowledge-document")?.value || null) : null }),
+        ...requestBody,
       });
     } catch (error) {
       cleanupCodexRun();
@@ -3396,7 +3595,7 @@
       data?.phase,
     ) || fallback;
     const friendlyRuntimeError = (value) => {
-      const raw = text(value, "模型运行时返回了未说明的错误。");
+      const raw = localizeCodexRuntimeMessage(text(value, "模型运行时返回了未说明的错误。"));
       if (/\b402\b.*insufficient balance|insufficient balance.*\b402\b/i.test(raw)) {
         return "Agent 专用 DeepSeek API 余额不足，请充值或更换 Key。";
       }
@@ -3740,8 +3939,6 @@
   async function deleteConversation(threadId) {
     const selectedThreadId = codexThreadIdOf(threadId);
     if (!selectedThreadId) return false;
-    const conversation = state.conversations.find((item) => codexThreadIdOf(item) === selectedThreadId);
-    if (!window.confirm(`确定删除“${codexThreadTitle(conversation)}”吗？删除后无法恢复。`)) return false;
     const wasActive = selectedThreadId === state.codexThreadId;
     if (wasActive && state.activeAssistantController) await stopAssistantExecution();
     try {
@@ -3831,6 +4028,8 @@
     const intent = mapIntent(normalized);
     const jobId = text(explicitJobId ?? $("assistant-job-id")?.value, "").trim();
     $("assistant-message").value = "";
+    $("assistant-job-id").value = "";
+    window.dispatchEvent?.(new CustomEvent("recruitops:assistant-job", { detail: { id: "" } }));
     updateIntentHint("");
     $("assistant-form-error").hidden = true;
     $("run-task-button").disabled = true;
@@ -3843,7 +4042,7 @@
       const task = await runCodexAssistantQuery(normalized, jobId, streamingMessage.id);
       const taskLabel = task.display_label || TASK_LABELS[task.task_type] || intent.label || "任务";
       const answer = task.error
-          ? `任务未完成：${text(task.error)}`
+          ? `任务未完成：${localizeCodexRuntimeMessage(task.error)}`
           : task.answer
             ? text(task.answer)
             : `已完成${taskLabel}，结果和引用已记录。`;
@@ -3857,13 +4056,13 @@
       }
       setAssistantStatus(
         task.error
-          ? `已停止：${text(task.error)}`
+          ? `已停止：${localizeCodexRuntimeMessage(task.error)}`
           : `已完成：${taskLabel}`,
         task.error ? "warn" : "ok"
       );
       showToast(
         task.error
-          ? `任务已停止：${task.error}`
+          ? `任务已停止：${localizeCodexRuntimeMessage(task.error)}`
           : `任务完成：${taskLabel}`,
         task.error ? "error" : "success"
       );
@@ -3877,13 +4076,14 @@
         showToast("已停止当前任务", "info");
         return null;
       }
-      const failed = rememberTask({ task_id: `failed-${Date.now()}`, task_type: intent.taskType, status: "safe_stop", steps: 0, error: error.message, user_request: normalized });
-      if (streamingMessage) updateMessage(streamingMessage.id, `任务未完成：${error.message}`, failed, false);
-      else appendMessage("assistant", `任务未完成：${error.message}`, failed);
-      $("assistant-form-error").textContent = error.message;
+      const localizedError = localizeCodexRuntimeMessage(error.message);
+      const failed = rememberTask({ task_id: `failed-${Date.now()}`, task_type: intent.taskType, status: "safe_stop", steps: 0, error: localizedError, user_request: normalized });
+      if (streamingMessage) updateMessage(streamingMessage.id, `任务未完成：${localizedError}`, failed, false);
+      else appendMessage("assistant", `任务未完成：${localizedError}`, failed);
+      $("assistant-form-error").textContent = localizedError;
       $("assistant-form-error").hidden = false;
-      setAssistantStatus(`未完成：${error.message}`, "error");
-      showToast(error.message, "error");
+      setAssistantStatus(`未完成：${localizedError}`, "error");
+      showToast(localizedError, "error");
       return null;
     } finally {
       state.activeAssistantController = null;
@@ -3902,12 +4102,18 @@
       loadApplications(), loadFullSchedule(), loadAutomations(),
       loadRecruitmentMails({ showLoading: false }),
       loadJobBrowser({ refreshFeatured: true }),
-      api(`/api/schedule?on=${today}`).then((events) => {
-        state.schedules = events;
-        renderSchedule(events);
-        setText("metric-schedule", events.length);
+      api("/api/approvals").then((approvals) => {
+        state.approvals = normalizeApprovals(approvals);
+        renderApprovals();
+        renderDashboardLists();
+      }),
+      api(`/api/jobs/browse?first_seen_on=${localDate()}&limit=8&sort=newest`).then((jobs) => {
+        state.jobTotal = jobs.total || 0;
+        renderJobs(jobs.items || []);
+        setText("metric-new-jobs", state.jobTotal);
       }),
     ]);
+    renderDashboardTodos();
     if (typeof CustomEvent === "function") document.dispatchEvent(new CustomEvent("recruitops:business-updated"));
   }
 
@@ -3917,7 +4123,7 @@
     try {
       const [health, codexHealth, schedule, jobs, companies, approvals, traces, mails, operationalReport] = await Promise.all([
         api("/health"), api("/api/codex/health").catch((error) => ({ enabled: null, ready: false, state: "unavailable", detail: error.message })),
-        api(`/api/schedule?on=${today}`), api(`/api/jobs?cohort=2027&cohort_status=confirmed&first_seen_on=${today}&limit=8&batches=formal&batches=early`),
+        api(`/api/schedule?on=${today}`), api(`/api/jobs/browse?first_seen_on=${today}&limit=8&sort=newest`),
         api("/api/companies"), api("/api/approvals"), api("/api/codex/traces"),
         api("/api/recruitment-mails?limit=50").catch((error) => ({
           items: [],
@@ -3946,7 +4152,7 @@
       ]);
       setText("today-label", today); setText("last-sync-label", `读取于 ${new Date().toLocaleTimeString()}`);
       setText("nav-today-count", (jobs.items || []).length); setText("metric-new-jobs", jobs.total || 0); setText("metric-new-jobs-detail", "已确认 2027 校招");
-      setText("metric-schedule", schedule.length); setText("metric-schedule-detail", schedule.length ? "有安排" : "暂无安排");
+      setText("metric-schedule", state.schedules.length); setText("metric-schedule-detail", state.schedules.length ? "有安排" : "暂无安排");
       setText("metric-approvals", state.approvals.filter((item) => item.status === "pending").length); setText("metric-approvals-detail", "等待人工确认");
       setText("metric-anomalies", operationalReport?.counts?.crawler_issues ?? companies.filter((item) => item.integration_status !== "connected").length); setText("metric-anomalies-detail", "运营报告异常");
       $("dashboard-status-summary").textContent = `服务 ${health.status} · ${health.mode} · 运营报告已读取`;
@@ -4016,6 +4222,7 @@
     if (activeView && activeView !== view) viewScroll.set(activeView, window.scrollY);
     const changed = activeView !== view;
     activeView = view;
+    try { sessionStorage.setItem("recruitops.activeView", view); } catch (_) { /* Storage may be unavailable. */ }
     document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== view; panel.classList.toggle("is-visible", panel.dataset.viewPanel === view); });
     document.querySelectorAll("[data-view]").forEach((item) => {
       let isActive = item.dataset.view === view;
@@ -4037,7 +4244,6 @@
       approvals: ["系统 / 人工确认", "待确认事项"],
       integrations: ["系统 / 招聘情报", "数据接入"],
       configuration: ["个人设置", "配置"],
-      knowledge: ["个人资料", "个人知识库"],
     };
     if (titles[view]) { setText("page-eyebrow", titles[view][0]); setText("page-title", titles[view][1]); }
     const systemNav = document.querySelector(".system-nav");
@@ -4048,7 +4254,68 @@
     if (changed && view === "applications") void loadApplications();
   }
 
+  function normalizeApplicationDraft(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("投递草稿格式无效");
+    const limits = { company_name: 255, job_title: 512, record_url: 2048, note: 4000 };
+    if (Object.keys(value).some((key) => !Object.hasOwn(limits, key))) throw new Error("投递草稿包含不支持的字段");
+    const draft = {};
+    for (const [key, limit] of Object.entries(limits)) {
+      const raw = value[key] ?? "";
+      if (typeof raw !== "string" || raw.length > limit || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(raw)) throw new Error("投递草稿字段无效");
+      draft[key] = raw.trim();
+    }
+    if (!draft.job_title) throw new Error("投递草稿缺少岗位");
+    if (draft.record_url) {
+      const url = new URL(draft.record_url);
+      if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.hash.startsWith("#/job/")) throw new Error("投递草稿进度页地址无效");
+    }
+    return draft;
+  }
+
+  function openManualApplicationDraft(value = null) {
+    const dialog = $("application-create-dialog");
+    if (dialog.open || $("application-create-submit").disabled) {
+      showToast("请先保存或取消当前投递草稿，再重新采集。", "error");
+      return false;
+    }
+    let draft;
+    try { draft = value === null ? {} : normalizeApplicationDraft(value); }
+    catch (error) { showToast(error.message, "error"); return false; }
+    const form = $("application-create-form");
+    form.reset();
+    form.elements.stage.value = "applied";
+    for (const [key, text] of Object.entries(draft)) form.elements.namedItem(key).value = text;
+    $("application-create-error").hidden = true;
+    switchView("applications");
+    dialog.showModal();
+    return true;
+  }
+
   function bind() {
+    let jobRequest = 0;
+    window.addEventListener("recruitops:assistant-job", async (event) => {
+      const id = event.detail.id, request = ++jobRequest;
+      $("assistant-selected-job").hidden = $("assistant-clear-job").hidden = !id;
+      $("assistant-selected-job").textContent = id ? "当前岗位" : "";
+      if (!id) return;
+      try {
+        const response = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
+        if (!response.ok) throw new Error();
+        const value = await response.json(), job = value.job || value;
+        if (request === jobRequest) $("assistant-selected-job").textContent = job.title || id;
+      } catch (_) { if (request === jobRequest) $("assistant-selected-job").textContent = "岗位详情暂不可用"; }
+    });
+    $("assistant-clear-job").addEventListener("click", () => {
+      $("assistant-job-id").value = "";
+      window.dispatchEvent(new CustomEvent("recruitops:assistant-job", {detail: {id: ""}}));
+    });
+    document.addEventListener("recruitops:assistant-configuration", (event) => {
+      state.assistantConfiguration = {status: event.detail?.status || "unknown"};
+      renderCodexRuntimeStatus();
+      void refreshAssistantAvailability();
+    });
+    $("assistant-open-configuration").addEventListener("click", () => document.querySelector('[data-view="configuration"]').click());
+    $("assistant-recheck").addEventListener("click", () => document.dispatchEvent(new CustomEvent("recruitops:configuration-reload")));
     document.querySelectorAll("[data-view]").forEach((item) => item.addEventListener("click", () => {
       if (item.dataset.jobNavMode && item.dataset.jobNavMode !== state.jobBrowse.mode) {
         state.jobBrowse.mode = item.dataset.jobNavMode;
@@ -4130,6 +4397,23 @@
       }
       const automationButton = event.target.closest("[data-automation-disable]");
       if (automationButton) { event.preventDefault(); void disableAutomation(automationButton.dataset.automationDisable); return; }
+      const automationDetailButton = event.target.closest("[data-automation-detail]");
+      if (automationDetailButton) {
+        event.preventDefault();
+        openAutomationDetail(automationDetailButton.dataset.automationDetail);
+        return;
+      }
+      const automationExplainButton = event.target.closest("[data-automation-explain]");
+      if (automationExplainButton) {
+        event.preventDefault();
+        const automation = state.automations.find((item) => text(item.id, "") === text(automationExplainButton.dataset.automationExplain, ""));
+        if (!automation) return;
+        $("automation-detail-dialog")?.close();
+        const prompt = automationExplanationPrompt(automation);
+        openAssistantDraft(prompt);
+        void submitAssistantQuestion(prompt, null);
+        return;
+      }
       const button = event.target.closest("[data-job-action]");
       if (!button) return;
       const job = findBrowseJob(button.dataset.jobId);
@@ -4137,6 +4421,52 @@
     });
     $("jobs-back-button").addEventListener("click", () => void returnToJobBrowseLocation());
     $("refresh-button").addEventListener("click", loadCore);
+    const createDialog = $("application-create-dialog");
+    const createForm = $("application-create-form");
+    const createSubmit = $("application-create-submit");
+    const createError = $("application-create-error");
+    Object.entries(APPLICATION_STAGE_LABELS).forEach(([value, label]) => {
+      createForm.elements.stage.add(new Option(label, value));
+    });
+    $("application-add-button").addEventListener("click", () => openManualApplicationDraft());
+    // Only the isolated workbench preload supplies this one-way subscription.
+    // Remote pages have no preload; never listen for cross-window messages.
+    if (typeof window.recruitopsDesktop?.onApplicationDraft === "function") {
+      window.recruitopsDesktop.onApplicationDraft((draft) => queueMicrotask(() => openManualApplicationDraft(draft)));
+    }
+    if (typeof window.recruitopsDesktop?.onDataChanged === "function") {
+      window.recruitopsDesktop.onDataChanged((event) => queueMicrotask(async () => {
+        if (!event || typeof event !== "object" || event.applications !== true) return;
+        const scroll = window.scrollY;
+        await loadApplications();
+        if (event.preservePosition === true) window.scrollTo(0, scroll);
+      }));
+    }
+    const closeCreate = () => { if (!createSubmit.disabled) createDialog.close(); };
+    $("application-create-close").addEventListener("click", closeCreate);
+    $("application-create-cancel").addEventListener("click", closeCreate);
+    createDialog.addEventListener("cancel", (event) => { if (createSubmit.disabled) event.preventDefault(); });
+    createForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (createSubmit.disabled) return;
+      createSubmit.disabled = true;
+      createError.hidden = true;
+      const body = Object.fromEntries(new FormData(createForm));
+      Object.keys(body).forEach(key => { body[key] = body[key].trim(); });
+      body.record_url ||= null;
+      try {
+        const result = await api("/api/local-ui/applications/manual", {
+          method: "POST", headers: authHeaders("手动添加投递", {"Content-Type": "application/json"}),
+          body: JSON.stringify(body),
+        });
+        createDialog.close();
+        showToast(result.created ? "投递已添加" : "已有相同公司和岗位的投递，保留原记录", "success");
+        await loadApplications();
+      } catch (error) {
+        createError.textContent = `保存失败：${error.message}`;
+        createError.hidden = false;
+      } finally { createSubmit.disabled = false; }
+    });
     $("applications-refresh-button").addEventListener("click", async (event) => {
       const button = event.currentTarget;
       if (button.disabled) return;
@@ -4255,6 +4585,11 @@
     $("job-detail-dialog").addEventListener("click", (event) => {
       if (event.target === $("job-detail-dialog")) $("job-detail-dialog").close();
     });
+    $("automation-detail-close").addEventListener("click", () => $("automation-detail-dialog").close());
+    $("automation-detail-dismiss").addEventListener("click", () => $("automation-detail-dialog").close());
+    $("automation-detail-dialog").addEventListener("click", (event) => {
+      if (event.target === $("automation-detail-dialog")) $("automation-detail-dialog").close();
+    });
     document.addEventListener("click", (event) => {
       const button = event.target.closest("[data-mail-review-id]");
       if (button) void reviewRecruitmentMail(button.dataset.mailReviewId);
@@ -4264,6 +4599,7 @@
   const testHooks = {
     renderMarkdown,
     renderCodexRuntimeStatus,
+    assistantAvailability,
     renderConversation,
     renderMails,
     renderSchedule,
@@ -4275,8 +4611,14 @@
     updateScheduleStatus,
     openScheduleEditor,
     openRecruitmentMail,
+    renderAutomations,
+    openAutomationDetail,
+    automationExplanationPrompt,
     scheduleFormPayload,
     renderApplications,
+    loadApplications,
+    loadFullSchedule,
+    normalizeApplicationDraft,
     syncRecruitmentMails,
     runCodexAssistantQuery,
     stopAssistantExecution,
@@ -4288,6 +4630,11 @@
   if (globalThis.__RECRUITOPS_TEST_MODE__) {
     globalThis.__RECRUITOPS_TEST_HOOKS__ = testHooks;
   } else {
-    bind(); switchView("jobs"); updateIntentHint(); renderConversation(); renderTaskHistory(); renderDashboardTodos(); loadCore();
+    let initialView = "jobs";
+    try {
+      const savedView = sessionStorage.getItem("recruitops.activeView");
+      if ([...document.querySelectorAll("[data-view-panel]")].some(panel => panel.dataset.viewPanel === savedView)) initialView = savedView;
+    } catch (_) { /* Start at jobs when storage is unavailable. */ }
+    bind(); switchView(initialView); updateIntentHint(); renderConversation(); renderTaskHistory(); renderDashboardTodos(); loadCore();
   }
 })();

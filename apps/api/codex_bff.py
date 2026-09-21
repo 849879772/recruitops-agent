@@ -9,6 +9,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Protocol, TypeVar, cast
 
 from packages.codex_runtime import (
@@ -478,6 +479,8 @@ def get_codex_supervisor() -> CodexSupervisor:
     from packages.config import get_settings
 
     settings = get_settings()
+    desktop = getattr(settings, "env", None) == "desktop-isolated"
+    code_root = Path(__file__).resolve().parents[2] if desktop else settings.agent_root
     codex_home = settings.codex_home
     if not codex_home.is_absolute():
         codex_home = settings.agent_root / codex_home
@@ -492,6 +495,9 @@ def get_codex_supervisor() -> CodexSupervisor:
         "RECRUITOPS_JOB_ANALYSIS_ENABLED",
         "RECRUITOPS_LLM_API_KEY",
         "RECRUITOPS_MODEL_API_BASE_URL",
+        "RECRUITOPS_MODEL_API_STYLE",
+        "RECRUITOPS_MODEL_NAME",
+        "RECRUITOPS_MODEL_PROVIDER_NAME",
         "RECRUITOPS_LLM_MODEL",
         "RECRUITOPS_LLM_ENDPOINT",
         "RECRUITOPS_LLM_TIMEOUT_SECONDS",
@@ -516,9 +522,36 @@ def get_codex_supervisor() -> CodexSupervisor:
         "HTTPS_PROXY",
         "NO_PROXY",
     )
+    if desktop:
+        # Forward the native supervisor's isolation contract, never synthesize opt-in.
+        mcp_env_vars += (
+            "RECRUITOPS_DESKTOP_LAUNCH_MODE",
+            "RECRUITOPS_DESKTOP_CAPABILITIES",
+            "RECRUITOPS_DESKTOP_INSTANCE_ID",
+            "RECRUITOPS_DESKTOP_RUN_ID",
+            "RECRUITOPS_DESKTOP_WRITE_OPTIN",
+            "RECRUITOPS_CODEX_RUNTIME_ENABLED",
+            "RECRUITOPS_AUTOMATION_ENABLED",
+            "RECRUITOPS_MAIL_SYNC_ON_STARTUP",
+            "RECRUITOPS_VISION_ENABLED",
+            "RECRUITOPS_CODEX_HOME",
+            "PLAYWRIGHT_BROWSERS_PATH",
+            "PYTHONPATH",
+            "PYTHONNOUSERSITE",
+            "PYTHONDONTWRITEBYTECODE",
+            "PYTHONUTF8",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+            "no_proxy",
+        )
     CodexHomeConfig(
         model=settings.codex_model,
         provider_id=settings.codex_model_provider_id,
+        provider_name=getattr(settings, "model_provider_name", "DeepSeek"),
         base_url=settings.codex_model_base_url,
         api_key_env=settings.codex_model_api_key_env,
         reasoning_effort=settings.codex_reasoning_effort,
@@ -529,7 +562,7 @@ def get_codex_supervisor() -> CodexSupervisor:
             96_000,
         ),
         mcp_command=sys.executable,
-        mcp_args=(str(settings.agent_root / "scripts" / "run_mcp_server.py"),),
+        mcp_args=(str(code_root / "scripts" / "run_mcp_server.py"),),
         mcp_env_vars=mcp_env_vars,
     ).write(codex_home)
     api_key = (settings.llm_api_key if settings.codex_model_api_key_env == "RECRUITOPS_LLM_API_KEY"
@@ -545,6 +578,9 @@ def get_codex_supervisor() -> CodexSupervisor:
     # Settings may come from .env rather than the parent's process environment.
     for field in (
         "model_api_base_url",
+        "model_api_style",
+        "model_name",
+        "model_provider_name",
         "llm_enabled",
         "job_analysis_enabled",
         "llm_api_key",
@@ -562,6 +598,7 @@ def get_codex_supervisor() -> CodexSupervisor:
         CodexRuntimeConfig(
             command=settings.codex_command,
             working_dir=settings.agent_root,
+            skill_roots=(code_root / ".agents" / "skills",) if desktop else (),
             startup_timeout_seconds=settings.codex_startup_timeout_seconds,
             provider=settings.codex_model_provider_id,
             model=settings.codex_model,

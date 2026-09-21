@@ -480,6 +480,61 @@ class BrowserBridgeStore:
             session.flush()
             return operation_row
 
+    def recover_interrupted_operations(self, *, now: datetime | None = None) -> int:
+        """Cancel orphaned status reads at exclusive, write-opted desktop startup.
+
+        The caller must hold the instance supervisor lock and call this before
+        starting the bridge. This is not a live-server sweep or a retry mechanism.
+        Other operation types and terminal operation history remain untouched.
+        """
+        self._initialize()
+        timestamp = _now(now)
+        reason = "interrupted_by_restart"
+        with self.storage.write_transaction() as session:
+            operations = list(session.scalars(
+                select(BrowserOperation).where(
+                    BrowserOperation.operation.in_([
+                        OperationName.OBSERVE_APPLICATION_STATUS_PAGE.value,
+                        OperationName.REVIEW_AND_UPDATE_APPLICATION_STATUS.value,
+                    ]),
+                    BrowserOperation.status.not_in([status.value for status in TERMINAL_STATUSES]),
+                ).order_by(BrowserOperation.operation_id).with_for_update()
+            ))
+            for operation in operations:
+                result = {"reason": reason, "previous_status": operation.status}
+                event_id = f"recovery-{uuid4().hex}"
+                # Retire only this operation's unsent/unacknowledged dispatches.
+                # Existing transport ACK receipts and other commands are evidence.
+                dispatches = session.scalars(select(BrowserOutbox).where(
+                    BrowserOutbox.operation_id == operation.operation_id,
+                    BrowserOutbox.message_type == "operation.dispatch",
+                    BrowserOutbox.acked_at.is_(None),
+                ).with_for_update())
+                for dispatch in dispatches:
+                    dispatch.acked_at = timestamp
+                    dispatch.ack_id = event_id
+                    dispatch.ack_payload = {"retired_by": "startup_recovery", "reason": reason}
+                self._append_event_in_session(
+                    session, operation, event_id=event_id, status=OperationStatus.CANCELLED,
+                    payload=result, sequence=None, event_type="recovery", occurred_at=timestamp,
+                )
+                operation.result = result
+                operation.error_code = reason
+                cancel = self._enqueue_in_session(
+                    session, operation, message_type="operation.cancel",
+                    payload={"operation_id": operation.operation_id, "reason": reason},
+                    created_at=timestamp,
+                )
+                operation.last_outbox_sequence = cancel.sequence
+            # Under the exclusive startup contract, no previous socket is live.
+            # Preserve last_seen_at: recovery is not an authenticated heartbeat.
+            for device in session.scalars(select(BrowserBridgeDevice).where(
+                BrowserBridgeDevice.connected.is_(True),
+            ).with_for_update()):
+                device.connected = False
+            session.flush()
+            return len(operations)
+
     def get_operation(self, operation_id: str) -> BrowserOperation | None:
         self._initialize()
         operation_id_value = _text(operation_id, "operation_id", MAX_OPERATION_ID_LENGTH)

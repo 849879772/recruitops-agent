@@ -60,10 +60,15 @@ def _guard_database_target(database: Engine | str | URL) -> None:
     target = Path(url.database)
     if not target.is_absolute():
         target = PROJECT_ROOT / target
+    source_root = DEFAULT_SOURCE_ROOT.resolve()
+    project_root = PROJECT_ROOT.resolve()
+    # Only allow the historical layout where this agent lives below the source.
+    # A source nested inside this checkout must remain protected.
+    nested_agent = project_root != source_root and project_root.is_relative_to(source_root)
     ensure_target_outside_source_root(
         DEFAULT_SOURCE_ROOT,
         target,
-        allowed_root=PROJECT_ROOT,
+        allowed_root=project_root if nested_agent else None,
     )
 
 

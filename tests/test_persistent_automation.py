@@ -28,7 +28,7 @@ def test_next_daily_run_uses_asia_shanghai_wall_clock() -> None:
     )
 
 
-def test_schedule_is_active_idempotent_and_survives_store_restart(tmp_path) -> None:
+def test_schedule_is_idempotent_for_the_same_time_and_survives_store_restart(tmp_path) -> None:
     storage = _storage(tmp_path)
     first = AutomationStore(storage).upsert_daily(
         task_id="application_progress",
@@ -42,7 +42,7 @@ def test_schedule_is_active_idempotent_and_survives_store_restart(tmp_path) -> N
     updated = AutomationStore(storage).upsert_daily(
         task_id="application_progress",
         task_label="本地投递进度复核",
-        start_time=time(3, 15),
+        start_time=time(3, 0),
         target_kind="application",
         target_id="24",
         target_label="新华三 / 软件开发工程师-C/C++",
@@ -54,8 +54,80 @@ def test_schedule_is_active_idempotent_and_survives_store_restart(tmp_path) -> N
     assert first.id == updated.id
     assert len(rows) == 1
     assert rows[0].active is True
-    assert rows[0].start_time == time(3, 15)
+    assert rows[0].start_time == time(3, 0)
     assert rows[0].target_id == "24"
+
+
+def test_same_task_and_target_can_run_at_multiple_daily_times(tmp_path) -> None:
+    store = AutomationStore(_storage(tmp_path))
+    morning = store.upsert_daily(
+        task_id="application_progress",
+        task_label="本地投递进度复核",
+        start_time=time(9, 0),
+        target_kind="all",
+        now=datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc),
+    )
+    evening = store.upsert_daily(
+        task_id="application_progress",
+        task_label="本地投递进度复核",
+        start_time=time(18, 0),
+        target_kind="all",
+        now=datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc),
+    )
+
+    rows = store.list(active_only=True)
+
+    assert morning.id != evening.id
+    assert len(rows) == 2
+    assert {row.start_time for row in rows} == {time(9, 0), time(18, 0)}
+
+
+def test_schedule_saved_before_due_time_is_claimed_on_first_poll_after_due(tmp_path) -> None:
+    store = AutomationStore(_storage(tmp_path))
+    saved_at = datetime(2026, 9, 19, 20, 58, tzinfo=timezone.utc)  # 04:58 Asia/Shanghai
+    due_at = datetime(2026, 9, 19, 21, 0, tzinfo=timezone.utc)  # 05:00 Asia/Shanghai
+    schedule = store.upsert_daily(
+        task_id="recruitment_mailbox",
+        task_label="本地邮件整理",
+        start_time=time(5, 0),
+        target_kind="all",
+        now=saved_at,
+    )
+    assert schedule.next_run_at.replace(tzinfo=timezone.utc) == due_at
+
+    claimed = store.claim_due(now=datetime(2026, 9, 19, 21, 3, tzinfo=timezone.utc))
+
+    assert claimed is not None
+    assert claimed.schedule_id == schedule.id
+    assert claimed.scheduled_for == due_at
+    persisted = store.list(active_only=True)[0]
+    assert persisted.last_status == "running"
+    assert persisted.last_run_at is not None
+    assert len(store.executions(schedule.id)) == 1
+
+
+def test_worker_start_skips_old_occurrences_without_creating_execution(tmp_path) -> None:
+    store = AutomationStore(_storage(tmp_path))
+    due_at = datetime(2026, 9, 19, 21, 0, tzinfo=timezone.utc)
+    restarted_at = datetime(2026, 9, 20, 1, 3, tzinfo=timezone.utc)
+    schedule = store.upsert_daily(
+        task_id="recruitment_mailbox",
+        task_label="fixture mail task",
+        start_time=time(5, 0),
+        target_kind="all",
+        now=datetime(2026, 9, 19, 20, 58, tzinfo=timezone.utc),
+    )
+    assert schedule.next_run_at.replace(tzinfo=timezone.utc) == due_at
+
+    assert store.skip_missed_occurrences(now=restarted_at) == 1
+
+    persisted = store.list(active_only=True)[0]
+    assert persisted.next_run_at.replace(tzinfo=timezone.utc) == datetime(
+        2026, 9, 20, 21, 0, tzinfo=timezone.utc
+    )
+    assert persisted.last_run_at is None
+    assert store.claim_due(now=restarted_at) is None
+    assert store.executions(schedule.id) == []
 
 
 def test_worker_claims_due_schedule_and_persists_execution(tmp_path) -> None:

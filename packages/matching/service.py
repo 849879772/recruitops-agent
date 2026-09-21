@@ -30,6 +30,7 @@ from .rules import (
     canonical_direction,
     content_fingerprint,
     job_id,
+    internship_reason,
     profile_content_payload,
     profile_fingerprint,
     screen_job,
@@ -221,9 +222,9 @@ def _prompt_system() -> str:
     return (
         "你是严格的校招岗位匹配审计员，只依据候选人和岗位给出的证据。"
         "岗位已经通过确定性筛选：cohort=2027、cohort_status=confirmed、非实习且非博士限定。"
-        "C++软件开发与测开、机械臂开发、具身/VLA/模仿学习/强化学习、"
-        "大模型/Agent/RAG/模型训练部署/AI应用是四个并列方向，命中任一方向即可，不因未命中其他方向扣分。"
-        "Linux和ROS只能作为辅助工程栈证据，不能替代核心项目证据。"
+        "仅依据候选人配置的 title_keywords、方向和简历事实评分，不套用开发者的职业方向。"
+        "并列方向命中任一即可，不因未命中其他方向扣分；工程栈不能替代核心项目证据。"
+        "未映射到内置方向枚举的自定义职业仍正常评分，matched_directions 返回空列表，primary_match_direction 返回 null。"
         "project_evidence 才能作为直接项目证据；supporting_skills只能作为工程栈证据；"
         "learning_targets和unverified_skills不能写成已掌握能力。"
         "当前阶段只负责评分：匹配较弱时给出低分，不得再次排除、跳过或延后岗位。"
@@ -627,6 +628,11 @@ class MatchingService:
         screening: ScreeningResult | None = None,
     ) -> AnalysisOutcome:
         """Run the title-first flow without changing the legacy ``analyze`` path."""
+        if internship_reason(job):
+            return self._title_first_filter(
+                job, profile, screen_title_job(job, profile),
+                status=AnalysisStatus.INTERNSHIP, reason="internship",
+            )
         existing = _coerce_existing(existing_analysis)
         if _has_completed_finite_score(existing):
             decision = AnalysisDecision(

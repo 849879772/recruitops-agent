@@ -54,10 +54,10 @@ def test_navigation_keeps_business_routes_and_decorative_line_icons():
 def test_script_and_style_versions_are_updated_together():
     versions = parse_navigation().asset_versions
     assert len(versions) == 4
-    assert versions == ["0.4.20-20260915"] * 4
+    assert versions == ["public-ui-20260918"] * 4
     html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert '<script defer src="./company-sources.js?v=0.4.20-20260915"></script>' in html
-    assert '<script defer src="./knowledge.js?v=0.4.20-20260915"></script>' in html
+    assert '<script defer src="./company-sources.js?v=public-ui-20260918"></script>' in html
+    assert 'knowledge.js' not in html
 
 
 def test_assistant_leads_personal_navigation_and_messages_do_not_stretch():

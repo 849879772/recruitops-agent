@@ -577,13 +577,14 @@ def _digest(value: Any) -> str:
 def _interruption_message(reason: TurnInterruptionReason) -> str:
     return {
         TurnInterruptionReason.TURN_TIMEOUT: (
-            "Codex turn interrupted after reaching the runtime time limit."
+            "本次对话回合达到运行时限并已结束；已经启动的后台任务不会因此自动取消，"
+            "请按运行编号查询实际状态。中断前已经完成的写入会保留。"
         ),
         TurnInterruptionReason.TOOL_CALL_BUDGET: (
-            "Codex turn interrupted after reaching the tool-call budget."
+            "本次任务达到工具调用次数上限，已被运行时中断；中断前已经完成的写入会保留。"
         ),
         TurnInterruptionReason.REPEATED_NO_PROGRESS: (
-            "Codex turn interrupted after repeated events without progress."
+            "本次任务连续多次没有产生新进展，已被运行时中断；中断前已经完成的写入会保留。"
         ),
     }[reason]
 

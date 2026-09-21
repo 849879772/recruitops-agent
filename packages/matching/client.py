@@ -124,6 +124,7 @@ class DeepSeekClient:
         transport: Transport | None = None,
         max_attempts: int = 2,
         retry_backoff_seconds: float = 0.5,
+        api_style: str = "anthropic",
     ) -> None:
         if not api_key.strip():
             raise ValueError("DeepSeek API key is required")
@@ -131,6 +132,9 @@ class DeepSeekClient:
             raise ValueError("DeepSeek model is required")
         self.api_key = api_key.strip()
         self.model = model.strip()
+        if api_style not in {"anthropic", "openai"}:
+            raise ValueError("api_style must be anthropic or openai")
+        self.api_style = api_style
         self.endpoint = _validated_endpoint(endpoint)
         self.timeout = max(1.0, min(float(timeout), 180.0))
         self.max_tokens = max(128, min(int(max_tokens), 4_000))
@@ -211,10 +215,39 @@ class DeepSeekClient:
             "content-type": "application/json",
             "x-api-key": self.api_key,
         }
+        if self.api_style == "openai":
+            payload = {
+                "model": self.model,
+                "max_tokens": payload["max_tokens"],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            }
+            headers = {"Authorization": f"Bearer {self.api_key}",
+                       "content-type": "application/json"}
         for attempt in range(1, self.max_attempts + 1):
             try:
                 data = self.transport(self.endpoint, headers, payload, self.timeout)
-                if output_schema is not None:
+                if self.api_style == "openai":
+                    choices = data.get("choices")
+                    choice = choices[0] if isinstance(choices, list) and choices else None
+                    if not isinstance(choice, Mapping):
+                        raise DeepSeekClientError("response_invalid")
+                    if choice.get("finish_reason") == "length":
+                        raise DeepSeekClientError("response_truncated")
+                    message = choice.get("message")
+                    content = message.get("content") if isinstance(message, Mapping) else None
+                    if not isinstance(content, str) or not content.strip():
+                        raise DeepSeekClientError("response_empty")
+                    return DeepSeekResponse(
+                        content=content.strip(), model=str(data.get("model") or self.model),
+                        input_tokens=_usage(data, "prompt_tokens"),
+                        output_tokens=_usage(data, "completion_tokens"),
+                    )
+                elif output_schema is not None:
                     blocks = data.get("content")
                     calls = [b for b in blocks if isinstance(b, Mapping) and b.get("type") == "tool_use"] if isinstance(blocks, list) else []
                     if (data.get("stop_reason") == "max_tokens" or len(calls) != 1

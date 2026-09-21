@@ -14,11 +14,11 @@ def read_source(name: str) -> str:
     return (EXTENSION / "src" / name).read_text(encoding="utf-8")
 
 
-def test_manifest_is_mv3_with_minimum_permissions_and_local_api_only() -> None:
+def test_manifest_is_mv3_with_public_permissions_and_no_cookie_access() -> None:
     manifest = read_json(EXTENSION / "manifest.json")
 
     assert manifest["manifest_version"] == 3
-    assert manifest["version"] == "0.3.21"
+    assert manifest["version"] == "0.3.23"
     assert set(manifest["permissions"]) == {"activeTab", "scripting", "storage", "tabs"}
     assert set(manifest["host_permissions"]) == {
         "http://127.0.0.1/*",

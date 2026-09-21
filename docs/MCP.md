@@ -8,10 +8,7 @@ and administration primitives.
 must not maintain a competing list. The server uses Agent-owned PostgreSQL and
 configuration. It never writes the old autumn recruitment project.
 
-`knowledge_search` also supports owner-uploaded personal documents with
-`domain=personal` and `action=list/search/read`. Search uses BM25 and semantic
-retrieval with RRF fusion, returning versioned source links. This extension
-is read-only and does not change the number of tools. See PERSONAL_KNOWLEDGE.md.
+`knowledge_search` only supports approved crawler/candidate evidence. Personal document upload and retrieval are not available.
 
 Validate the contract without a database connection:
 

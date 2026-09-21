@@ -576,7 +576,9 @@ class AutomationSchedule(Base):
         UniqueConstraint(
             "task_id",
             "target_key",
-            name="uq_automation_schedules_task_target",
+            "start_time",
+            "timezone_name",
+            name="uq_automation_schedules_task_target_time",
         ),
         CheckConstraint("frequency = 'daily'", name="ck_automation_schedules_frequency"),
         Index("ix_automation_schedules_due", "active", "next_run_at"),

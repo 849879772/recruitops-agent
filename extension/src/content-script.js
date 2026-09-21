@@ -240,6 +240,16 @@
     if (/(?:请先登录|请登录|登录失效|重新登录|未登录|login required|session expired|sign in to|log in to)/i.test(text)) {
       return protocol.pauseReasons.LOGIN_REQUIRED;
     }
+    // Identity gates may use SMS/email without mentioning login (e.g. delivery queries).
+    // Require an explicit request and verification context, not contact fields alone.
+    const leadText = text.slice(0, 800);
+    if (
+      /请(?:先)?(?:进行|完成)?身份(?:认证|验证)/.test(leadText) &&
+      /(?:手机|短信|邮箱|邮件)/.test(leadText) &&
+      /(?:(?:发送|获取)(?:短信|邮箱|邮件)?验证码|(?:使用|通过)(?:手机|短信|邮箱|邮件)验证)/.test(leadText)
+    ) {
+      return protocol.pauseReasons.LOGIN_REQUIRED;
+    }
     if (hasVisibleSelector(OVERLAY_SELECTORS)) {
       return protocol.pauseReasons.STATE_UNCLEAR;
     }

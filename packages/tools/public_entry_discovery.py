@@ -28,6 +28,7 @@ class PublicEntryDiscoveryInput(ToolInput):
     company_names: list[str] = Field(min_length=1, max_length=MAX_COMPANIES)
     max_queries_per_company: int = Field(default=2, ge=1, le=MAX_QUERIES_PER_COMPANY)
     max_candidates_per_company: int = Field(default=5, ge=1, le=MAX_CANDIDATES_PER_COMPANY)
+    cohort_year: int = Field(default=2027, ge=1, le=9999)
 
     @field_validator("company_names")
     @classmethod
@@ -113,6 +114,7 @@ def discover_public_recruitment_entries(
                 timeout_seconds=per_company_timeout,
                 max_queries=request.max_queries_per_company,
                 max_candidates=request.max_candidates_per_company,
+                cohort_year=request.cohort_year,
             )
             results.append(PublicEntryCompanyResult(
                 company=company,
@@ -148,7 +150,7 @@ def discover_public_recruitment_entries(
         failed_count=failed_count,
         safety_boundary=(
             "Search results are untrusted candidates only. Validate company identity, public "
-            "2027 recruitment scope, pagination, and jobs through the crawler acceptance path "
+            f"{request.cohort_year} recruitment scope, pagination, and jobs through the crawler acceptance path "
             "before changing configuration or database state."
         ),
     )

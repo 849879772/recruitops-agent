@@ -12,6 +12,7 @@
     complete: "抓取完整",
     partial: "抓取不完整",
     failed: "无法抓取",
+    unusable: "无法抓取",
   };
   const LEGACY_STATUS_LABELS = {
     complete: "已完成",
@@ -37,7 +38,7 @@
     { value: "running", label: "抓取中" },
     { value: "complete", label: "抓取完整" },
     { value: "partial", label: "抓取不完整" },
-    { value: "ungrabbable", label: "公司抓取失败" },
+    { value: "ungrabbable", label: "无法抓取" },
   ];
   const FAILURE_STAGE_LABELS = {
     entry: "入口",

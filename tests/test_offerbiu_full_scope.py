@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from datetime import datetime, timezone
 
+import pytest
 import yaml
 
 import packages.scheduler.runtime as scheduler_runtime
@@ -13,7 +14,7 @@ from packages.scheduler.runtime import _prepare_full_offerbiu_scope
 from packages.storage import Storage
 
 
-def test_full_offerbiu_scope_uses_current_sources_and_merges_legacy_config(
+def test_full_offerbiu_scope_uses_only_current_sources(
     tmp_path: Path,
 ) -> None:
     companies_path = tmp_path / "companies.yaml"
@@ -80,10 +81,30 @@ def test_full_offerbiu_scope_uses_current_sources_and_merges_legacy_config(
     assert [company.name for company in companies] == [
         "BIU Company",
         "New Company",
-        "Legacy Only",
     ]
     assert companies[0].careers_url == "https://one.zhiye.com/campus/jobs"
     assert companies[0].extra["discovery_source"] == "offerbiu"
+
+
+def test_full_offerbiu_scope_rejects_zero_matches_without_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    companies_path = tmp_path / "companies.yaml"
+    companies_path.write_text(
+        "companies:\n  - id: legacy-only\n    name: Legacy Only\n"
+        "    careers_url: https://legacy.example.com/campus\n"
+        "    crawler: render\n    integration_status: connected\n",
+        encoding="utf-8",
+    )
+    storage = Storage.from_url("sqlite+pysqlite:///:memory:", initialize=True)
+    settings = SimpleNamespace(companies_config=companies_path, agent_root=tmp_path)
+
+    try:
+        _prepare_full_offerbiu_scope(settings, storage, "empty-run", ())
+    except ValueError as exc:
+        assert "refusing legacy companies fallback" in str(exc)
+    else:
+        raise AssertionError("an empty BIU snapshot must not use legacy companies")
 
 
 def test_unscoped_full_run_uses_complete_offerbiu_scope(
@@ -172,3 +193,94 @@ def test_unscoped_full_run_uses_complete_offerbiu_scope(
     assert result["status"] == "completed"
     assert result["offerbiu_companies_queued"] == 1
     assert observed[-1] == ["Current Company"]
+
+
+@pytest.mark.parametrize(
+    ("industry_groups", "refresh_error"),
+    [
+        (["internet-tech", "manufacturing-equipment", "auto-transport-equipment"], None),
+        (["finance"], "当前 OfferBiu 发现适配器不支持所选行业范围"),
+    ],
+)
+def test_daily_run_never_falls_back_to_legacy_after_biu_scope_attempt(
+    tmp_path: Path,
+    monkeypatch,
+    industry_groups: list[str],
+    refresh_error: str | None,
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "companies.yaml").write_text(
+        "companies:\n  - id: legacy-only\n    name: Legacy Only\n"
+        "    careers_url: https://legacy.example.com/campus\n"
+        "    crawler: render\n    integration_status: connected\n",
+        encoding="utf-8",
+    )
+    (config_dir / "candidate_profile.yaml").write_text("profile: {}\n", encoding="utf-8")
+    database_url = f"sqlite+pysqlite:///{(tmp_path / 'agent.db').as_posix()}"
+    storage = Storage.from_url(database_url, initialize=True)
+
+    class RefreshService:
+        def __init__(self, _registry):
+            if refresh_error:
+                raise AssertionError("unsupported scope must fail before refresh")
+            self.last_registered_ids = ()
+
+        def refresh(self, **_kwargs):
+            return {
+                "complete": True,
+                "stop_reason": "complete",
+                "pages_fetched": 1,
+                "records_seen": 0,
+                "companies_seen": 0,
+                "applied": True,
+                "registered_entries": 0,
+                "new_entries": 0,
+                "linked_existing_entries": 0,
+                "excluded_unusable": 0,
+                "out_of_scope": 0,
+                "registered_ids": [],
+                "pending_entries": [],
+            }
+
+    class Pipeline:
+        def __init__(self, **_kwargs):
+            self.progress_callback = None
+
+        def run(self, **_kwargs):
+            raise AssertionError("legacy companies must not be crawled")
+
+    monkeypatch.setattr(scheduler_runtime, "OfferBiuRefreshService", RefreshService)
+    monkeypatch.setattr(scheduler_runtime, "DailyRecruitmentPipeline", Pipeline)
+    settings = Settings(
+        agent_root=tmp_path,
+        database_url=database_url,
+        discovery_enabled=True,
+        offerbiu_industry_groups=industry_groups,
+        offline_reconciliation_enabled=False,
+        llm_enabled=False,
+    )
+    handlers = scheduler_runtime.build_runtime_task_handlers(settings=settings)
+    context = TaskContext(
+        task_id=TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value,
+        task_label="test",
+        scheduled_for=datetime(2026, 9, 12, tzinfo=timezone.utc),
+        run_id="strict-scope-run",
+        attempt=1,
+        write_enabled=True,  # Only the temporary fixture database is authorized.
+        metadata={"details": {"mode": "full"}},
+    )
+
+    result = handlers[TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value](context)
+
+    assert result["status"] == "failed"
+    crawl_errors = [
+        event["error"]
+        for event in result["daily_sync"]["stages"]
+        if event["stage"] == "crawl" and event["error"]
+    ]
+    assert crawl_errors
+    if refresh_error:
+        assert refresh_error in result["daily_sync"]["warnings"][0]
+    else:
+        assert "refusing legacy companies fallback" in crawl_errors[0]

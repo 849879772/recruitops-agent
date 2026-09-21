@@ -308,3 +308,69 @@ def test_default_supervisor_passes_dotenv_provider_key_only_to_child_environment
         assert supervisor.config.environment["RECRUITOPS_MATCH_MAX_CONCURRENCY"] == "1"
     finally:
         codex_bff.get_codex_supervisor.cache_clear()
+
+
+def test_desktop_supervisor_separates_installed_code_from_instance(monkeypatch, tmp_path):
+    import tomllib
+
+    code_root = tmp_path / "installed app"
+    instance = tmp_path / "instance"
+    settings = config_module.Settings(
+        _env_file=None, env="desktop-isolated", agent_root=instance,
+        codex_home=instance / "codex", database_url="sqlite:///:memory:",
+        write_enabled=False, llm_api_key="",
+    )
+    monkeypatch.setattr(codex_bff, "__file__", str(code_root / "apps/api/codex_bff.py"))
+    monkeypatch.setattr(config_module, "get_settings", lambda: settings)
+    monkeypatch.delenv("RECRUITOPS_DESKTOP_WRITE_OPTIN", raising=False)
+    inherited = {
+        "RECRUITOPS_DESKTOP_LAUNCH_MODE": "packaged",
+        "RECRUITOPS_DESKTOP_CAPABILITIES": '{"llm_enabled":false}',
+        "RECRUITOPS_DESKTOP_INSTANCE_ID": "a" * 32,
+        "RECRUITOPS_DESKTOP_RUN_ID": "b" * 32,
+        "PLAYWRIGHT_BROWSERS_PATH": str(code_root / "chromium"),
+        "PYTHONPATH": str(code_root),
+    }
+    for name, value in inherited.items():
+        monkeypatch.setenv(name, value)
+    codex_bff.get_codex_supervisor.cache_clear()
+    try:
+        supervisor = codex_bff.get_codex_supervisor()
+        rendered = (instance / "codex/config.toml").read_text(encoding="utf-8")
+        mcp = tomllib.loads(rendered)["mcp_servers"]["recruitops"]
+        assert mcp["args"] == [str(code_root / "scripts/run_mcp_server.py")]
+        assert supervisor.config.working_dir == instance
+        assert supervisor.config.skill_roots == (code_root / ".agents/skills",)
+        assert "RECRUITOPS_DESKTOP_WRITE_OPTIN" not in supervisor.config.environment
+        for name in (
+            "RECRUITOPS_DESKTOP_LAUNCH_MODE", "RECRUITOPS_DESKTOP_CAPABILITIES",
+            "RECRUITOPS_DESKTOP_INSTANCE_ID", "RECRUITOPS_DESKTOP_RUN_ID",
+            "RECRUITOPS_DESKTOP_WRITE_OPTIN", "RECRUITOPS_WRITE_ENABLED",
+            "RECRUITOPS_AGENT_ROOT", "RECRUITOPS_DATABASE_URL",
+            "PLAYWRIGHT_BROWSERS_PATH", "PYTHONPATH", "PYTHONNOUSERSITE",
+            "PYTHONDONTWRITEBYTECODE", "PYTHONUTF8", "HOME", "USERPROFILE",
+            "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "NO_PROXY", "no_proxy",
+            "RECRUITOPS_CODEX_RUNTIME_ENABLED", "RECRUITOPS_AUTOMATION_ENABLED",
+            "RECRUITOPS_MAIL_SYNC_ON_STARTUP", "RECRUITOPS_VISION_ENABLED",
+        ):
+            assert name in mcp["env_vars"]
+        assert "RECRUITOPS_API_TOKEN" not in mcp["env_vars"]
+        from packages.codex_runtime.client import create_process
+        captured = {}
+
+        async def capture_process(*args, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_process)
+        asyncio.run(create_process(
+            supervisor.config.command, supervisor.config.working_dir,
+            supervisor.config.environment,
+        ))
+        forwarded = {key: value for key, value in captured["env"].items()
+                     if key in mcp["env_vars"]}
+        assert all(forwarded[name] == value for name, value in inherited.items())
+        assert "RECRUITOPS_DESKTOP_WRITE_OPTIN" not in forwarded
+        assert captured["cwd"] == str(instance)
+    finally:
+        codex_bff.get_codex_supervisor.cache_clear()

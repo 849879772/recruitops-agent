@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from packages.mcp.server import TOOL_DEFINITIONS, _build_handler
+from packages.storage import ApplicationSnapshot
 from packages.tools.application_status_evidence import (
     VerifyApplicationStatusEvidenceInput, VerifyApplicationStatusEvidenceResponse,
     verify_application_status_evidence, has_unmapped_status,
@@ -29,7 +30,7 @@ def test_historical_unknown_status_is_not_absent(signals):
 
 
 @pytest.mark.parametrize("entries", [[], [{"status": "rejected", "context": "另一岗位 流程终止"}]])
-def test_batch_returns_unknown_text_for_model_instead_of_unchanged(tmp_path, monkeypatch, entries):
+def test_batch_returns_terminal_unknown_text_for_model_instead_of_unchanged(tmp_path, monkeypatch, entries):
     from packages.tools import batch_browser_operations as module
     repository = _repository(tmp_path, [{"id": "24", "title": "软件开发工程师", "record_url": "https://ats.example/applications"}])
     async def observe(*args):
@@ -45,7 +46,33 @@ def test_batch_returns_unknown_text_for_model_instead_of_unchanged(tmp_path, mon
     assert "暂不匹配" in str(result.unresolved[0].observation)
 
 
-def test_mcp_verifier_returns_readonly_and_error_results(tmp_path):
+def test_batch_treats_non_decisive_unknown_text_as_no_newer_status(tmp_path, monkeypatch):
+    from packages.tools import batch_browser_operations as module
+    repository = _repository(tmp_path, [{
+        "id": "24", "title": "软件开发工程师", "record_url": "https://ats.example/applications",
+        "stage": "written",
+    }])
+
+    async def observe(*args):
+        return _observed({"entries": [], "application_records": [{
+            "title": "软件开发工程师", "status": "", "label": "正在等待业务决策",
+            "raw_status_labels": ["正在等待业务决策"],
+            "context": "软件开发工程师 状态: 正在等待业务决策",
+            "signals": {"has_explicit_status": True, "unmapped_status": True},
+        }]})
+
+    monkeypatch.setattr(module, "observe_application_status_page_workflow", observe)
+    result = asyncio.run(batch_observe_application_status(
+        BatchObserveApplicationStatusInput(application_ids=["24"]), object(), repository))
+
+    assert result.unchanged[0].reason == "no_newer_status_observed"
+    assert not result.unresolved and not result.updated
+    with repository.storage.session() as session:
+        assert session.get(ApplicationSnapshot, "24").stage == "written"
+
+
+def test_mcp_verifier_returns_readonly_and_error_results(tmp_path, monkeypatch):
+    monkeypatch.setattr("packages.mcp.server.get_settings", lambda: SimpleNamespace(write_enabled=True))
     store, url = _prepared_store(tmp_path)
     operation = _observed_operation(store, url, observation={
         "page_url": url, "captured_at": "2026-08-22T12:00:00Z",
@@ -106,7 +133,8 @@ def test_dom_preserves_unknown_label_and_maps_explicit_rejection():
         try:
             page = browser.new_page()
             for label, status in [("暂不匹配", "rejected"), ("正在等待业务决策", ""),
-                                  ("线上测评-进行中", "assessment"), ("笔试-进行中", "written"),
+                                  ("筛选阶段", "applied"), ("测试中", "applied"),
+                                  ("线上测评-进行中", "applied"), ("笔试-进行中", "written"),
                                   ("线上测评-未通过", "rejected")]:
                 page.set_content(f'<article data-recruitops-application><h3>软件开发工程师</h3><p>第 1 志愿</p><p>状态: {label}</p></article>')
                 page.add_script_tag(path=str(script))
@@ -120,8 +148,61 @@ def test_dom_preserves_unknown_label_and_maps_explicit_rejection():
             browser.close()
 
 
+def test_dom_extracts_recruitment_table_row_with_generic_status():
+    from playwright.sync_api import sync_playwright
+    from tests.test_extension_actions import launch_fixture_browser
+    script = Path(__file__).parents[1] / "extension/src/application-records.js"
+    with sync_playwright() as p:
+        browser = launch_fixture_browser(p)
+        try:
+            page = browser.new_page()
+            page.set_content("""
+                <table>
+                  <thead><tr><th>投递岗位</th><th>工作地点</th><th>投递日期</th><th>当前状态</th></tr></thead>
+                  <tbody><tr><td>游戏研发-游戏测试开发<br>校园招聘</td><td>上海</td>
+                    <td>2026-09-14 18:10</td><td>测试中</td></tr></tbody>
+                </table>
+            """)
+            page.add_script_tag(path=str(script))
+            result = page.evaluate("RecruitOpsApplicationRecords.extract(document)")
+            assert result["diagnostics"]["recordCount"] == 1
+            assert result["records"][0]["title"] == "游戏研发-游戏测试开发"
+            assert result["records"][0]["status"] == "applied"
+            assert result["records"][0]["label"] == "测试中"
+        finally:
+            browser.close()
+
+
+def test_dom_extracts_beisen_submission_when_action_buttons_are_delayed():
+    from playwright.sync_api import sync_playwright
+    from tests.test_extension_actions import launch_fixture_browser
+    script = Path(__file__).parents[1] / "extension/src/application-records.js"
+    with sync_playwright() as p:
+        browser = launch_fixture_browser(p)
+        try:
+            page = browser.new_page()
+            page.set_content("""
+                <main>
+                  <section class="delivery-record-card">
+                    <h3>软件工程师（应用软件部）-27届校招(J11510)</h3>
+                    <p>校园招聘</p><p>2026-08-20 01:14 投递</p>
+                  </section>
+                </main>
+            """)
+            page.add_script_tag(path=str(script))
+            result = page.evaluate("RecruitOpsApplicationRecords.extract(document)")
+            assert result["diagnostics"]["recordCount"] == 1
+            card = result["records"][0]
+            assert card["title"] == "软件工程师（应用软件部）-27届校招(J11510)"
+            assert card["status"] == ""
+            assert card["signals"]["has_date"] is True
+        finally:
+            browser.close()
+
+
 def test_browser_assessment_retains_applied_but_written_advances():
-    from packages.tools.browser_status_update import _target_stage
+    from packages.tools.browser_status_update import _normalise_status, _target_stage
     from packages.domain.models import ApplicationStage
+    assert _normalise_status("线上测评-进行中") == "applied"
     assert _target_stage(ApplicationStage.APPLIED, "assessment") == ApplicationStage.APPLIED
     assert _target_stage(ApplicationStage.APPLIED, "written") == ApplicationStage.WRITTEN

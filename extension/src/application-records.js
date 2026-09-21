@@ -5,7 +5,7 @@
 
   const DATE_PATTERN = /(?:20\d{2}[年./-]\s?\d{1,2}[月./-]\s?\d{1,2}日?(?:\s+\d{1,2}:\d{2})?|\d{1,2}月\d{1,2}日|\d{1,2}[-/.]\d{1,2}\s+\d{1,2}:\d{2})/;
   const JOB_PATTERN = /工程师|开发|算法|产品|设计|运营|测试|研究|研发|技术|顾问|销售|市场|采购|财务|人力|法务|实习|管培|项目经理|架构|数据|运维|机器人|嵌入式|软件|硬件|视觉|岗位|职位|\b(?:engineer|developer|designer|manager|intern|analyst|researcher|builder|architect|scientist|specialist|consultant|lead|director)\b/i;
-  const STATUS_PATTERN = /投递|申请|简历|筛选|评估|测评|测试|笔试|面试|终试|洽谈|录用|offer|签约|淘汰|不合适|拒绝|结束|终止|已挂|撤回|applied|assessment|written|interview|rejected|withdrawn/i;
+  const STATUS_PATTERN = /投递|申请|简历|筛选|评估|测评|测试|笔试|面试|终试|洽谈|录用|offer|签约|淘汰|不合适|不匹配|未通过|拒绝|结束|终止|已挂|撤回|applied|assessment|written|interview|rejected|withdrawn/i;
   const ACTION_PATTERN = /^(?:编辑|查看|查看\/打印|详情|修改申请|撤回|撤回申请|取消申请)$/;
   const BLOCKED_TITLE_PATTERN = /^(?:投递记录|我的投递|申请记录|投递历史|已完成的投递|校园招聘|社会招聘|编辑|查看|查看\/打印|修改申请|撤回|撤回申请|取消申请|修改志愿顺序|第\s*\d+\s*志愿|没有更多了|当前进度.*)$/i;
   const STRUCTURAL_SELECTOR = [
@@ -47,6 +47,7 @@
   function normalizedStatus(rawStatus) {
     const status = String(rawStatus || "").replace(/\s+/g, "").toLowerCase();
     if (!status) return "";
+    if (status === "assessment") return "applied";
     if (/^(?:interested|applied|assessment|written|interview|hr|offer|rejected|withdrawn)$/.test(status)) return status;
     if (/撤回成功|已撤回|已取消申请|取消申请成功/.test(status)) return "withdrawn";
     if (/淘汰|不合适|未通过|暂不匹配|不匹配|流程终止|流程结束|申请终止|拒绝|已挂/.test(status)) return "rejected";
@@ -56,7 +57,8 @@
     if (/二面|第二轮面试/.test(status)) return "interview";
     if (/一面|第一轮面试|面试/.test(status)) return "interview";
     if (/笔试|机试|编程测试|在线考试|written(?:test)?/.test(status)) return "written";
-    if (/测评|assessment/.test(status)) return "assessment";
+    if (/测评|assessment/.test(status)) return "applied";
+    if (/^(?:筛选阶段|筛选中|测试中|测试阶段|进行中)$/.test(status)) return "applied";
     if (/投递|申请成功|已申请|简历(?:初筛|筛选|评估|待筛)|初筛|待处理|处理中/.test(status)) return "applied";
     return "";
   }
@@ -144,13 +146,41 @@
     return best && best.score >= 8 ? best.title : "";
   }
 
+  function tableRecordParts(node) {
+    if (String(node?.tagName || "").toLowerCase() !== "tr") return null;
+    const table = node.closest("table");
+    if (!table) return null;
+    const headers = Array.from(table.querySelectorAll("thead th, tr th")).map((header) => textOf(header));
+    const cells = Array.from(node.children || []).filter(
+      (child) => String(child.tagName || "").toLowerCase() === "td"
+    );
+    if (!headers.length || !cells.length) return null;
+    const indexOf = (pattern) => headers.findIndex((header) => pattern.test(header.replace(/\s+/g, "")));
+    const titleIndex = indexOf(/^(?:投递岗位|申请岗位|岗位名称|职位名称|岗位|职位|job|position)$/i);
+    const statusIndex = indexOf(/^(?:当前状态|申请状态|投递状态|当前进度|申请进度|应聘进度|状态|进度|status)$/i);
+    const dateIndex = indexOf(/^(?:投递日期|申请日期|投递时间|申请时间|日期|date)$/i);
+    if (titleIndex < 0 || statusIndex < 0 || !cells[titleIndex] || !cells[statusIndex]) return null;
+    const titleCell = textOf(cells[titleIndex]);
+    const titleLines = linesOf(titleCell);
+    const preferredTitle = titleLines.find((line) => JOB_PATTERN.test(line)) || titleLines[0] || "";
+    const title = preferredTitle.replace(/\s+(?:校园招聘|社会招聘|实习招聘)$/i, "").trim();
+    const status = normalizeStatusLabel(textOf(cells[statusIndex]));
+    const date = dateIndex >= 0 && cells[dateIndex]
+      ? (textOf(cells[dateIndex]).match(DATE_PATTERN)?.[0] || "")
+      : "";
+    if (!title || !JOB_PATTERN.test(title) || !status || !STATUS_PATTERN.test(status)) return null;
+    return {title, status, date};
+  }
+
   function isRecordLike(text) {
     const hasDate = DATE_PATTERN.test(text);
     const hasVolunteer = /第\s*\d+\s*志愿/.test(text);
     const hasOperation = /(?:修改申请|撤回|撤回申请|取消申请|查看\/打印)/.test(text);
     const hasExplicitStatus = /(?:当前进度|申请进度|应聘进度|当前状态|状态|status)\s*[:：]|申请成功|投递成功|流程终止|已淘汰|不合适|未通过/i.test(text);
     const hasOfficialDelivery = /官网投递|投递简历/.test(text);
+    const hasStandaloneDelivery = /(?:^|\s)投递(?:\s|$)/.test(text);
     return (hasDate && (hasOperation || hasExplicitStatus || hasOfficialDelivery))
+      || (hasDate && hasStandaloneDelivery)
       || (hasVolunteer && hasExplicitStatus)
       || (hasOperation && hasExplicitStatus);
   }
@@ -171,26 +201,31 @@
     }
     for (const node of documentValue.querySelectorAll(STRUCTURAL_SELECTOR)) {
       const text = textOf(node);
+      const tableParts = tableRecordParts(node);
       const protocolMarked = node.hasAttribute("data-recruitops-application")
         || node.hasAttribute("data-application-id")
         || node.hasAttribute("data-recruitops-application-id");
-      if (text.length <= 2000 && (isRecordLike(text) || protocolMarked)) blocks.add(node);
+      if (text.length <= 2000 && (isRecordLike(text) || protocolMarked || tableParts)) blocks.add(node);
     }
     // Never interpret a multi-application wrapper as another application card.
-    const candidates = Array.from(blocks).filter((node) => bestJobTitle(textOf(node)));
+    const titleOf = (node) => tableRecordParts(node)?.title || bestJobTitle(textOf(node));
+    const candidates = Array.from(blocks).filter((node) => titleOf(node));
     return candidates.filter((node) => {
       const childTitles = new Set(candidates
         .filter((child) => child !== node && node.contains(child))
-        .map((child) => bestJobTitle(textOf(child))));
+        .map((child) => titleOf(child)));
       return childTitles.size < 2;
     });
   }
 
   function recordFromBlock(node, redactText) {
     const rawText = textOf(node);
-    const title = bestJobTitle(rawText);
+    const tableParts = tableRecordParts(node);
+    const title = tableParts?.title || bestJobTitle(rawText);
     if (!title) return null;
-    const hints = statusHints(node, rawText);
+    const hints = tableParts?.status
+      ? [{label: tableParts.status, source: "explicit-label"}]
+      : statusHints(node, rawText);
     const mappedHints = hints.map((hint) => ({...hint, status: normalizedStatus(hint.label)}))
       .filter((hint) => hint.status);
     const distinctStatuses = [...new Set(mappedHints.map((hint) => hint.status))];
@@ -200,7 +235,7 @@
     const label = chosen?.label || unknownHints[0]?.label || hints[0]?.label || "";
     const status = chosen?.status || "";
     const hasOperation = /(?:修改申请|撤回|撤回申请|取消申请|查看\/打印)/.test(rawText);
-    const date = rawText.match(DATE_PATTERN)?.[0] || "";
+    const date = tableParts?.date || rawText.match(DATE_PATTERN)?.[0] || "";
     let confidence = 0;
     if (status) {
       confidence = source === "terminal-label" ? 0.99 : source === "explicit-label" ? 0.97 : source === "active-step" ? 0.95 : 0.92;

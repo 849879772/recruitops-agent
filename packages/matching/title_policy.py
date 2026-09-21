@@ -13,7 +13,7 @@ from .models import (
     ScreeningEvidence,
     ScreeningResult,
 )
-from .rules import DEFAULT_DIRECTIONS, requested_directions
+from .rules import DEFAULT_DIRECTIONS, internship_reason, requested_directions
 
 
 def normalize_job_title_key(title: Any) -> str:
@@ -212,18 +212,25 @@ def _matched_directions(
 
 
 def screen_title_job(job: Any, profile: Any | None = None) -> ScreeningResult:
-    """Screen a job using only its title and the configured target directions."""
+    """Match direction by title; reject explicit internship evidence from any stage."""
     title = normalize_job_title_key(_field(job, "title", ""))
     allowed = list(DEFAULT_DIRECTIONS) if profile is None else requested_directions(profile)
     matched, evidence = _matched_directions(title, allowed)
-    matching = _field(profile, "matching", {})
+    matching = _field(profile, "matching", profile or {})
     keywords = _field(matching, "title_keywords", []) or []
     excluded = _field(matching, "excluded_title_keywords", []) or []
+    if (profile is not None and _field(matching, "title_keywords", None) is not None
+            and not keywords and not _field(matching, "primary_directions", [])
+            and not _field(matching, "secondary_directions", [])
+            and not _field(profile, "target_directions", [])
+            and not _field(profile, "direction", None)):
+        return ScreeningResult(eligible=False, analysis_status=AnalysisStatus.DIRECTION_OUT,
+                               reasons=["title_keywords_required"], evidence=[])
     if any(_literal_pattern(word).search(title) for word in excluded):
         return ScreeningResult(eligible=False, analysis_status=AnalysisStatus.DIRECTION_OUT,
                                reasons=["excluded_title_keyword"], evidence=[])
 
-    if _INTERNSHIP_TITLE_PATTERN.search(title):
+    if _INTERNSHIP_TITLE_PATTERN.search(title) or internship_reason(job):
         evidence.insert(
             0,
             ScreeningEvidence(
@@ -280,6 +287,12 @@ def screen_title_job(job: Any, profile: Any | None = None) -> ScreeningResult:
             evidence=evidence,
         )
 
+    if custom_match:
+        evidence.extend(
+            ScreeningEvidence(source="title", signal="configured_title_keyword",
+                              excerpt=word, reason="User-confirmed title keyword")
+            for word in keywords if _literal_pattern(word).search(title)
+        )
     return ScreeningResult(
         eligible=True,
         analysis_status=AnalysisStatus.ELIGIBLE,

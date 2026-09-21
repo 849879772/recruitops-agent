@@ -4,6 +4,33 @@ from pathlib import Path
 WEB_ROOT = Path(__file__).parents[1] / "apps" / "web"
 
 
+def test_latest_ui_assets_and_manual_api_contract():
+    import re
+    html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    app = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    configuration = (WEB_ROOT / "configuration.js").read_text(encoding="utf-8")
+    for asset in re.findall(r'(?:src|href)="\./([^"?]+)', html):
+        assert (WEB_ROOT / asset).is_file(), asset
+    assert 'id="application-add-button"' in html
+    assert 'id="application-create-dialog"' in html
+    assert '/api/local-ui/applications/manual' in app
+    assert 'body.record_url ||= null' in app
+    assert 'localizeCodexRuntimeMessage(record.body)' in app
+    assert 'await loadApplications();' in app
+    assert 'returnToJobBrowseLocation()' in app
+    assert 'model_connections: connections' in configuration
+    assert 'post("model/test",' in configuration
+    assert 'post("mail/test",' in configuration
+    assert '配置 API 尚未支持' in configuration
+    assert 'write_enabled' not in configuration
+    for field in ("mail_enabled", "job_analysis_enabled", "automation_enabled"):
+        assert f'name="{field}"' not in html
+    assert 'name="mail_sync_on_startup"' in html
+    assert 'name="vision_enabled"' in html
+    for private_marker in ('8012', '5433', 'D:/RecruitOps-Agent', '周帅康'):
+        assert private_marker not in html + app + configuration
+
+
 def test_dashboard_assets_are_local_and_reference_api() -> None:
     html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     js = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
@@ -91,11 +118,12 @@ def test_company_ranking_is_not_overwritten_by_today_job_facets() -> None:
     assert 'api("/api/jobs/browse?limit=1&offset=0&sort=score")' in js
 
 
-def test_jobs_view_does_not_call_excluded_or_incomplete_jobs_pending() -> None:
+def test_jobs_view_keeps_unscored_filters_but_never_offers_excluded_jobs() -> None:
     html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     js = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
-    for state in ("pending", "jd_incomplete", "excluded", "unscored"):
+    for state in ("pending", "jd_incomplete", "unscored"):
         assert f'option value="{state}"' in html
+    assert 'option value="excluded"' not in html
     assert 'setText("jobs-unscored-total", stats.pending ?? 0)' in js
     assert 'scoreBadge(job.match_score, job.analysis_status)' in js
     assert 'status && status !== "complete"' in js
@@ -126,7 +154,10 @@ def test_autumn_navigation_controls_job_mode_and_assistant_handoffs() -> None:
     js = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert 'data-job-nav-mode="all"' in html
-    assert 'data-job-nav-mode="today"' in html
+    assert 'data-job-nav-mode="today"' not in html
+    assert 'id="nav-today-count"' not in html
+    assert 'data-job-mode="all"' in html
+    assert 'data-job-mode="today"' in html
     assert "renderJobModePresentation" in js
     assert 'switchView("assistant");\n        openAssistantDraft' in js
 

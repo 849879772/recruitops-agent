@@ -26,7 +26,9 @@ def test_parse_is_grounded_preview_only(owner, monkeypatch):
     assert response.json()["draft"]["skills"][0]["value"] == "Python"
     assert not (root / ".data/settings/candidate_profile.yaml").exists()
     payload["skills"][0]["value"] = "invented skill"
-    assert client.post(url, headers=headers, json={"text": resume}).status_code == 502
+    edited = client.post(url, headers=headers, json={"text": resume})
+    assert edited.status_code == 200
+    assert edited.json()["draft"]["skills"][0]["value"] == "invented skill"
     assert not (root / ".data/settings/candidate_profile.yaml").exists()
 
 

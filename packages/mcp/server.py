@@ -413,7 +413,10 @@ def _sync_mail_before_read(
 
     from packages.recruitment_mail.freshness import ensure_mail_fresh
 
-    return ensure_mail_fresh(get_settings(), dependencies.mail_store, limit=limit)
+    settings = get_settings()
+    if not bool(getattr(settings, "write_enabled", False)):
+        return {"status": "disabled", "reason": "write_disabled", "sync": {}}
+    return ensure_mail_fresh(settings, dependencies.mail_store, limit=limit)
 
 
 def _recruitment_mail_process_operation(
@@ -573,10 +576,6 @@ def _knowledge_search_operation(
     request: Any,
     dependencies: MCPToolDependencies,
 ) -> BaseModel:
-    if request.domain == "personal":
-        from packages.personal_knowledge import get_knowledge_service
-        from packages.tools.knowledge import search_personal_knowledge
-        return search_personal_knowledge(request, get_knowledge_service())
     if dependencies.evidence_grounder is None:
         return _missing_dependency_response(
             request,
@@ -1041,7 +1040,8 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
     MCPToolDefinition(
         name="observe_application_status_page",
         description=(
-            "Open one stored application page in Edge and return bounded semantic evidence. "
+            "Open one non-terminal stored application page in Edge and return bounded semantic "
+            "evidence. Rejected and withdrawn applications are closed and are never opened. "
             "Start with include_vision=false. Only use include_vision=true for an individual "
             "follow-up after a prior DOM-only observation has no bindable evidence and the single "
             "page has a clear target; supply "
@@ -1058,10 +1058,19 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         name="batch_observe_application_status",
         description=(
             "Batch observe stored application pages concurrently; this tool is DOM-only and never "
-            "starts vision analysis. "
-            "Return updated, unchanged, blocked, unresolved and failed counts accurately. In normal "
-            "user-facing summaries translate them to 已更新, 状态未变化, 需要登录或验证, 无法确认, "
-            "and 执行失败; "
+            "starts vision analysis. Rejected and withdrawn applications are excluded before any "
+            "browser operation. For a complete current/non-terminal review, set "
+            "all_non_terminal=true and omit application_ids; do not call application_query "
+            "with list_all=true just to collect IDs. "
+            "The all-mode processes a bounded wave and persists its frozen scope. "
+            "Omit timeout_ms or use 120000 at most; never submit a larger timeout. "
+            "While remaining_count > 0, call again with ONLY run_id from the result until "
+            "scope_complete=true. Counts are cumulative, not per-call. Never subtract "
+            "excluded_terminal from scope_total again. Do not restart all-mode on timeout. "
+            "No separate bridge or capabilities call is required. "
+            "Return updated, unchanged, excluded, blocked, unresolved and failed "
+            "counts accurately. In normal user-facing summaries translate them to 已更新, 状态未变化, "
+            "已跳过（已挂）, 需要登录或验证, 无法确认, and 执行失败; "
             "login, CAPTCHA and unclear evidence do not count as successful verification. "
             "Use the separate individual observation flow for a justified visual fallback."
         ),
@@ -1106,7 +1115,7 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
     ),
     MCPToolDefinition(
         name="knowledge_search",
-        description="Search approved knowledge. Use domain=personal for owner-uploaded notes and project materials: action=list lists documents; search uses BM25+semantic RRF; read retrieves a page with optional offset. Cite returned source_ref URLs and respect personal/reference/notes provenance. No document writes or application changes.",
+        description="Search approved crawler or candidate evidence. Cite returned source_ref URLs. No personal document access, document writes or application changes.",
         input_model=KnowledgeSearchInput,
         response_model=KnowledgeSearchResponse,
         operation=_knowledge_search_operation,
@@ -1207,6 +1216,10 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
             "crawl_only to skip scoring, score_only for saved JDs, and resume with the original "
             "resume_run_id to restore its frozen scope; missing recovery state is an error, not "
             "permission to expand the queue. Use dry_run for validation without business writes."
+            " An explicit user request to run the flow authorizes this controlled operation without "
+            "another confirmation or a recurring schedule, subject to instance write/configuration gates. "
+            "Returns a background run_id promptly; accepted/running is not completion. The chat may "
+            "finish while the local runtime stays open. Query daily_recruitment_sync_status with that ID."
         ),
         input_model=DailyRecruitmentSyncInput,
         response_model=DailyRecruitmentSyncResponse,
@@ -1255,6 +1268,10 @@ def _build_handler(
     definition: MCPToolDefinition,
     dependencies: MCPToolDependencies,
 ) -> Callable[[Any], Any]:
+    def require_write_opt_in() -> None:
+        if not definition.read_only and not bool(getattr(get_settings(), "write_enabled", False)):
+            raise PermissionError("Business writes are disabled; owner opt-in is required.")
+
     def validate_response(result: Any) -> BaseModel:
         response = definition.response_model.model_validate(result)
         if definition.read_only and getattr(response, "read_only", True) is not True:
@@ -1265,11 +1282,13 @@ def _build_handler(
 
     if inspect.iscoroutinefunction(definition.operation):
         async def handler(request: Any) -> BaseModel:
+            require_write_opt_in()
             typed_request = definition.input_model.model_validate(request)
             result = await definition.operation(typed_request, dependencies)
             return validate_response(result)
     else:
         def handler(request: Any) -> BaseModel:
+            require_write_opt_in()
             typed_request = definition.input_model.model_validate(request)
             result = definition.operation(typed_request, dependencies)
             return validate_response(result)

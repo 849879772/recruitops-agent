@@ -1,0 +1,10 @@
+{
+  "basic": {"fullName":"Synthetic Candidate", "email":"candidate@example.test", "phone":"00000000000"},
+  "education": [
+    {"school":"Fixture University A","major":"Synthetic Engineering","startDate":"2020-09","endDate":"2024-06"},
+    {"school":"Fixture University B","major":"Synthetic Research","startDate":"2024-09","endDate":"2026-06"},
+    {"school":"Fixture University C","major":"Synthetic Course","startDate":"2026-07","endDate":"2026-08"}
+  ],
+  "work": [{"company":"Fixture Company A","title":"Synthetic Intern","description":"Anonymous test experience"}],
+  "projects": [{"name":"Fixture Project A","description":"Anonymous test project"}]
+}

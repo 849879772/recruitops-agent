@@ -2,7 +2,9 @@
 from contextvars import ContextVar
 from datetime import date, datetime, time, timezone
 import json
+import os
 from pathlib import Path
+import re
 from urllib.parse import urlsplit
 from uuid import uuid4
 from typing import Literal
@@ -31,6 +33,85 @@ def is_local_ui(request: Request) -> bool:
             and origin.scheme == request.url.scheme
             and origin.netloc == request.url.netloc
             and request.headers.get("sec-fetch-site", "same-origin") == "same-origin")
+
+
+def _desktop_completion_target(settings):
+    instance_id = os.environ.get("RECRUITOPS_DESKTOP_INSTANCE_ID", "")
+    run_id = os.environ.get("RECRUITOPS_DESKTOP_RUN_ID", "")
+    if (not local_ui_request.get() or os.environ.get("RECRUITOPS_ENV") != "desktop-isolated"
+            or not re.fullmatch(r"[0-9a-f]{32}", instance_id)
+            or not re.fullmatch(r"[0-9a-f]{32}", run_id)
+            or os.environ.get("RECRUITOPS_DESKTOP_WRITE_OPTIN") != instance_id
+            or os.environ.get("RECRUITOPS_WRITE_ENABLED") != "true"
+            or settings.write_enabled is not True):
+        raise HTTPException(403, "当前独立实例尚未授权完成配置")
+    try:
+        raw_root = Path(os.environ.get("RECRUITOPS_AGENT_ROOT", ""))
+        if not raw_root.is_absolute() or not raw_root.is_dir():
+            raise ValueError()
+        # Check only fixed ownership/config paths; never enumerate personal data.
+        targets = [raw_root, *raw_root.parents, raw_root / "instance.json",
+                   raw_root / "config", raw_root / "config/runtime-capabilities.json",
+                   raw_root / ".data", raw_root / ".data/settings",
+                   raw_root / ".data/settings/preferences.json",
+                   raw_root / ".data/settings/candidate_profile.yaml"]
+        for path in targets:
+            if path.is_symlink():
+                raise ValueError()
+            if path.exists() and getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
+                raise ValueError()
+        root = raw_root.resolve(strict=True)
+        if Path(settings.agent_root).resolve(strict=True) != root:
+            raise ValueError()
+        record = json.loads((root / "instance.json").read_text(encoding="utf-8"))
+        if (not isinstance(record, dict) or record.get("schema") != 1
+                or record.get("postgres_major") != 16 or record.get("instance_id") != instance_id
+                or record.get("run_id") != run_id or record.get("root") != str(root)
+                or record.get("state") != "ready"):
+            raise ValueError()
+    except (OSError, ValueError, TypeError):
+        raise HTTPException(403, "无法验证当前独立实例的配置目录") from None
+    return root / "config/runtime-capabilities.json", instance_id
+
+
+def validate_desktop_onboarding(settings, profile):
+    """Validate prospective config before writes, without enabling any capability."""
+    target = _desktop_completion_target(settings)
+    matching = getattr(profile, "matching", None)
+    facts = [*(getattr(profile, "skills", None) or []),
+             *(getattr(matching, "project_evidence", None) or []),
+             *(getattr(matching, "supporting_skills", None) or [])]
+    present = lambda value: isinstance(value, str) and bool(value.strip())
+    model_ready = all(present(getattr(settings, key, None)) for key in (
+        "llm_api_key", "model_api_base_url", "model_name"))
+    if (not model_ready or not any(present(fact) for fact in facts)
+            or not any(present(word) for word in (getattr(matching, "title_keywords", None) or []))
+            or not getattr(settings, "offerbiu_industry_groups", None)):
+        raise HTTPException(422, "请先完成模型连接、简历事实、岗位关键词和行业范围配置")
+    if (any(getattr(settings, key, False) for key in (
+            "job_analysis_enabled", "codex_runtime_enabled", "vision_enabled"))
+            and not settings.llm_enabled):
+        raise HTTPException(422, "评分、助理或视觉能力需要先启用模型调用")
+    if getattr(settings, "mail_enabled", False) and not all(
+            present(getattr(settings, key, None)) for key in (
+                "mail_imap_host", "mail_imap_username", "mail_imap_password")):
+        raise HTTPException(422, "启用招聘邮箱前请完成 IMAP 连接配置")
+    if getattr(settings, "mail_sync_on_startup", False) and not settings.mail_enabled:
+        raise HTTPException(422, "启动时同步需要先启用招聘邮箱")
+    return target
+
+
+def complete_desktop_onboarding(settings, profile):
+    """Called only after an explicit completion request and successful config save."""
+    from packages.automation.latest_report import write_json_atomic
+
+    target, instance_id = validate_desktop_onboarding(settings, profile)
+    try:
+        write_json_atomic(target, {"schema": 1, "instance_id": instance_id,
+                                   "first_run_complete": True})
+    except OSError:
+        raise HTTPException(503, "配置已保存，但完成标记写入失败，请重试；当前能力未改变") from None
+    return {"first_run_complete": True, "restart_required": True}
 
 
 def _storage():
@@ -95,7 +176,13 @@ def _row(session, application_id, expected):
         ApplicationSnapshot.id == application_id).with_for_update())
     if row is None:
         raise HTTPException(404, "Application not found")
-    if row.updated_at.replace(tzinfo=timezone.utc) != expected.astimezone(timezone.utc):
+    # PostgreSQL preserves offsets; SQLite returns stored UTC without tzinfo.
+    actual = row.updated_at
+    if actual.tzinfo is None:
+        actual = actual.replace(tzinfo=timezone.utc)
+    if expected.tzinfo is None:
+        expected = expected.replace(tzinfo=timezone.utc)
+    if actual.astimezone(timezone.utc) != expected.astimezone(timezone.utc):
         raise HTTPException(409, "记录已变化，请刷新后重试")
     return row
 
@@ -140,6 +227,50 @@ class ApplicationLink(BaseModel):
         if parsed.fragment.startswith("/job/"):
             raise ValueError("这是岗位详情页，请填写官网的我的投递/投递记录页面地址")
         return value
+
+
+class ManualApplicationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    company_name: str = Field(min_length=1, max_length=255)
+    job_title: str = Field(min_length=1, max_length=512)
+    stage: ApplicationStage = ApplicationStage.APPLIED
+    record_url: str | None = Field(default=None, max_length=2048)
+    note: str = Field(default="", max_length=4000)
+
+    @field_validator("record_url")
+    @classmethod
+    def validate_record_url(cls, value):
+        return ApplicationLink.valid_url(value) if value else None
+
+
+@router.post("/manual")
+def create_manual_application(body: ManualApplicationCreate):
+    identity = sha256((body.company_name + "\n" + body.job_title).encode()).hexdigest()
+    with _storage().write_transaction() as session:
+        if session.bind.dialect.name == "postgresql":
+            from sqlalchemy import text
+            session.execute(text("select pg_advisory_xact_lock(:key)"), {"key": int(identity[:15], 16)})
+        rows = list(session.scalars(select(ApplicationSnapshot).where(
+            ApplicationSnapshot.company_name == body.company_name,
+            ApplicationSnapshot.job_title == body.job_title,
+        )))
+        if len(rows) > 1:
+            raise HTTPException(409, "存在多条相符投递，请先核对已有记录")
+        if rows:
+            return {"application_id": rows[0].id, "created": False, "stage": rows[0].stage}
+        result = "淘汰" if body.stage == ApplicationStage.REJECTED else (
+            "放弃" if body.stage == ApplicationStage.WITHDRAWN else "进行中")
+        row = ApplicationSnapshot(
+            id="manual-" + identity[:24], company_name=body.company_name,
+            job_title=body.job_title, stage=body.stage.value, record_url=body.record_url,
+            note=body.note, source="manual", source_ref=identity,
+            idempotency_key="manual:" + identity,
+            stage_history=[{"stage": body.stage.value, "result": result, "source": "manual",
+                            "note": body.note, "at": datetime.now(timezone.utc).isoformat()}],
+        )
+        session.add(row)
+        session.flush()
+        return {"application_id": row.id, "created": True, "stage": row.stage}
 
 
 @router.patch("/{application_id}/record-url")

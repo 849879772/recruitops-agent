@@ -1,4 +1,5 @@
 import json
+import pytest
 from types import SimpleNamespace
 from datetime import datetime, timezone
 
@@ -78,6 +79,35 @@ def test_model_dji_overrides_wrong_legacy_extraction_and_second_run_skips():
     assert saved.pending_confirmation_reasons == []
     assert process_pending_mail(store, repo, settings, client=client)["processed"] == 0
     assert client.calls == 2
+
+
+@pytest.mark.parametrize("state", ["processed_updated", "processed_unchanged", "processed", "irrelevant", "ignored"])
+def test_completed_mail_resync_preserves_mark_and_never_reanalyzes(state):
+    from packages.recruitment_mail.processing import _eligible
+    store, repo, record, settings, _, _ = setup_case()
+    store.update_processing_status(record.id, state)
+    synced = store.upsert(EmailMessage(
+        identity=MailIdentity(message_id="model-dji"), sender=record.sender,
+        subject=record.subject, body_text=record.body_text,
+        received_at=record.received_at,
+    ), source="imap_readonly")
+    assert synced.id == record.id
+    assert synced.processing_status == state
+    assert not _eligible(synced, "changed-matching-inputs")
+    client = Client([])
+    assert process_pending_mail(store, repo, settings, client=client)["processed"] == 0
+    assert client.calls == 0
+
+
+def test_unfinished_mail_only_retries_when_matching_inputs_change():
+    from packages.recruitment_mail.processing import MAIL_ANALYSIS_VERSION, _eligible
+    record = SimpleNamespace(processing_status="ambiguous_application", content_digest="content",
+                             raw_metadata={"model_processing": {
+                                 "digest": "content", "version": MAIL_ANALYSIS_VERSION,
+                                 "state": "ambiguous_application", "inputs": "original",
+                             }})
+    assert not _eligible(record, "original")
+    assert _eligible(record, "changed")
 
 
 def test_reset_analysis_cache_supports_processing_and_mail_detail():

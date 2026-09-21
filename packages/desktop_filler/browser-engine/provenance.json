@@ -1,0 +1,23 @@
+{
+  "source": "User-provided local resume-filler browser extension",
+  "version": "0.11.5",
+  "local_patches": [
+    "content.js: native-select verification compares committed option values",
+    "content.js: add-only RESUME_PREPARE_SCOPED with cancellation and deadline checks",
+    "content.js: optional host-name fallback exclusion for desktop registration drafts",
+    "content.js: prefer an explicitly branded recruitment title over loose header/navigation text",
+    "content.js: strip a leading welcome-to-join phrase from a company label"
+  ],
+  "imported_files": {
+    "core.js": "377e6a6edbb758e1640e30de3d0e75514a31f3c5a4a6f385a28a35ddd4d83524",
+    "repeater-engine.js": "17e322953e1c61b499c2979a329e4cffaaac41d42dc54075eabaaa8c1b771ac6",
+    "content.js": "9dcede88cf96fcb61254cb006dd72e123ad3452c7e6bc7cdc560869d935bcb11"
+  },
+  "excluded": [
+    "resume-data.js",
+    "default-resume.pdf",
+    "background.js",
+    "sms-bridge",
+    "agent-binding.local.js"
+  ]
+}

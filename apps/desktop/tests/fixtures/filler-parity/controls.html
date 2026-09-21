@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Anonymous filler controls</title>
+<body><form id="application">
+<label>Name <input id="name" name="fullName"></label>
+<label>Summary <textarea id="summary" name="summary"></textarea></label>
+<fieldset><legend>Work mode</legend><label><input type="radio" name="mode" value="remote">Remote</label><label><input type="radio" name="mode" value="onsite">Onsite</label></fieldset>
+<label><input id="consent" type="checkbox">Synthetic consent choice</label>
+<label>Degree <select id="degree"><option value="">Choose</option><option value="bachelor">Bachelor</option></select></label>
+<label>Start date <input id="date" type="date"></label>
+<label>City <input id="city" type="search" list="cities"></label><datalist id="cities"><option value="Fixture City"></datalist>
+<label>Password <input id="password" type="password"></label>
+<label>Verification code <input id="otp" autocomplete="one-time-code"></label>
+<input id="hidden" type="hidden" value="fixture-hidden">
+<label>Disabled <input id="disabled" disabled></label>
+<label>Resume <input id="resume" type="file" accept=".pdf,.doc,.docx"></label>
+<label>Portrait <input id="portrait" type="file" accept="image/*"></label>
+<section id="education"><label>School <input name="school"></label></section>
+<button id="add-education" type="button">Add education</button>
+<button type="submit">Submit application</button>
+</form>
+<script>
+window.fixtureEvents = {submitted: 0, additions: 0, changes: []};
+document.querySelector('form').addEventListener('submit', event => { event.preventDefault(); window.fixtureEvents.submitted++; });
+document.querySelector('form').addEventListener('input', event => window.fixtureEvents.changes.push(event.target.id));
+document.querySelector('#add-education').addEventListener('click', () => {
+  const label = document.createElement('label');
+  label.textContent = 'School ';
+  const input = document.createElement('input'); input.name = 'school';
+  label.append(input); document.querySelector('#education').append(label);
+  window.fixtureEvents.additions++;
+});
+</script></body></html>

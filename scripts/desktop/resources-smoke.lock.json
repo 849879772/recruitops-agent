@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "platform": "windows-x64",
+  "purpose": "Public native component staging smoke only, not a release dependency lock",
+  "components": {
+    "node": {
+      "version": "22.14.0",
+      "source": "https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.zip",
+      "checksum_source": "https://nodejs.org/dist/v22.14.0/SHASUMS256.txt",
+      "sha256": "55b639295920b219bb2acbcfa00f90393a2789095b7323f79475c9f34795f217",
+      "strip_prefix": "node-v22.14.0-win-x64/",
+      "license_file": "LICENSE"
+    },
+    "python_websockets": {
+      "version": "15.0.1",
+      "source": "https://files.pythonhosted.org/packages/98/93/e36c73f78400a65f5e236cd376713c34182e6663f6889cd45a4a04d8f203/websockets-15.0.1-cp311-cp311-win_amd64.whl",
+      "checksum_source": "https://pypi.org/pypi/websockets/15.0.1/json",
+      "sha256": "27ccee0071a0e75d22cb35849b1db43f2ecd3e161041ac1ee9d2352ddf72f065",
+      "strip_prefix": "",
+      "license_file": "websockets-15.0.1.dist-info/LICENSE"
+    }
+  }
+}

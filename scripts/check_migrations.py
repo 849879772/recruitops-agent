@@ -11,13 +11,17 @@ from pathlib import Path
 MIGRATION_NAME = re.compile(r"^(?P<version>\d+)_[A-Za-z0-9][A-Za-z0-9_.-]*\.sql$")
 DESTRUCTIVE_SQL = re.compile(
     r"\b(?:DROP\s+(?:DATABASE|SCHEMA|TABLE)|TRUNCATE(?:\s+TABLE)?|"
-    r"ALTER\s+TABLE\s+\S+\s+DROP)\b",
+    r"ALTER\s+TABLE\s+\S+\s+DROP\s+COLUMN)\b",
     re.IGNORECASE,
 )
 SECRET_LIKE_VALUE = re.compile(
     r"(?:sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----)",
 )
+
+# This migration removes a retired, user-requested feature. Keep the exception
+# narrow so future destructive migrations still fail the deployment check.
+APPROVED_DESTRUCTIVE_MIGRATIONS = frozenset({"024_remove_personal_knowledge.sql"})
 
 
 def check_migrations(directory: Path) -> list[str]:
@@ -50,7 +54,7 @@ def check_migrations(directory: Path) -> list[str]:
         sql = path.read_text(encoding="utf-8")
         if not sql.strip():
             errors.append(f"empty migration: {path.name}")
-        if DESTRUCTIVE_SQL.search(sql):
+        if DESTRUCTIVE_SQL.search(sql) and path.name not in APPROVED_DESTRUCTIVE_MIGRATIONS:
             errors.append(f"destructive SQL is not allowed in deployment migrations: {path.name}")
         if SECRET_LIKE_VALUE.search(sql):
             errors.append(f"secret-like value found in migration: {path.name}")

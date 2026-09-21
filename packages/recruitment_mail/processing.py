@@ -216,6 +216,7 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
             return dict(summary, status="blocked", reason="mail_model_unavailable")
         client = DeepSeekClient(api_key=settings.llm_api_key, model=settings.llm_model,
                                 endpoint=settings.llm_endpoint, max_tokens=4000,
+                                api_style=settings.model_api_style,
                                 timeout=min(settings.llm_timeout_seconds, 25), max_attempts=1)
     limit = max(1, min(limit, 50))
     applications = repository.list_applications()

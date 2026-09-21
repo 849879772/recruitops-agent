@@ -248,6 +248,7 @@ function loadApp(fetch, options = {}) {
     TextEncoder,
     URL,
     AbortController,
+    Date: options.Date || Date,
     Uint8Array,
   };
   vm.runInNewContext(APP_SOURCE, context, { filename: "apps/web/app.js" });
@@ -316,6 +317,62 @@ function turnEventPayload(eventType, eventId, extra = {}) {
   };
 }
 
+test("localizes runtime interruption messages without assuming a configured time limit", () => {
+  const { document, hooks } = loadApp(async () => { throw new Error("Unexpected network"); });
+  hooks.appendMessage("assistant", "Codex turn interrupted after reaching the runtime time limit.");
+  const content = document.getElementById("assistant-messages").textContent;
+  assert.match(content, /达到运行时限/);
+  assert.match(content, /后台任务不会因此自动取消/);
+  assert.doesNotMatch(content, /10 分钟|Codex turn interrupted/);
+});
+
+test("automation explanation uses only the latest recorded execution and forbids rerun", () => {
+  const { hooks } = loadApp(async () => { throw new Error("Unexpected network"); });
+  const prompt = hooks.automationExplanationPrompt({
+    task_label: "Fixture", latest_execution: {id: "execution-test", status: "failed", error: "Offline test"},
+  });
+  assert.match(prompt, /execution-test/);
+  assert.match(prompt, /Offline test/);
+  assert.match(prompt, /不要重新运行任务/);
+});
+
+test("desktop capture draft validates typed fields without invoking any API", () => {
+  const { hooks } = loadApp(async () => { throw new Error("Draft must not persist"); });
+  const normalized = hooks.normalizeApplicationDraft({company_name: "", job_title: " Engineer ", note: "https://example.test/job"});
+  assert.equal(normalized.company_name, "");
+  assert.equal(normalized.job_title, "Engineer");
+  assert.equal(normalized.record_url, "");
+  for (const draft of [null, [], {job_title: ""}, {job_title: {}}, {job_title: "a".repeat(513)},
+    {job_title: "Engineer", token: "secret"}, {job_title: "Engineer", stage: "offer"},
+    {job_title: "Engineer", record_url: "javascript:alert(1)"},
+    {job_title: "Engineer", record_url: "https://user:pass@example.test"},
+    {job_title: "Engineer", record_url: "https://example.test/#/job/123"}]) {
+    assert.throws(() => hooks.normalizeApplicationDraft(draft));
+  }
+});
+
+test("assistant diagnoses missing model, restart, deliberate disable and runtime failure separately", () => {
+  const { hooks, document } = loadApp(async () => { throw new Error("No model or runtime calls"); });
+  hooks.state.codexEnabled = false;
+  hooks.state.codexReady = false;
+  hooks.state.codexHealth = {state: "failed", detail: "Codex App Server missing API key"};
+  for (const [status, expected] of [["missing_model", "尚未配置模型连接"], ["restart_required", "重启桌面"],
+    ["disabled", "高级配置中关闭"], ["configured", "本地助理服务连接失败"]]) {
+    hooks.state.assistantConfiguration = {status};
+    hooks.renderCodexRuntimeStatus();
+    assert.match(hooks.assistantAvailability().message, new RegExp(expected));
+    assert.doesNotMatch(hooks.assistantAvailability().message, /Codex|App Server/);
+    assert.equal(document.getElementById("run-task-button").disabled, true);
+    assert.equal(document.getElementById("assistant-codex-event-strip").hidden, true);
+    assert.equal(document.getElementById("assistant-thread-label").hidden, true);
+  }
+  hooks.state.codexEnabled = true;
+  hooks.state.codexReady = true;
+  hooks.renderCodexRuntimeStatus();
+  assert.equal(hooks.assistantAvailability().status, "ready");
+  assert.equal(document.getElementById("run-task-button").disabled, false);
+});
+
 test("consumes SSE events in wire order and completes the turn", async () => {
   const source = [
     turnEvent(),
@@ -343,6 +400,7 @@ test("consumes SSE events in wire order and completes the turn", async () => {
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { text: "查看岗位" });
   assert.equal(task.answer, "A");
   assert.deepEqual(
     Array.from(task.codex_events, (event) => event.event_type),
@@ -476,24 +534,22 @@ test("clears the composer after a successful message send", async () => {
   const jobId = document.getElementById("assistant-job-id");
   input.value = "查看今日岗位";
   jobId.value = "job-1";
-  document.getElementById("assistant-knowledge-document").value = "a".repeat(32);
-  document.getElementById("assistant-knowledge-enabled").checked = false;
   const task = await hooks.submitAssistantQuestion(input.value, jobId.value);
 
   assert.equal(task.status, "succeeded");
   const streamCall = calls.find((call) => /\/turns\/stream$/.test(call.url));
   assert.ok(streamCall);
   assert.deepEqual(JSON.parse(streamCall.options.body), {
-    text: "查看今日岗位", job_id: "job-1", knowledge_enabled: false, knowledge_document_id: null,
+    text: "查看今日岗位", job_id: "job-1",
   });
   assert.equal(input.value, "");
-  assert.equal(jobId.value, "job-1");
+  assert.equal(jobId.value, "");
   assert.equal(calls.filter(call => call.url === "/api/schedule").length, 1);
   assert.ok(calls.some(call => call.url.startsWith("/api/applications")));
   assert.ok(calls.some(call => call.url.startsWith("/api/recruitment-mails")));
 });
 
-test("deletes a conversation and reloads the server-synced next conversation", async () => {
+test("deletes a conversation without confirmation and reloads the server-synced next conversation", async () => {
   const serverThreads = new Map([
     ["thread-1", { id: "thread-1", preview: "旧会话" }],
     ["thread-2", { id: "thread-2", preview: "保留会话" }],
@@ -522,7 +578,7 @@ test("deletes a conversation and reloads the server-synced next conversation", a
     }
     if (url.endsWith("/resume")) return jsonResponse({ id: "thread-2" });
     throw new Error(`unexpected request: ${url}`);
-  }, { confirm: () => true });
+  }, { confirm: () => { throw new Error("Conversation deletion must not request confirmation"); } });
 
   hooks.state.conversations = [...serverThreads.values()];
   const deleted = await hooks.deleteConversation("thread-1");
@@ -615,15 +671,15 @@ test("renders markdown lists and aligned tables as DOM elements", () => {
   assert.equal(headers[1].style.textAlign, "right");
 });
 
-test("renders both markdown and plain personal knowledge citations as links", () => {
+test("renders ordinary markdown source citations as links", () => {
   const { hooks } = loadApp(async () => { throw new Error("no fetch"); });
   const root = new FakeElement("div");
-  const url = `/?knowledge=${"a".repeat(32)}&page=2&revision=${"b".repeat(32)}`;
-  hooks.renderMarkdown(root, `[原文第2页](${url})\n\n来源：${url}`);
+  const url = "/api/jobs/job-1";
+  hooks.renderMarkdown(root, `[岗位来源](${url})`);
   const links = root.querySelectorAll("a");
-  assert.equal(links.length, 2);
+  assert.equal(links.length, 1);
   assert.equal(links[0].href, `http://localhost${url}`);
-  assert.equal(links[1].textContent, "查看资料原文");
+  assert.equal(links[0].textContent, "岗位来源");
 });
 
 function mailFixture(overrides = {}) {
@@ -776,7 +832,10 @@ function scheduleFixture(overrides = {}) {
 test("renders overdue and due-soon todo groups without calling an undated event all-day", () => {
   const { document, hooks } = loadApp(async () => {
     throw new Error("schedule render should not fetch");
-  });
+  }, { Date: class extends Date {
+    constructor(...args) { super(...(args.length ? args : ["2026-09-15T12:00:00+08:00"])); }
+    static now() { return new Date("2026-09-15T12:00:00+08:00").getTime(); }
+  } });
   hooks.state.allSchedules = [
     scheduleFixture({ id: "overdue", title: "逾期面试", event_date: "2026-09-01" }),
     scheduleFixture({ id: "soon", title: "近期笔试", event_date: "2026-09-16", event_time: null }),
@@ -894,6 +953,51 @@ test("status updates use the local-ui event route and optimistic version", async
     status: "completed",
     expected_updated_at: "2026-09-08T08:00:00Z",
   });
+});
+
+test("schedule refresh updates dashboard and preserves filters while ignoring stale responses", async () => {
+  let resolveOlder;
+  let requests = 0;
+  const date = "2026-09-18";
+  class FixedDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [`${date}T12:00:00`])); }
+  }
+  const { document, hooks } = loadApp(async () => {
+    requests += 1;
+    if (requests === 1) return new Promise(resolve => { resolveOlder = resolve; });
+    return jsonResponse([
+      scheduleFixture({ id: "pending", event_date: date, status: "pending" }),
+      scheduleFixture({ id: "done", event_date: date, status: "completed" }),
+    ]);
+  }, { Date: FixedDate });
+  hooks.state.scheduleView = "calendar";
+  hooks.state.scheduleStatus = "all";
+  hooks.state.scheduleDateFilter = date;
+  const old = hooks.loadFullSchedule();
+  assert.equal(await hooks.loadFullSchedule(), true);
+  resolveOlder(jsonResponse([]));
+  assert.equal(await old, false);
+  assert.equal(hooks.state.allSchedules.length, 2);
+  assert.equal(hooks.state.schedules.length, 1);
+  assert.equal(document.getElementById("metric-schedule").textContent, "1");
+  assert.match(document.getElementById("today-todos").textContent, /1 项待看/);
+  assert.equal(hooks.state.scheduleView, "calendar");
+  assert.equal(hooks.state.scheduleStatus, "all");
+  assert.equal(hooks.state.scheduleDateFilter, date);
+});
+
+test("application refresh ignores older responses after a manual update", async () => {
+  let resolveOlder;
+  let requests = 0;
+  const { hooks } = loadApp(async () => {
+    if (++requests === 1) return new Promise(resolve => { resolveOlder = resolve; });
+    return jsonResponse({ items: [{id: "new", company_name: "Fixture", job_title: "Engineer", stage: "written"}], total: 1 });
+  });
+  const old = hooks.loadApplications();
+  assert.equal(await hooks.loadApplications(), true);
+  resolveOlder(jsonResponse({ items: [], total: 0 }));
+  assert.equal(await old, false);
+  assert.equal(hooks.state.applications[0].stage, "written");
 });
 
 test("manual schedule payload permits an empty job title and no application", () => {

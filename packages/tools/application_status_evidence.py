@@ -9,11 +9,13 @@ from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from packages.browser_bridge import BrowserBridgeStore, OperationName, OperationStatus, normalize_status
 from packages.storage import ApplicationSnapshot
+from packages.domain.urls import normalize_http_page_url
 from packages.tools.browser_status_update import (
     BrowserStatusUpdateInput,
     BrowserStatusUpdateResponse,
@@ -87,6 +89,46 @@ def has_unmapped_status(card: Mapping[str, object]) -> bool:
     )
 
 
+_DECISIVE_STATUS_PATTERN = re.compile(
+    r"(?:笔试|机试|编程测试|在线考试|面试|一面|二面|三面|终面|"
+    r"hr\s*面|终试|洽谈|offer|录用|拟录用|签约|待入职|已入职|"
+    r"淘汰|不合适|未通过|暂不匹配|不匹配|流程终止|流程结束|"
+    r"申请终止|拒绝|已挂|撤回)",
+    re.I,
+)
+
+
+def supports_no_newer_status(card: Mapping[str, object]) -> bool:
+    """Whether one bound card only confirms that the application still exists.
+
+    Generic labels such as screening, processing, or testing do not outrank a
+    previously confirmed written/interview stage. Explicit forward or terminal
+    evidence must still go through the normal verifier.
+    """
+
+    signals = card.get("signals") or {}
+    if isinstance(signals, Mapping) and signals.get("conflicting_statuses"):
+        return False
+    if _normalise_status(card.get("status")):
+        return False
+    if not has_unmapped_status(card):
+        return True
+    labels = [str(card.get("label") or "")]
+    raw_labels = card.get("raw_status_labels")
+    if isinstance(raw_labels, list):
+        labels.extend(str(value or "") for value in raw_labels)
+    status_text = " ".join(value for value in labels if value.strip())
+    if not status_text:
+        context = str(card.get("context") or card.get("evidence") or "")
+        match = re.search(
+            r"(?:当前进度|申请进度|应聘进度|当前状态|状态|\bstatus)\s*[:：]\s*([^\n]{1,120})",
+            context,
+            re.I,
+        )
+        status_text = match.group(1) if match else ""
+    return not bool(_DECISIVE_STATUS_PATTERN.search(status_text))
+
+
 def _error(
     code: VerificationError,
     message: str,
@@ -124,8 +166,9 @@ def _structured_observation_conflicts(
         card_status = _normalise_status(card.get("status"))
         if card_status and card_status != observed_status:
             return True
-        # An unlabelled submission card can only support applied, never a later stage.
-        if observed_status == "applied" and not card_status and not has_unmapped_status(card) and evidence and observed_label:
+        # A submission card with no decisive later outcome only supports the
+        # applied baseline; browser_status_update preserves any higher stored stage.
+        if observed_status == "applied" and not card_status and supports_no_newer_status(card) and evidence and observed_label:
             if evidence in context and observed_label in context:
                 entries = result.get("entries") or []
                 other_titles = [str(item.get("title")) for item in records if item is not card]
@@ -216,6 +259,30 @@ def verify_application_status_evidence(
                       "Status verification failed internally; do not retry unchanged evidence. Check server logs using the observation operation ID.")
 
 
+def _bound_observation_target(operation, command):
+    """Keep the captured URL in the ledger while resolving its owned request target."""
+    requested = normalize_http_page_url(str(command.get("page_url") or command.get("application_url") or ""))
+    observed = normalize_http_page_url(str(operation.result.get("page_url") or ""))
+    if not requested or not observed:
+        return None
+    if requested == observed:
+        return requested
+    binding = operation.result.get("navigation_binding")
+    page = operation.result.get("page")
+    if (not str(operation.device_id or "").startswith("desktop-")
+            or not isinstance(binding, dict)
+            or binding.get("source") != "desktop_owned_navigation_v1"
+            or normalize_http_page_url(str(binding.get("requested_page_url") or "")) != requested
+            or normalize_http_page_url(str(binding.get("observed_page_url") or "")) != observed
+            or not isinstance(page, dict)
+            or normalize_http_page_url(str(page.get("page_url") or "")) != observed):
+        return None
+    target, final = urlsplit(requested), urlsplit(observed)
+    if (target.scheme, target.netloc) != (final.scheme, final.netloc):
+        return None
+    return requested
+
+
 def _verify_application_status_evidence(
     request: VerifyApplicationStatusEvidenceInput,
     store: BrowserBridgeStore | None,
@@ -246,6 +313,10 @@ def _verify_application_status_evidence(
             VerificationError.OBSERVATION_BINDING_MISMATCH,
             "The observation belongs to another application.",
         )
+    page_url = _bound_observation_target(operation, command)
+    if page_url is None:
+        return _error(VerificationError.OBSERVATION_BINDING_MISMATCH,
+                      "The captured page is not bound to the requested application page.")
     dom_result = {key: value for key, value in operation.result.items() if key != "vision"}
     evidence_haystack = json.dumps(dom_result, ensure_ascii=False, sort_keys=True)
     visual_reading = None
@@ -275,9 +346,14 @@ def _verify_application_status_evidence(
             application = session.get(ApplicationSnapshot, request.application_id)
             target_title = application.job_title if application is not None else ""
             current_stage = application.stage if application is not None else ""
+            record_url = normalize_http_page_url(application.record_url or "") if application is not None else None
     except Exception:
         target_title = ""
         current_stage = ""
+        record_url = None
+    if record_url != page_url:
+        return _error(VerificationError.OBSERVATION_BINDING_MISMATCH,
+                      "The application page changed after this observation was requested.")
     confidence = request.confidence
     if visual_reading is not None:
         if not target_title or not _title_matches(target_title, request.evidence):
@@ -289,10 +365,14 @@ def _verify_application_status_evidence(
         if not isinstance(visual_confidence, (int, float)) or not 0 <= visual_confidence <= 1:
             return _error(VerificationError.VISUAL_EVIDENCE_UNVERIFIED, "Invalid visual confidence.")
         confidence = min(confidence, visual_confidence)
+    observed_status = request.observed_status
+    deterministic_label_status = _normalise_status(request.observed_label)
+    if deterministic_label_status is not None:
+        observed_status = deterministic_label_status
     if _structured_observation_conflicts(
         operation.result,
         request.application_id,
-        request.observed_status,
+        observed_status,
         target_title=target_title,
         observed_label=request.observed_label,
         evidence=request.evidence,
@@ -307,17 +387,17 @@ def _verify_application_status_evidence(
             VerificationError.OBSERVATION_BINDING_MISMATCH,
             "The persisted observation has no capture timestamp.",
         )
-    page_url = str(operation.result.get("page_url") or command.get("page_url") or "")
     # Confirming an existing submission is a read, not an automatic status write.
     # Require a unique persisted target card and quotations scoped to that card.
     cards = [card for card in operation.result.get("application_records", [])
              if isinstance(card, Mapping) and "".join(str(card.get("title") or "").split())
              == "".join(target_title.split())]
-    if visual_reading is None and current_stage == request.observed_status == "applied" and len(cards) == 1:
+    if visual_reading is None and observed_status == "applied" and len(cards) == 1:
         card = cards[0]
         context = str(card.get("context") or card.get("evidence") or "")
-        if (not card.get("status") and not has_unmapped_status(card)
-                and not (card.get("signals") or {}).get("conflicting_statuses")
+        card_status = _normalise_status(card.get("status"))
+        baseline_card = card_status == "applied" or supports_no_newer_status(card)
+        if (current_stage == "applied" and baseline_card
                 and request.evidence in context and request.observed_label in context):
             return VerifyApplicationStatusEvidenceResponse(
                 success=True, status="unchanged", reason_code="no_newer_status_observed", read_only=True,
@@ -337,7 +417,7 @@ def _verify_application_status_evidence(
                     "entries": [
                         {
                             "application_id": request.application_id,
-                            "status": request.observed_status,
+                            "status": observed_status,
                             "label": request.observed_label,
                             "context": request.evidence,
                             "evidence": request.evidence,
@@ -363,4 +443,5 @@ __all__ = [
     "VerifyApplicationStatusEvidenceInput",
     "VerifyApplicationStatusEvidenceResponse",
     "verify_application_status_evidence",
+    "supports_no_newer_status",
 ]

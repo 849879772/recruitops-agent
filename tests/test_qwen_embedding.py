@@ -7,32 +7,6 @@ from packages.rag.embeddings import OpenAICompatibleEmbeddingProvider, QWEN_QUER
 from services.embedding.server import create_app
 
 
-def test_personal_embedding_override_preserves_legacy_configuration(monkeypatch):
-    from packages.config import Settings
-    from packages import personal_knowledge as knowledge
-    settings = Settings(_env_file=None, embedding_endpoint="http://legacy.test/embeddings",
-                        embedding_model="legacy", embedding_api_key="legacy-key",
-                        knowledge_embedding_endpoint="http://qwen.test/v1/embeddings",
-                        knowledge_embedding_api_key="local-key")
-    monkeypatch.setattr(knowledge, "get_settings", lambda: settings)
-    monkeypatch.setattr(knowledge.Storage, "from_url", lambda *_: object())
-    knowledge.get_knowledge_service.cache_clear()
-    try:
-        provider = knowledge.get_knowledge_service().provider
-        assert provider.endpoint == settings.knowledge_embedding_endpoint
-        assert provider.api_key == "local-key"
-        assert provider.query_prefix == QWEN_QUERY_PREFIX
-        assert settings.embedding_endpoint == "http://legacy.test/embeddings"
-        settings.knowledge_embedding_endpoint = ""
-        knowledge.get_knowledge_service.cache_clear()
-        fallback = knowledge.get_knowledge_service().provider
-        assert fallback.model == "legacy"
-        assert fallback.api_key == "legacy-key"
-        assert fallback.query_prefix == ""
-    finally:
-        knowledge.get_knowledge_service.cache_clear()
-
-
 class Engine:
     def __init__(self):
         self.calls = []

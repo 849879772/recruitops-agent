@@ -260,14 +260,16 @@ class DefaultPublicSearchProvider:
         return []
 
 
-def build_company_queries(company_name: str) -> tuple[str, ...]:
+def build_company_queries(company_name: str, *, cohort_year: int = 2027) -> tuple[str, ...]:
+    if isinstance(cohort_year, bool) or not isinstance(cohort_year, int) or not 1 <= cohort_year <= 9999:
+        raise ValueError("cohort_year must be an integer from 1 to 9999")
     normalized = re.sub(r"\s+", " ", company_name).strip()
     compact = re.sub(r"[\s·・()（）\-_/]+", "", normalized).casefold()
     stem = _COMPANY_SUFFIXES.sub("", compact)
     search_name = stem if len(stem) >= 3 else normalized
     return (
         f"{normalized} 校园招聘 官网",
-        f"{search_name} 2027 校园招聘",
+        f"{search_name} {cohort_year} 校园招聘",
     )
 
 
@@ -345,7 +347,7 @@ def observe_public_entry_identity(
     )
 
 
-def rank_entry_candidate(company_name: str, hit: PublicSearchHit) -> RankedEntryCandidate | None:
+def rank_entry_candidate(company_name: str, hit: PublicSearchHit, *, cohort_year: int = 2027) -> RankedEntryCandidate | None:
     url = normalize_search_result_url(hit.url)
     if not url:
         return None
@@ -366,7 +368,10 @@ def rank_entry_candidate(company_name: str, hit: PublicSearchHit) -> RankedEntry
     if not _RECRUITMENT_RE.search(haystack):
         return None
     score = 50
-    if _CURRENT_COHORT_RE.search(haystack):
+    cohort_pattern = _CURRENT_COHORT_RE if cohort_year == 2027 else re.compile(
+        rf"(?<!\d){cohort_year}(?!\d)|(?<!\d){cohort_year % 100:02d}届"
+    )
+    if cohort_pattern.search(haystack):
         score += 15
     if re.search(r"官网|官方", haystack):
         score += 10
@@ -398,12 +403,13 @@ def discover_company_entry_candidates(
     timeout_seconds: float = 30.0,
     max_queries: int = MAX_QUERIES_PER_COMPANY,
     max_candidates: int = MAX_CANDIDATES_PER_COMPANY,
+    cohort_year: int = 2027,
 ) -> tuple[list[str], list[RankedEntryCandidate]]:
     """Return bounded, ranked candidate URLs with their search provenance."""
 
     provider = provider or DefaultPublicSearchProvider()
     deadline = perf_counter() + max(1.0, timeout_seconds)
-    queries = list(build_company_queries(company_name))[:max(1, min(max_queries, MAX_QUERIES_PER_COMPANY))]
+    queries = list(build_company_queries(company_name, cohort_year=cohort_year))[:max(1, min(max_queries, MAX_QUERIES_PER_COMPANY))]
     ranked: dict[str, RankedEntryCandidate] = {}
     attempted: list[str] = []
     for query in queries:
@@ -412,7 +418,7 @@ def discover_company_entry_candidates(
             break
         attempted.append(query)
         for hit in provider.search(query, remaining):
-            candidate = rank_entry_candidate(company_name, hit)
+            candidate = rank_entry_candidate(company_name, hit, cohort_year=cohort_year)
             if candidate is None:
                 continue
             current = ranked.get(candidate.hit.url)

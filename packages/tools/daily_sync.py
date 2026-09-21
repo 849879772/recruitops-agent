@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -187,14 +186,6 @@ def get_daily_recruitment_sync_status(
     runner: OperationalTaskRunner,
 ) -> DailyRecruitmentSyncStatusResponse:
     payload = runner.background_status(request.run_id)
-    deadline = time.monotonic() + max(0.0, request.timeout_ms / 1_000 - 0.25)
-    while (
-        payload is not None
-        and payload.get("run_status") in {"accepted", "running"}
-        and time.monotonic() < deadline
-    ):
-        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-        payload = runner.background_status(request.run_id)
     if payload is None:
         return DailyRecruitmentSyncStatusResponse(
             tool_name="daily_recruitment_sync_status",

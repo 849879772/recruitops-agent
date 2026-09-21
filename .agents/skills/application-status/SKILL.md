@@ -1,9 +1,25 @@
 ---
 name: application-status
-description: Verify and update a recorded application from page evidence through the connected Edge browser bridge.
+description: Verify and update recorded applications from page evidence through the connected desktop or Edge browser bridge.
 ---
 
 # Application Status
+
+## Batch Review
+
+For "复核官网投递状态" or all current applications, call
+`batch_observe_application_status(all_non_terminal=true)` directly. The service selects
+all saved applications except rejected/withdrawn; do not query or infer IDs first.
+Omit `timeout_ms`, or set it to at most `120000`. The complete review uses bounded waves,
+not a longer single call. Continue using only the returned `run_id` while `remaining_count`
+is positive; do not start a new full review after a timeout. A completed checkpoint is not
+the same as successful verification: report updated/unchanged separately from errors.
+`processed_count` counts attempted unique records, including retryable failures; use
+`completed_count` for completed records and `remaining_count` for those still needing work.
+Never subtract attempted records from the scope to invent a remaining count.
+Use the individual workflow below only for a specific application or justified follow-up.
+
+## Individual Review
 
 0. If the requested status change comes from a persisted recruitment email, stop this page workflow
    and follow the `recruitment-mail` skill. Authenticated, uniquely bound explicit mail evidence goes

@@ -155,6 +155,20 @@ class CodexSupervisor:
                             "Codex initialize handshake timed out"
                         ) from exc
                     await client.notify("initialized")
+                    if self.config.skill_roots:
+                        remaining = max(0.0, start_deadline - asyncio.get_running_loop().time())
+                        try:
+                            await client.request(
+                                "skills/extraRoots/set",
+                                {"extraRoots": [
+                                    str(root.resolve()) for root in self.config.skill_roots
+                                ]},
+                                timeout=remaining,
+                            )
+                        except asyncio.TimeoutError as exc:
+                            raise SupervisorStartupError(
+                                "Codex bundled skills registration timed out"
+                            ) from exc
                 self._state = SupervisorState.RUNNING
                 self._server_request_task = asyncio.create_task(
                     self._handle_server_requests(client),

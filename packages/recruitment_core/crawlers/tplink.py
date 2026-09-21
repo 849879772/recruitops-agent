@@ -32,6 +32,9 @@ class TPLinkCrawler(BaseCrawler):
         self.advertised_total = None
         self.has_more = False
         self.fetch_failed = False
+        self.crawl_error_code = ""
+        self.failure_reason = ""
+        self.pagination_diagnostics = []
         self.resolved_source_url = HOME
         self.pagination_evidence = []
 
@@ -144,5 +147,8 @@ class TPLinkCrawler(BaseCrawler):
                     browser.close()
         except (Error, ValueError) as exc:
             self.fetch_failed = True
-            self.pagination_termination_reason = f"tplink_fetch_failed:{type(exc).__name__}:{str(exc)[:240]}"
+            self.crawl_error_code = "tplink_fetch_failed"
+            self.pagination_termination_reason = self.crawl_error_code
+            self.failure_reason = f"{type(exc).__name__}: {exc}"
+            self.pagination_diagnostics = [{"reason": self.failure_reason}]
             return []

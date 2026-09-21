@@ -46,6 +46,8 @@ class CandidateScoringContext(ProfileModel):
     job_type: str | None = None
     direction_policy: Literal["parallel", "priority"] = "parallel"
     target_directions: list[str] = Field(default_factory=list)
+    title_keywords: list[str] = Field(default_factory=list)
+    excluded_title_keywords: list[str] = Field(default_factory=list)
     evidence: list[CandidateEvidence] = Field(default_factory=list)
     learning_targets: list[str] = Field(default_factory=list)
     excluded_unverified_skills: list[str] = Field(default_factory=list)

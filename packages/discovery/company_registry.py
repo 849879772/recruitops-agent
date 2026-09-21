@@ -155,6 +155,30 @@ def _optional_text(value: object, field: str, maximum: int) -> str:
     return text
 
 
+def _bounded_attempt_reason(detail: str) -> str:
+    """Keep the input boundary, but never abort a batch for verbose diagnostics."""
+    marker = "\n[truncated: reason exceeds 10000 characters]"
+    return detail if len(detail) <= 10000 else detail[:10000 - len(marker)] + marker
+
+
+def _attempt_reason(reason_code: object, reason: object, status: str) -> tuple[str, str]:
+    """Separate legacy exception codes from bounded, explicitly truncated details."""
+    code = str(reason_code or "").strip()
+    detail = str(reason or "").strip()
+    failed = status in {"failed", "unusable"}
+    if (not code or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", code)
+            or (not failed and len(code) <= 128)):
+        return code, _bounded_attempt_reason(detail)
+    prefix = code.partition(":")[0]
+    normalized = (
+        prefix if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", prefix)
+        else "source_attempt_failed" if failed else "source_attempt_note"
+    )
+    if code not in detail:
+        detail = f"{detail}\n{code}" if detail else code
+    return normalized, _bounded_attempt_reason(detail)
+
+
 def _redact_url_text(value: object, field: str) -> str:
     """Keep URL evidence without retaining credentials or secret query values."""
 
@@ -404,8 +428,7 @@ class CompanySourceRegistry:
         attempted_url = _redact_url_text(attempted_url, "attempted_url")
         final_url = _redact_url_text(final_url, "final_url")
         failure_stage = _optional_text(failure_stage, "failure_stage", 128)
-        reason_code = _optional_text(reason_code, "reason_code", 128)
-        reason = _optional_text(reason, "reason", 10000)
+        reason_code, reason = _attempt_reason(reason_code, reason, status)
         job_count = _validate_count(job_count, "job_count")
         jd_pending_count = _validate_count(jd_pending_count, "jd_pending_count")
         now = utc_now()

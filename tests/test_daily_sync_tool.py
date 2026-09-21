@@ -13,6 +13,67 @@ from pydantic import ValidationError
 import pytest
 
 
+def test_background_flow_returns_before_handler_finishes_without_a_schedule(tmp_path):
+    from threading import Event
+
+    started, release = Event(), Event()
+    calls = []
+
+    def handler(context):
+        calls.append(context)
+        started.set()
+        assert release.wait(5)
+        return {"status": "completed", "fixture": True}
+
+    runner = OperationalTaskRunner(LocalTaskScheduler(lock_path=tmp_path / "task.lock"),
+        {TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value: handler})
+    try:
+        response = run_daily_recruitment_sync(DailyRecruitmentSyncInput(mode="full"), runner)
+        assert started.wait(2)
+        assert response.data.run_status in {"accepted", "running"}
+        assert runner.background_status(response.data.run_id)["run_status"] == "running"
+    finally:
+        release.set()
+    for _ in range(100):
+        status = get_daily_recruitment_sync_status(
+            DailyRecruitmentSyncStatusInput(run_id=response.data.run_id, timeout_ms=5000), runner)
+        if status.data.run_status == "success":
+            break
+        time.sleep(0.01)
+    assert status.data.run_status == "success"
+    assert status.data.result["fixture"] is True
+    assert len(calls) == 1
+    assert calls[0].metadata["details"]["mode"] == "full"
+
+
+def test_daily_sync_status_is_an_immediate_snapshot(tmp_path) -> None:
+    class RunningStore:
+        def get_task_run(self, run_id):
+            return {
+                "run_id": run_id,
+                "task_id": TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value,
+                "run_status": "running",
+                "current_step": "companies:1/10",
+                "step_count": 1,
+                "error": None,
+            }
+
+    runner = OperationalTaskRunner(
+        LocalTaskScheduler(lock_path=tmp_path / "task.lock"),
+        {},
+        state_store=RunningStore(),
+    )
+    started = time.monotonic()
+    response = get_daily_recruitment_sync_status(
+        DailyRecruitmentSyncStatusInput(run_id="running-snapshot", timeout_ms=120_000),
+        runner,
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert response.data.run_status == "running"
+    assert response.data.current_step == "companies:1/10"
+
+
 def test_daily_sync_tool_has_no_arbitrary_task_selector(tmp_path) -> None:
     runner = OperationalTaskRunner(
         LocalTaskScheduler(lock_path=tmp_path / "task.lock"),

@@ -12,9 +12,13 @@ from uuid import uuid4
 from pydantic import Field, field_validator, model_validator
 
 from packages.scheduler.models import TaskCallable
-from packages.scheduler.runner import LocalTaskScheduler
+from packages.scheduler.runner import LocalTaskScheduler, _business_failure
 from packages.scheduler.tasks import TaskType
-from packages.automation import AutomationStore
+from packages.automation import (
+    AutomationStore,
+    automation_blocked_message,
+    automation_blocked_reason,
+)
 
 from .typed import EvidenceSource, ToolErrorCode, ToolInput, ToolModel, ToolResponse, ToolStatus
 
@@ -168,7 +172,7 @@ class OperationalTaskRunner:
             except Exception as exc:
                 payload = {
                     **initial,
-                    "run_status": "failure",
+                    "run_status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             finally:
@@ -208,15 +212,18 @@ class OperationalTaskRunner:
         if result is None:
             if persisted is None:
                 return None
+            state = persisted.get("state")
+            value = state.get("result") if isinstance(state, Mapping) else None
+            business_error = _business_failure(value)
             return {
                 "task_id": persisted.get("task_id"),
                 "run_id": persisted.get("run_id", run_id),
-                "run_status": persisted.get("run_status", "unknown"),
+                "run_status": "failed" if business_error else persisted.get("run_status", "unknown"),
                 "dry_run": False,
                 "attempts": 0,
                 "agent_write_enabled": True,
-                "result": None,
-                "error": persisted.get("error"),
+                "result": value,
+                "error": business_error or persisted.get("error"),
                 "current_step": persisted.get("current_step"),
                 "step_count": persisted.get("step_count", 0),
             }
@@ -341,6 +348,8 @@ class AutomationScheduleData(ToolModel):
     timezone: str
     active: bool
     activation_status: str
+    runnable: bool = True
+    blocked_reason: str | None = None
     target_kind: str
     target_id: str | None = None
     target_label: str | None = None
@@ -365,6 +374,8 @@ class AutomationScheduleListInput(ToolInput):
 class AutomationScheduleListData(ToolModel):
     schedules: list[AutomationScheduleData]
     total: int = Field(ge=0)
+    engine_configured: bool = True
+    engine_blocked_reason: str | None = None
 
 
 class AutomationScheduleListResponse(ToolResponse[AutomationScheduleListData]):
@@ -413,7 +424,12 @@ def plan_automation(
     )
 
 
-def _schedule_data(row: Any, execution: Any | None = None) -> AutomationScheduleData:
+def _schedule_data(
+    row: Any,
+    execution: Any | None = None,
+    *,
+    blocked_reason: str | None = None,
+) -> AutomationScheduleData:
     return AutomationScheduleData(
         schedule_id=row.id,
         task_id=row.task_id,
@@ -423,6 +439,8 @@ def _schedule_data(row: Any, execution: Any | None = None) -> AutomationSchedule
         timezone=row.timezone_name,
         active=bool(row.active),
         activation_status="active" if row.active else "disabled",
+        runnable=bool(row.active and blocked_reason is None),
+        blocked_reason=blocked_reason,
         target_kind=row.target_kind,
         target_id=row.target_id,
         target_label=row.target_label,
@@ -437,14 +455,38 @@ def _schedule_data(row: Any, execution: Any | None = None) -> AutomationSchedule
     )
 
 
+def _fresh_automation_settings():
+    from packages.config import get_settings
+
+    get_settings.cache_clear()
+    return get_settings()
+
+
 def activate_automation(
     request: AutomationScheduleInput,
     scheduler: LocalTaskScheduler,
     store: AutomationStore,
     *,
     target_label: str | None = None,
+    runtime_settings: Any | None = None,
 ) -> AutomationScheduleResponse:
     started = perf_counter()
+    settings = runtime_settings or _fresh_automation_settings()
+    blocked = automation_blocked_reason(request.task_id, settings)
+    if blocked is not None:
+        return AutomationScheduleResponse(
+            tool_name="automation_schedule",
+            status=ToolStatus.FAILURE,
+            success=False,
+            evidence=[EvidenceSource(
+                source="agent_automation_configuration",
+                source_ref=blocked,
+            )],
+            error_code=ToolErrorCode.INVALID_INPUT,
+            error_message="计划未创建：" + automation_blocked_message(blocked),
+            timeout_ms=request.timeout_ms,
+            elapsed_ms=max(0, int((perf_counter() - started) * 1_000)),
+        )
     definition = scheduler.task_definition(request.task_id)
     hour, minute = (int(part) for part in request.start_time.split(":"))
     row = store.upsert_daily(
@@ -475,8 +517,12 @@ def activate_automation(
 def list_automations(
     request: AutomationScheduleListInput,
     store: AutomationStore,
+    *,
+    runtime_settings: Any | None = None,
 ) -> AutomationScheduleListResponse:
     started = perf_counter()
+    settings = runtime_settings or _fresh_automation_settings()
+    engine_blocked = automation_blocked_reason(None, settings)
     rows = store.list(active_only=request.active_only)
     return AutomationScheduleListResponse(
         tool_name="automation_schedule_list",
@@ -487,10 +533,22 @@ def list_automations(
                 _schedule_data(
                     row,
                     (store.executions(row.id, limit=1) or [None])[0],
+                    blocked_reason=(
+                        automation_blocked_message(reason)
+                        if row.active
+                        and (reason := automation_blocked_reason(row.task_id, settings)) is not None
+                        else None
+                    ),
                 )
                 for row in rows
             ],
             total=len(rows),
+            engine_configured=engine_blocked is None,
+            engine_blocked_reason=(
+                automation_blocked_message(engine_blocked)
+                if engine_blocked is not None
+                else None
+            ),
         ),
         evidence=[EvidenceSource(source="agent_automation_store", source_ref="schedules")],
         timeout_ms=request.timeout_ms,

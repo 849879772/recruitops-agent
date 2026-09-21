@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 from apps.api.codex_bff import CodexBffService
 from packages.automation import AutomationRunResult, AutomationStore, ClaimedAutomation
@@ -21,54 +21,74 @@ class CodexAutomationExecutor:
         *,
         timeout_seconds: float = 600.0,
         reconnect_grace_seconds: float = 90.0,
+        settings: Any | None = None,
+        task_handlers: Mapping[str, Any] | None = None,
     ) -> None:
         self.service = service
         self.store = store
         self.timeout_seconds = max(10.0, timeout_seconds)
         self.reconnect_grace_seconds = max(0.01, reconnect_grace_seconds)
+        # Injected dependencies exist so tests can run the same dispatch path
+        # against an isolated store.  When both are omitted the executor keeps
+        # its production behaviour of resolving the global configuration.
+        self._settings = settings
+        self._task_handlers = task_handlers
+
+    def _runtime_handlers(self, settings: Any) -> Mapping[str, Any]:
+        if self._task_handlers is not None:
+            return self._task_handlers
+        from packages.scheduler.runtime import build_runtime_task_handlers
+
+        return build_runtime_task_handlers(settings=settings)
 
     async def __call__(self, task: ClaimedAutomation) -> AutomationRunResult:
         if task.task_id == "daily_recruitment_intelligence":
             from packages.config import get_settings
             from packages.scheduler.models import TaskContext
-            from packages.scheduler.runtime import build_runtime_task_handlers
             from packages.automation.latest_report import report_path, summarize, write_json_atomic
 
-            settings = get_settings()
+            settings = self._settings or get_settings()
+            if not settings.write_enabled:
+                return AutomationRunResult(status="blocked", error="write_disabled")
+            if task.target_kind not in {"all", "company", "source"} or (
+                task.target_kind in {"company", "source"} and not task.target_id
+            ):
+                return AutomationRunResult(status="blocked", error="invalid_sync_scope")
             context = TaskContext(task_id=task.task_id, task_label=task.task_label,
                 scheduled_for=task.scheduled_for, run_id=task.execution_id, attempt=1,
                 read_only=False, write_enabled=settings.write_enabled,
                 metadata={"details": {"mode": "full", "company_ids": [task.target_id]
-                    if task.target_kind == "company" and task.target_id else []}})
-            handler = build_runtime_task_handlers(settings=settings)[task.task_id]
+                    if task.target_kind == "company" and task.target_id else [],
+                    "source_record_ids": [task.target_id]
+                    if task.target_kind == "source" and task.target_id else []}})
             # Crawl/score stages retain their own bounded requests and checkpoints.
             # A chat-turn time limit must not decide the outcome of this pipeline.
             try:
+                handler = self._runtime_handlers(settings)[task.task_id]
                 result = await asyncio.to_thread(handler, context)
             except Exception as exc:
-                write_json_atomic(report_path(settings), {
-                    "execution_id": task.execution_id, "status": "failed",
-                    "error": f"流水线执行异常：{type(exc).__name__}",
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                })
-                raise
-            report = summarize(result, task.execution_id)
+                # Return a redacted failure; rethrowing lets the worker persist
+                # the original provider exception, including its credentials.
+                result = {
+                    "status": "failed",
+                    "error": f"流水线执行异常：{type(exc).__name__}: {exc}",
+                }
+            report = summarize(result, task.execution_id, settings=settings)
             write_json_atomic(report_path(settings), report)
             return AutomationRunResult(
                 status="succeeded" if result.get("status") == "completed" else "failed",
                 summary="全量任务已结束；部分公司或评分未完成" if report["status"] == "partial" else
-                    ("全量任务已完成" if report["status"] == "succeeded" else "全量任务执行失败"),
+                    ("全量任务已完成" if report["status"] == "succeeded" else f"全量任务执行失败：{report['error']}"),
                 error=report.get("error"),
             )
         if task.task_id == "crawler_health":
             from packages.config import get_settings
             from packages.scheduler.models import TaskContext
-            from packages.scheduler.runtime import build_runtime_task_handlers
 
+            settings = self._settings or get_settings()
             context = TaskContext(task_id=task.task_id, task_label=task.task_label,
                                   scheduled_for=task.scheduled_for, run_id=task.execution_id, attempt=1)
-            settings = get_settings()
-            handler = build_runtime_task_handlers(settings=settings)[task.task_id]
+            handler = self._runtime_handlers(settings)[task.task_id]
             result = await asyncio.to_thread(handler, context)
             report_path = Path(settings.agent_root) / ".data" / "scheduler" / f"{task.execution_id}.json"
             report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,9 +265,17 @@ class CodexAutomationExecutor:
                 if task.target_id
                 else "复核当前所有未终态投递记录"
             )
+            selection = (
+                "按指定 application_id 调用 batch_observe_application_status。"
+                if task.target_id else
+                "直接调用 batch_observe_application_status(all_non_terminal=true)，"
+                "不要先查询全部记录。若 remaining_count>0，只传返回的 run_id 继续调用，"
+                "直到 scope_complete=true；按 scope_total 报告范围，不得再减 excluded_terminal，"
+                "累计计数不相加。"
+            )
             return (
                 "这是本地持久化计划触发的投递进度复核，不是用户咨询。"
-                f"{scope}。查询数据库记录后直接调用 batch_observe_application_status，"
+                f"{scope}。{selection}"
                 "由工具完成页面观测和状态校验；include_vision=false；不要读取本地技能文件或调用未开放的连接工具。"
                 "本定时任务禁止调用视觉分析，"
                 "即使 DOM 证据不足也只归类为无法确认或需要登录或验证，不做第二次视觉观察；"

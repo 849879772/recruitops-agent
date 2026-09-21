@@ -24,7 +24,6 @@ try {
     $logRoot = Join-Path $root '.data\logs'
     New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
     $logPath = Join-Path $logRoot 'desktop-start.log'
-    & (Join-Path $PSScriptRoot 'start_embedding.ps1')
     if (-not (Test-WorkbenchReady)) {
         & (Join-Path $PSScriptRoot 'start_docker.ps1') -WaitSeconds 180 *>&1 |
             Out-File -LiteralPath $logPath -Encoding utf8

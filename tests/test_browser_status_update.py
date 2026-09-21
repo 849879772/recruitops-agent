@@ -176,7 +176,7 @@ def test_url_or_ambiguous_evidence_is_state_unclear_without_write(tmp_path) -> N
     assert all(not audit.success for audit in _audit_rows(storage))
 
 
-def test_low_confidence_and_regression_are_blocked_but_rejection_is_synced(tmp_path) -> None:
+def test_low_confidence_is_blocked_regression_retains_history_and_rejection_is_synced(tmp_path) -> None:
     storage = _storage(tmp_path, [{"id": "24", "title": "软件开发工程师", "stage": "written"}])
 
     low_confidence = browser_status_update(
@@ -221,7 +221,11 @@ def test_low_confidence_and_regression_are_blocked_but_rejection_is_synced(tmp_p
     assert low_confidence.data is not None
     assert low_confidence.data.reason_code == "confidence_below_threshold"
     assert low_confidence.data.wrote is False
-    assert regressive.status is UpdateStatus.APPROVAL_REQUIRED
+    assert regressive.status is UpdateStatus.UNCHANGED
+    assert regressive.data is not None
+    assert regressive.data.reason_code == "historical_stage_retained"
+    assert regressive.data.current_stage.value == "written"
+    assert regressive.data.target_stage.value == "written"
     assert rejected.status is UpdateStatus.UPDATED
     assert rejected.data is not None
     assert rejected.data.wrote is True
@@ -229,7 +233,34 @@ def test_low_confidence_and_regression_are_blocked_but_rejection_is_synced(tmp_p
         application = session.get(ApplicationSnapshot, "24")
         assert application.stage == "rejected"
         assert application.stage_history[-1]["result"] == "淘汰"
-    assert sum(a.success is True for a in _audit_rows(storage)) == 1
+    assert sum(a.success is True for a in _audit_rows(storage)) == 2
+
+
+def test_low_confidence_same_stage_requires_verified_card_evidence(tmp_path) -> None:
+    storage = _storage(tmp_path, [{"id": "24", "title": "软件开发工程师", "stage": "applied"}])
+
+    response = browser_status_update(
+        BrowserStatusUpdateInput(
+            application_id="24",
+            page_url="https://ats.example/applications",
+            terminal_result={
+                "status": "applied",
+                "label": "筛选阶段",
+                "entries": [
+                    {"application_id": "24", "status": "applied", "label": "筛选阶段", "confidence": 0.70}
+                ],
+                "capturedAt": CAPTURED_AT,
+            },
+        ),
+        storage,
+    )
+
+    assert response.status is UpdateStatus.STATE_UNCLEAR
+    assert response.data is not None
+    assert response.data.reason_code == "confidence_below_threshold"
+    assert response.data.wrote is False
+    with storage.session() as session:
+        assert session.get(ApplicationSnapshot, "24").stage == "applied"
 
 
 def test_withdrawal_still_requires_approval(tmp_path) -> None:
