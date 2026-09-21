@@ -333,6 +333,14 @@ docs/                 架构、安装、运行和故障排查文档
 
 发现安全问题请阅读 [SECURITY.md](SECURITY.md)。
 
+## 支持作者
+
+如果这个项目对你有帮助，欢迎请作者喝杯咖啡。感谢你的支持，它会帮助项目继续维护和完善。
+
+<p align="center">
+  <img src="docs/assets/wechat-support.jpg" alt="微信收款码" width="280">
+</p>
+
 ## 更多文档
 
 - [安装与部署](docs/INSTALLATION.md)
