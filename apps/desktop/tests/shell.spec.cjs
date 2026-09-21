@@ -84,6 +84,16 @@ test('T07 renderer preserves full profile, dirty edits and save failures with ve
   expect((await page.evaluate(()=>window.fixtureCommands)).map(c=>c.action)).toEqual(expect.arrayContaining(['filler-profile-export','filler-profile-import','filler-attachment-select','filler-attachment-clear','filler-demo-enable','filler-demo-restore']));
 });
 
+test('normal business mode hides the notice bar and read-only mode keeps its warning',async()=>{
+  const page=await rendererWindow();
+  await expect(page.locator('#notice')).toBeHidden();
+  await expect.poll(()=>page.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue('--desktop-content-top').trim())).toBe('112px');
+  await updateRenderer(page,()=>{window.fixtureState.writesEnabled=false;});
+  await expect(page.locator('#notice')).toBeVisible();
+  await expect(page.locator('#notice')).toHaveText('只读模式 · 登录与文件选择由本人操作');
+  await expect.poll(()=>page.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue('--desktop-content-top').trim())).toBe('144px');
+});
+
 test('T07 renderer exposes all 65 audited fields and supports multiple editable records without source defaults',async()=>{
   const page=await rendererWindow();
   await updateRenderer(page,()=>{window.fixtureState.filler.profile.data={basic:{},education:[{}],projects:[{}],awards:[{}],publications:[{}],certificates:[{}]};});

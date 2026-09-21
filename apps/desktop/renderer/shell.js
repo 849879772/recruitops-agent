@@ -595,7 +595,11 @@ function render(state) {
   $('use-capture').hidden = !state.captureDraft?.result?.draft || state.active !== null;
   $('use-capture').disabled = !state.apiConfigured;
   $('configuration-error').textContent = state.configurationError;
-  $('notice').textContent = state.notice || selected?.error || selected?.resourceWarning || (state.writesEnabled ? '本地业务模式 · 外部任务仍按个人配置启用' : '只读模式 · 登录与文件选择由本人操作'); $('notice').title = $('notice').textContent;
+  const noticeText = state.notice || selected?.error || selected?.resourceWarning || (!state.writesEnabled ? '只读模式 · 登录与文件选择由本人操作' : '');
+  $('notice').textContent = noticeText;
+  $('notice').title = noticeText;
+  $('notice').hidden = !noticeText;
+  document.documentElement.style.setProperty('--desktop-content-top', noticeText ? '144px' : '112px');
 }
 window.addEventListener('DOMContentLoaded', () => {
   $('startup-diagnostics').onclick = () => command({action:'home'});
