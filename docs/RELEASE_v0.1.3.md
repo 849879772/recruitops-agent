@@ -4,6 +4,8 @@
 
 下载文件：`RecruitOps-v0.1.3.zip`（约 704 MB）
 
+123 云盘备用下载（永久有效、无提取码）：https://1835739780.share.123pan.cn/123pan/QbN4Td-1nW2d
+
 SHA-256：`ADBC8CE8154488BEFA0E73FFB114488F6C0D32C1D59DDFB4E9A1E329046CD721`
 
 ## 旧版已有岗位数据的用户

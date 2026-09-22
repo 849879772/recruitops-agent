@@ -39,6 +39,7 @@
 
 - [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.3)
 - [Gitee Releases](https://gitee.com/zs-k/recruitops-agent/releases/tag/v0.1.3)
+- [123 云盘（永久有效，无提取码）](https://1835739780.share.123pan.cn/123pan/QbN4Td-1nW2d)
 
 安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
 
