@@ -59,6 +59,24 @@ def test_crash_requires_explicit_recovery_and_never_reinitializes(tmp_path, bund
     assert not any("initdb" in c[0][0] for c in tree.calls[calls:])
 
 
+def test_owned_desktop_recovers_unclean_instance_without_reinitializing(tmp_path, bundle):
+    first, tree, _ = supervisor_fixture(tmp_path, bundle)
+    first.start()
+    identity = first.events.instance_id
+    first.failed = True
+    first.stop()
+    calls = len(tree.calls)
+    recovered = reopen(first, tree, desktop=True)
+    recovered.shell_token = "a" * 64
+    recovered.start()
+    try:
+        assert recovered.events.instance_id == identity
+        assert recovered.instance.recovered is True
+        assert not any("initdb" in call[0][0] for call in tree.calls[calls:])
+    finally:
+        recovered.stop()
+
+
 def test_incomplete_first_cluster_is_reinitialized_without_touching_prior_data(tmp_path, bundle):
     first, tree, _ = supervisor_fixture(tmp_path, bundle, fail="initdb")
     with pytest.raises(RuntimeFailure):
@@ -69,6 +87,23 @@ def test_incomplete_first_cluster_is_reinitialized_without_touching_prior_data(t
     second.start()
     second.stop()
     assert any("initdb" in call[0][0] for call in tree.calls[count:])
+
+
+def test_legacy_instance_acl_is_migrated_once(tmp_path, bundle):
+    first, tree, _ = supervisor_fixture(tmp_path, bundle)
+    first.start()
+    first.stop()
+    metadata = first.layout.data / "instance.json"
+    record = json.loads(metadata.read_text())
+    record.pop("acl_schema")
+    metadata.write_text(json.dumps(record))
+    marker = first.layout.data / "pgdata/legacy-file"
+    marker.write_text("preserved")
+    second = reopen(first, tree)
+    second.start()
+    second.stop()
+    assert marker.read_text() == "preserved"
+    assert json.loads(metadata.read_text())["acl_schema"] == 2
 
 
 def test_incomplete_cluster_with_backup_still_requires_manual_recovery(tmp_path, bundle):

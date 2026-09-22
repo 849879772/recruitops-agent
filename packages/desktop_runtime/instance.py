@@ -20,6 +20,14 @@ class Blob(c.Structure):
     _fields_ = [("size", w.DWORD), ("data", c.POINTER(c.c_ubyte))]
 
 
+class TokenUser(c.Structure):
+    _fields_ = [("sid", c.c_void_p), ("attributes", w.DWORD)]
+
+
+class SecurityAttributes(c.Structure):
+    _fields_ = [("length", w.DWORD), ("descriptor", c.c_void_p), ("inherit", w.BOOL)]
+
+
 def protect_secret(value: bytes, *, decrypt=False) -> bytes:
     if os.name != "nt":
         raise RuntimeFailure("windows_secret_protection_required")
@@ -65,8 +73,50 @@ def reject_links(root: Path):
             pending.extend(path.iterdir())
 
 
-def secure_directory(root: Path):
+def current_user_sid() -> str:
     if os.name != "nt":
+        raise RuntimeFailure("windows_required")
+    advapi = c.WinDLL("advapi32", use_last_error=True)
+    kernel = c.WinDLL("kernel32", use_last_error=True)
+    advapi.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, c.POINTER(w.HANDLE)]
+    advapi.OpenProcessToken.restype = w.BOOL
+    advapi.GetTokenInformation.argtypes = [w.HANDLE, c.c_int, c.c_void_p, w.DWORD, c.POINTER(w.DWORD)]
+    advapi.GetTokenInformation.restype = w.BOOL
+    advapi.ConvertSidToStringSidW.argtypes = [c.c_void_p, c.POINTER(w.LPWSTR)]
+    advapi.ConvertSidToStringSidW.restype = w.BOOL
+    kernel.GetCurrentProcess.argtypes = []
+    kernel.GetCurrentProcess.restype = w.HANDLE
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    kernel.CloseHandle.restype = w.BOOL
+    kernel.LocalFree.argtypes = [c.c_void_p]
+    kernel.LocalFree.restype = c.c_void_p
+    token = w.HANDLE()
+    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, c.byref(token)):  # TOKEN_QUERY
+        raise RuntimeFailure("instance_acl_failed")
+    try:
+        size = w.DWORD()
+        advapi.GetTokenInformation(token, 1, None, 0, c.byref(size))  # TokenUser
+        if not size.value:
+            raise RuntimeFailure("instance_acl_failed")
+        buffer = c.create_string_buffer(size.value)
+        if not advapi.GetTokenInformation(token, 1, buffer, size, c.byref(size)):
+            raise RuntimeFailure("instance_acl_failed")
+        user = c.cast(buffer, c.POINTER(TokenUser)).contents
+        text = w.LPWSTR()
+        if not advapi.ConvertSidToStringSidW(user.sid, c.byref(text)):
+            raise RuntimeFailure("instance_acl_failed")
+        try:
+            return text.value
+        finally:
+            kernel.LocalFree(text)
+    finally:
+        kernel.CloseHandle(token)
+
+
+def secure_directory(root: Path, *, create=False):
+    if os.name != "nt":
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
         root.chmod(0o700)
         return
     advapi = c.WinDLL("advapi32", use_last_error=True)
@@ -75,18 +125,39 @@ def secure_directory(root: Path):
     advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = w.BOOL
     advapi.SetFileSecurityW.argtypes = [w.LPCWSTR, w.DWORD, c.c_void_p]
     advapi.SetFileSecurityW.restype = w.BOOL
+    kernel.CreateDirectoryW.argtypes = [w.LPCWSTR, c.POINTER(SecurityAttributes)]
+    kernel.CreateDirectoryW.restype = w.BOOL
     kernel.LocalFree.argtypes = [c.c_void_p]
     kernel.LocalFree.restype = c.c_void_p
     descriptor = c.c_void_p()
-    # Protected DACL, inheritable owner-rights + SYSTEM only. No Everyone/Users.
+    sid = current_user_sid()
+    # Pin ownership and access to the actual token user. OWNER_RIGHTS is unsafe
+    # when Windows chooses BUILTIN\Administrators as an elevated token's owner.
     if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)", 1, c.byref(descriptor), None):
+            f"O:{sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid})", 1, c.byref(descriptor), None):
         raise RuntimeFailure("instance_acl_failed")
     try:
-        if not advapi.SetFileSecurityW(str(root), 0x80000004, descriptor):
+        if create and not root.exists():
+            root.parent.mkdir(parents=True, exist_ok=True)
+            attributes = SecurityAttributes(c.sizeof(SecurityAttributes), descriptor, False)
+            if not kernel.CreateDirectoryW(str(extended_path(root)), c.byref(attributes)):
+                raise RuntimeFailure("instance_acl_failed")
+        target = str(extended_path(root))
+        # Grant the user WRITE_OWNER first. Owners implicitly have WRITE_DAC,
+        # but do not implicitly have permission to set even their own SID as owner.
+        if not advapi.SetFileSecurityW(target, 0x80000004, descriptor):
+            raise RuntimeFailure("instance_acl_failed")
+        if not advapi.SetFileSecurityW(target, 0x00000001, descriptor):
             raise RuntimeFailure("instance_acl_failed")
     finally:
         kernel.LocalFree(descriptor)
+
+
+def secure_tree(root: Path):
+    """One-time migration for legacy OWNER_RIGHTS instance trees."""
+    secure_directory(root)
+    for path in root.rglob("*"):
+        secure_directory(path)
 
 
 class Instance:
@@ -94,6 +165,7 @@ class Instance:
         self.root, self.protector = root, protector
         self.path = root / "instance.json"
         self.record = None
+        self.recovered = False
 
     def save(self, state, **fields):
         self.record.update(state=state, **fields)
@@ -109,10 +181,9 @@ class Instance:
         if not self.path.exists():
             if any(p.name != "runtime.lock" for p in self.root.iterdir()):
                 raise RuntimeFailure("recovery_required_unknown_instance")
-            secure_directory(self.root)
             password = secrets.token_hex(32)
             self.record = {"schema": 1, "instance_id": secrets.token_hex(16),
-                           "postgres_major": 16, "root": str(self.root.resolve()),
+                           "postgres_major": 16, "acl_schema": 2, "root": str(self.root.resolve()),
                            "credential": base64.b64encode(self.protector(password.encode())).decode("ascii")}
             self.save("initializing")
             return password, True
@@ -128,6 +199,11 @@ class Instance:
                 raise ValueError()
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise RuntimeFailure("invalid_instance_metadata") from exc
+        if record.get("acl_schema") != 2:
+            secure_tree(self.root)
+            record["acl_schema"] = 2
+            self.record = record
+            self.save(record["state"])
         pgversion = self.root / "pgdata/PG_VERSION"
         if not pgversion.is_file() or pgversion.read_text(encoding="ascii").strip() != "16":
             backups = self.root / "backups"
@@ -148,4 +224,5 @@ class Instance:
         if record.get("state") != "stopped" and not recover:
             raise RuntimeFailure("recovery_required_unclean_state")
         self.record = record
+        self.recovered = record.get("state") != "stopped"
         return password, False

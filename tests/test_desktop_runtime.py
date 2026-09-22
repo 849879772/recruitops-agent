@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import ctypes as c
 import io
 import json
 import os
+from ctypes import wintypes as w
 from pathlib import Path
 import subprocess
 import struct
@@ -18,9 +20,10 @@ from packages.desktop_runtime import RuntimeFailure
 from packages.desktop_runtime.__main__ import main
 from packages.desktop_runtime.api_bootstrap import ReadOnlyGuard
 from packages.desktop_runtime.isolation import InstanceLock, PortLease, child_environment
+from packages.desktop_runtime.instance import current_user_sid
 from packages.desktop_runtime.resources import Bundle, Layout, REQUIRED
 from packages.desktop_runtime.supervisor import Events, Supervisor
-from packages.desktop_runtime.windows import WindowsTree
+from packages.desktop_runtime.windows import WindowsTree, create_restricted_token
 
 
 @pytest.fixture
@@ -163,10 +166,11 @@ class FakeChild:
 
 class FakeTree:
     def __init__(self, fail=None):
-        self.fail, self.calls, self.closed = fail, [], False
+        self.fail, self.calls, self.outputs, self.closed = fail, [], [], False
 
-    def spawn(self, argv, cwd, env):
+    def spawn(self, argv, cwd, env, *, output=None):
         self.calls.append((argv, cwd, dict(env)))
+        self.outputs.append(output)
         name = Path(argv[0]).stem
         if name == "pg_dump":
             name = "backup"
@@ -209,6 +213,8 @@ def test_start_order_and_exit(tmp_path, bundle):
         assert all(call[1] == runtime.layout.data for call in tree.calls)
         assert all(call[2]["RECRUITOPS_WRITE_ENABLED"] == "false" for call in tree.calls)
         assert "--auth-host=scram-sha-256" in tree.calls[0][0]
+        assert tree.outputs[0] == runtime.layout.data / "logs/initdb.log"
+        assert tree.outputs[1] == runtime.layout.data / "logs/postgres.log"
         assert not (runtime.layout.data / "tmp/initdb-password").exists()
         assert runtime.env["PGPASSWORD"] not in stream.getvalue()
         assert runtime.env["RECRUITOPS_API_TOKEN"] not in stream.getvalue()
@@ -433,6 +439,68 @@ def test_windows_job_handles_unicode_argv_and_only_owned_subtree(tmp_path):
         tree.close()
         unrelated.terminate()
         unrelated.wait(5)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL native fixture")
+def test_fresh_instance_owner_is_the_token_user(tmp_path, bundle):
+    runtime, _, _ = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    runtime.stop()
+    advapi = c.WinDLL("advapi32", use_last_error=True)
+    advapi.GetFileSecurityW.argtypes = [w.LPCWSTR, w.DWORD, c.c_void_p, w.DWORD, c.POINTER(w.DWORD)]
+    advapi.GetFileSecurityW.restype = w.BOOL
+    advapi.GetSecurityDescriptorOwner.argtypes = [c.c_void_p, c.POINTER(c.c_void_p), c.POINTER(w.BOOL)]
+    advapi.GetSecurityDescriptorOwner.restype = w.BOOL
+    advapi.ConvertSidToStringSidW.argtypes = [c.c_void_p, c.POINTER(w.LPWSTR)]
+    advapi.ConvertSidToStringSidW.restype = w.BOOL
+    kernel = c.WinDLL("kernel32", use_last_error=True)
+    kernel.LocalFree.argtypes = [c.c_void_p]
+    size = w.DWORD()
+    advapi.GetFileSecurityW(str(runtime.layout.data), 1, None, 0, c.byref(size))
+    descriptor = c.create_string_buffer(size.value)
+    assert advapi.GetFileSecurityW(str(runtime.layout.data), 1, descriptor, size, c.byref(size))
+    owner, defaulted = c.c_void_p(), w.BOOL()
+    assert advapi.GetSecurityDescriptorOwner(descriptor, c.byref(owner), c.byref(defaulted))
+    text = w.LPWSTR()
+    assert advapi.ConvertSidToStringSidW(owner, c.byref(text))
+    try:
+        assert text.value == current_user_sid()
+    finally:
+        kernel.LocalFree(text)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object native fixture")
+def test_windows_job_captures_child_output(tmp_path):
+    tree = WindowsTree()
+    output = tmp_path / "child.log"
+    env = {key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR"}}
+    try:
+        child = tree.spawn(
+            [sys.executable, "-I", "-c", "import sys; print('stdout'); print('stderr', file=sys.stderr)"],
+            tmp_path, env, output=output,
+        )
+        assert child.wait(10) == 0
+        assert set(output.read_text().splitlines()) == {"stdout", "stderr"}
+    finally:
+        tree.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows restricted token native fixture")
+def test_windows_job_launches_with_same_user_restricted_token(tmp_path):
+    tree = WindowsTree(token_factory=create_restricted_token)
+    marker = tmp_path / "restricted.txt"
+    env = {key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR"}}
+    try:
+        child = tree.spawn(
+            [sys.executable, "-I", "-c",
+             "import ctypes,pathlib,sys; a=ctypes.windll.shell32.IsUserAnAdmin(); pathlib.Path(sys.argv[1]).write_text(str(a))",
+             str(marker)],
+            tmp_path, env,
+        )
+        assert child.wait(10) == 0
+        assert marker.read_text() == "0"
+    finally:
+        tree.close()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object native fixture")

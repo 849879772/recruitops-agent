@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -38,6 +39,8 @@ def main():
     provenance = root / "provenance/application-files.json"
     provenance.write_text(json.dumps(files, indent=2), encoding="utf-8")
     manifest["files"]["provenance/application-files.json"] = digest(provenance)
+    manifest["components"]["application"]["version"] = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     # Invalid hashes during refresh fail closed; never expose a partially refreshed manifest.
     Bundle(root, manifest).verify()
     temporary = root / "runtime-manifest.json.tmp"

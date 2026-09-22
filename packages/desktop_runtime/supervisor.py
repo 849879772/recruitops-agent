@@ -12,7 +12,7 @@ from pathlib import Path
 from . import PROTOCOL_VERSION, RuntimeFailure
 from .capabilities import automation_hot_reload_allowed, configured_capabilities
 from .isolation import InstanceLock, PortLease, child_environment
-from .instance import Instance
+from .instance import Instance, secure_directory
 from .windows import WindowsTree
 
 
@@ -62,10 +62,11 @@ class Supervisor:
     def command(self, name, *args):
         return [str(self.bundle.resource(name)), *map(str, args)]
 
-    def run_step(self, stage, argv):
+    def run_step(self, stage, argv, *, output=None):
         self.stage = stage
-        self.events.emit("starting", stage)
-        child = self.tree.spawn(argv, self.layout.data, self.env)
+        fields = {"log": str(Path(output).relative_to(self.layout.data)).replace("\\", "/")} if output else {}
+        self.events.emit("starting", stage, **fields)
+        child = self.tree.spawn(argv, self.layout.data, self.env, output=output)
         exit_code = child.wait(self.timeout)
         if exit_code != 0:
             raise RuntimeFailure(f"{stage}_failed", exit_code=exit_code)
@@ -124,10 +125,14 @@ class Supervisor:
                 raise RuntimeFailure("invalid_shell_token")
             if self.desktop and (not self.shell_token or self.enable_writes_for_instance is not None):
                 raise RuntimeFailure("invalid_desktop_launch")
-            self.layout.data.mkdir(parents=True, exist_ok=True)
-            self.lock = InstanceLock(self.layout.data, self.events.run_id).acquire()
+            if self.layout.data.exists():
+                self.lock = InstanceLock(self.layout.data, self.events.run_id).acquire()
+                secure_directory(self.layout.data)
+            else:
+                secure_directory(self.layout.data, create=True)
+                self.lock = InstanceLock(self.layout.data, self.events.run_id).acquire()
             candidate = self.instance_factory(self.layout.data)
-            password, fresh = candidate.open(recover=self.recover)
+            password, fresh = candidate.open(recover=self.recover or self.desktop)
             self.events.instance_id = candidate.record["instance_id"]
             if self.desktop:
                 self.writes = True
@@ -137,7 +142,8 @@ class Supervisor:
                 self.writes = True
             self.instance = candidate
             self.instance.save("starting", run_id=self.events.run_id)
-            self.events.emit("opened", "instance", fresh=fresh, recovered=self.recover)
+            self.events.emit("opened", "instance", fresh=fresh,
+                             recovered=bool(getattr(candidate, "recovered", False)))
             self.layout.prepare()
             self.tree = self.tree_factory()
             db = PortLease()
@@ -174,13 +180,15 @@ class Supervisor:
                 try:
                     pwfile.write_text(password + "\n", encoding="ascii")
                     pwfile.chmod(0o600)
-                    self.run_step("initdb", self.command("initdb", "-D", pgdata, "-U", "desktop", "--encoding=UTF8", "--locale=C", "--auth-host=scram-sha-256", "--auth-local=scram-sha-256", f"--pwfile={pwfile}"))
+                    self.run_step("initdb", self.command("initdb", "-D", pgdata, "-U", "desktop", "--encoding=UTF8", "--locale=C", "--auth-host=scram-sha-256", "--auth-local=scram-sha-256", f"--pwfile={pwfile}"),
+                                  output=self.layout.data / "logs/initdb.log")
                 finally:
                     pwfile.unlink(missing_ok=True)
             db.close()
             self.stage = "database"
-            self.events.emit("starting", self.stage)
-            self.services["database"] = self.tree.spawn(self.command("postgres", "-D", pgdata, "-h", "127.0.0.1", "-p", db.port, "-c", f"data_directory={pgdata}", "-c", "unix_socket_directories=", "-c", "password_encryption=scram-sha-256"), self.layout.data, self.env)
+            database_log = self.layout.data / "logs/postgres.log"
+            self.events.emit("starting", self.stage, log="logs/postgres.log")
+            self.services["database"] = self.tree.spawn(self.command("postgres", "-D", pgdata, "-h", "127.0.0.1", "-p", db.port, "-c", f"data_directory={pgdata}", "-c", "unix_socket_directories=", "-c", "password_encryption=scram-sha-256"), self.layout.data, self.env, output=database_log)
             self.await_ready("database")
             # Preserve a logical recovery point before any application migration.
             self.backup("pre-migration")

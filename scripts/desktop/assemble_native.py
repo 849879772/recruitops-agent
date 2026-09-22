@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,11 +82,12 @@ def main():
     acquired = json.loads((build / "acquisition.json").read_text())
     components = {name: {"version": acquired[name]["version"], "source": acquired[name]["source"], "license_file": license_file}
         for name, license_file in (("python", "python/LICENSE.txt"), ("postgres", "postgres/server_license.txt"), ("pgvector", "licenses/pgvector.txt"))}
+    application_version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     components.update(
         node={"version": "22.14.0", "source": "https://nodejs.org/dist/v22.14.0/", "license_file": "node/LICENSE"},
         codex={"version": "0.149.0", "source": "https://github.com/openai/codex/releases/tag/rust-v0.149.0", "license_file": "codex/LICENSE"},
         chromium={"version": "145.0.7632.6", "source": "https://cdn.playwright.dev/chrome-for-testing-public/145.0.7632.6/win64/chrome-win64.zip", "license_file": "chromium/chromium-1208/chrome-win64/ABOUT"},
-        application={"version": "0.1.0", "source": args.application_source, "license_file": "app/LICENSE"})
+        application={"version": application_version, "source": args.application_source, "license_file": "app/LICENSE"})
     manifest = {"schema": 1, "platform": "windows-x64", "postgres_major": 16,
         "components": components, "entrypoints": entries,
         "files": {p.relative_to(destination).as_posix(): digest(p) for p in sorted(destination.rglob("*")) if p.is_file()}}
