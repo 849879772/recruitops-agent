@@ -113,7 +113,7 @@ def current_user_sid() -> str:
         kernel.CloseHandle(token)
 
 
-def secure_directory(root: Path, *, create=False):
+def secure_directory(root: Path, *, create=False, sid=None):
     if os.name != "nt":
         if create:
             root.mkdir(parents=True, exist_ok=True)
@@ -130,7 +130,7 @@ def secure_directory(root: Path, *, create=False):
     kernel.LocalFree.argtypes = [c.c_void_p]
     kernel.LocalFree.restype = c.c_void_p
     descriptor = c.c_void_p()
-    sid = current_user_sid()
+    sid = sid or current_user_sid()
     # Pin ownership and access to the actual token user. OWNER_RIGHTS is unsafe
     # when Windows chooses BUILTIN\Administrators as an elevated token's owner.
     if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -155,9 +155,18 @@ def secure_directory(root: Path, *, create=False):
 
 def secure_tree(root: Path):
     """One-time migration for legacy OWNER_RIGHTS instance trees."""
-    secure_directory(root)
-    for path in root.rglob("*"):
-        secure_directory(path)
+    sid = current_user_sid() if os.name == "nt" else None
+    pending = [extended_path(root)]
+    while pending:
+        path = pending.pop()
+        try:
+            secure_directory(path, sid=sid)
+            if path.is_dir():
+                pending.extend(path.iterdir())
+        except FileNotFoundError:
+            # Temporary runtime entries may disappear after enumeration. New
+            # entries inherit the already-protected parent directory ACL.
+            continue
 
 
 class Instance:

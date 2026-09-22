@@ -383,9 +383,17 @@ def test_bootstrap_with_fixture_api_never_imports_real_settings(monkeypatch):
     app = FastAPI()
     captured, queries = {}, []
 
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [{"id": "active-run", "current_step": "discovery"}]
+
     class Connection:
         def execute(self, statement):
             queries.append(str(statement))
+            return Result()
 
     class Engine:
         def connect(self):
@@ -410,8 +418,13 @@ def test_bootstrap_with_fixture_api_never_imports_real_settings(monkeypatch):
         headers = {"Authorization": "Bearer fixture-secret"}
         response = client.get("/desktop-runtime/ready", headers=headers)
         assert response.json() == {"instance_id": "fixture-instance", "run_id": "fixture-run", "status": "ready", "writes": False, "websocket": False}
+        response = client.get("/desktop-runtime/activity", headers=headers)
+        assert response.json() == {"active_tasks": [{"run_id": "active-run", "current_step": "discovery"}]}
         assert client.post("/any-write", headers=headers).status_code == 403
-        assert queries == ["SELECT 1"]
+        assert queries == [
+            "SELECT 1",
+            "SELECT id, current_step FROM task_runs WHERE status = 'running' ORDER BY updated_at DESC LIMIT 20",
+        ]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object native fixture")

@@ -41,6 +41,13 @@ test('owned read-only runtime handshake, request policy and graceful stop', asyn
   } finally { await runtime.stop(); }
   assert.equal(runtime.state.status, 'stopped'); assert.equal(runtime.origin, undefined);
 });
+test('runtime reports bounded active background tasks', async () => {
+  const runtime = fixture('active-task', undefined, true); runtime.start();
+  try {
+    await wait(() => runtime.state.status === 'ready');
+    assert.deepEqual(await runtime.activity(), { activeTasks: [{ runId: 'active-run-1234567890', currentStep: 'discovery' }] });
+  } finally { await runtime.stop(); }
+});
 test('instance-specific write opt-in permits exact owned HTTP and WS only', async () => {
   const runtime = fixture('writes', 'fixture-instance'); runtime.start();
   try {

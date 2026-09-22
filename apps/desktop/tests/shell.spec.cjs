@@ -92,6 +92,24 @@ test('normal business mode hides the notice bar and read-only mode keeps its war
   await expect(page.locator('#notice')).toBeVisible();
   await expect(page.locator('#notice')).toHaveText('只读模式 · 登录与文件选择由本人操作');
   await expect.poll(()=>page.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue('--desktop-content-top').trim())).toBe('144px');
+  await updateRenderer(page,()=>{window.fixtureState.runtime.status='failed';});
+  await expect(page.locator('#notice')).toBeHidden();
+});
+
+test('quit detects active background work and defaults to keeping it running',async()=>{
+  const shell=await launch({RECRUITOPS_DESKTOP_TEST_RUNTIME:'active-task'});
+  await expect.poll(async()=>(await shell.evaluate(()=>window.desktop.state())).runtime.status).toBe('ready');
+  await desktop.evaluate(({dialog})=>{
+    globalThis.recruitopsQuitPrompts=[];
+    dialog.showMessageBox=async(_window,options)=>{globalThis.recruitopsQuitPrompts.push(options);return {response:0};};
+  });
+  await invoke(shell,{action:'quit'});
+  const prompt=await desktop.evaluate(()=>globalThis.recruitopsQuitPrompts.at(-1));
+  expect(prompt.title).toBe('任务仍在运行');
+  expect(prompt.buttons).toEqual(['继续运行','停止任务并退出']);
+  expect(prompt.defaultId).toBe(0);
+  expect(prompt.detail).toContain('active-run-1');
+  expect(await desktop.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().length)).toBe(1);
 });
 
 test('T07 renderer exposes all 65 audited fields and supports multiple editable records without source defaults',async()=>{

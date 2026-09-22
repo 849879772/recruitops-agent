@@ -10,7 +10,8 @@ test('tray and exit confirmation use Chinese and default to cancellation', () =>
   assert.match(source, /label: '退出…'/);
   assert.match(source, /title: '退出 RecruitOps', buttons: \['取消', '退出'\], defaultId: 0, cancelId: 0/);
   assert.match(source, /退出后，本地服务及后台任务将停止/);
-  assert.match(source, /if \(response === 1\) \{ quitting = true; app.quit\(\); \}/);
+  assert.match(source, /buttons: \['继续运行', '停止任务并退出'\], defaultId: 0, cancelId: 0/);
+  assert.match(source, /quitting = true; app.quit\(\);/);
   for (const old of ['Show RecruitOps', 'Quit RecruitOps?', 'Clear site session', 'Tray unavailable']) {
     assert.equal(source.includes(old), false);
   }

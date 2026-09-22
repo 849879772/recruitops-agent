@@ -12,7 +12,7 @@ from packages.desktop_runtime import RuntimeFailure
 from packages.desktop_runtime.__main__ import read_commands
 from packages.desktop_runtime.api_bootstrap import ReadOnlyGuard
 from packages.desktop_runtime.capabilities import CAPABILITY_FIELDS, configured_capabilities, saved_model_configured
-from packages.desktop_runtime.instance import Instance, protect_secret
+from packages.desktop_runtime.instance import Instance, extended_path, protect_secret
 from packages.desktop_runtime.supervisor import Events, Supervisor
 from test_desktop_runtime import bundle, supervisor_fixture
 
@@ -100,6 +100,30 @@ def test_legacy_instance_acl_is_migrated_once(tmp_path, bundle):
     marker = first.layout.data / "pgdata/legacy-file"
     marker.write_text("preserved")
     second = reopen(first, tree)
+    second.start()
+    second.stop()
+    assert marker.read_text() == "preserved"
+    assert json.loads(metadata.read_text())["acl_schema"] == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows long-path ACL migration")
+def test_legacy_instance_acl_migration_supports_long_paths(tmp_path, bundle):
+    first, tree, _ = supervisor_fixture(tmp_path, bundle)
+    first.start()
+    first.stop()
+    metadata = first.layout.data / "instance.json"
+    record = json.loads(metadata.read_text())
+    record.pop("acl_schema")
+    metadata.write_text(json.dumps(record))
+    deep = first.layout.data / "codex"
+    while len(str(deep / "marker.txt")) < 280:
+        deep /= "long-plugin-directory-name-0123456789"
+    long_directory = extended_path(deep)
+    long_directory.mkdir(parents=True)
+    marker = long_directory / "marker.txt"
+    marker.write_text("preserved")
+    second = reopen(first, tree, desktop=True)
+    second.shell_token = "a" * 64
     second.start()
     second.stop()
     assert marker.read_text() == "preserved"

@@ -611,8 +611,21 @@ async function execute(raw: unknown) {
   }
   else if (command.action === 'hide') { if (tray) window.hide(); }
   else if (command.action === 'quit') {
-    const { response } = await dialog.showMessageBox(window, { type: 'question', title: '退出 RecruitOps', buttons: ['取消', '退出'], defaultId: 0, cancelId: 0, message: '确定退出 RecruitOps？', detail: '网页中未保存的填写内容可能丢失。退出后，本地服务及后台任务将停止。' });
-    if (response === 1) { quitting = true; app.quit(); }
+    let activeTasks: { runId: string; currentStep: string }[] = [];
+    try { activeTasks = (await runtime?.activity())?.activeTasks ?? []; } catch { /* Fall back to the general warning. */ }
+    if (activeTasks.length) {
+      const summary = activeTasks.slice(0,3).map(task => `${task.runId.slice(0,12)}…（${task.currentStep}）`).join('\n');
+      const { response } = await dialog.showMessageBox(window, {
+        type: 'warning', title: '任务仍在运行', buttons: ['继续运行', '停止任务并退出'], defaultId: 0, cancelId: 0,
+        message: `当前有 ${activeTasks.length} 个后台任务尚未完成。`,
+        detail: `${summary}\n\n退出会立即停止这些任务，未完成的阶段需要下次重新运行。选择“继续运行”将保留当前窗口并让任务继续。`,
+      });
+      if (response === 0) return state();
+    } else {
+      const { response } = await dialog.showMessageBox(window, { type: 'question', title: '退出 RecruitOps', buttons: ['取消', '退出'], defaultId: 0, cancelId: 0, message: '确定退出 RecruitOps？', detail: '网页中未保存的填写内容可能丢失。退出后，本地服务及后台任务将停止。' });
+      if (response === 0) return state();
+    }
+    quitting = true; app.quit();
   } else {
     const tab = typeof active === 'number' ? tabs.get(active) : undefined;
     if (!tab) return state();
@@ -667,13 +680,13 @@ else {
       bootstrapStatus = app.isPackaged ? 'verifying_resources' : 'offline'; publish();
       const repo = path.resolve(__dirname, '../../..');
       const fixtureMode = testMode && process.env.RECRUITOPS_DESKTOP_TEST_RUNTIME;
-      if (fixtureMode && !['read-only', 'writes', 'identity-failure', 'crash', 'desktop', 'delayed-desktop', 'filler'].includes(fixtureMode)) throw new Error('invalid_fixture_mode');
+      if (fixtureMode && !['read-only', 'writes', 'identity-failure', 'crash', 'desktop', 'delayed-desktop', 'filler', 'active-task'].includes(fixtureMode)) throw new Error('invalid_fixture_mode');
       const launch = fixtureMode ? {
         executable: path.join(repo, '.venv-desktop-tests/Scripts/python.exe'),
         args: [path.join(__dirname, '../tests/runtime_fixture.py'), fixtureMode], cwd: repo,
         env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, PYTHONUTF8: '1', NO_PROXY: '127.0.0.1,localhost,::1' },
         expectedInstance: fixtureMode === 'writes' ? 'fixture-instance' : undefined,
-        desktop: fixtureMode === 'desktop' || fixtureMode === 'delayed-desktop' || fixtureMode === 'filler'
+        desktop: fixtureMode === 'desktop' || fixtureMode === 'delayed-desktop' || fixtureMode === 'filler' || fixtureMode === 'active-task'
       } : app.isPackaged ? await packagedRuntimeLaunch(process.resourcesPath, app.getPath('userData'), process.env,readOnlyPreference()) : runtimeLaunch(repo, process.env);
       if (quitting) return;
       if (launch) startOwnedRuntime(launch);

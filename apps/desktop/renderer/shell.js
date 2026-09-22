@@ -595,7 +595,7 @@ function render(state) {
   $('use-capture').hidden = !state.captureDraft?.result?.draft || state.active !== null;
   $('use-capture').disabled = !state.apiConfigured;
   $('configuration-error').textContent = state.configurationError;
-  const noticeText = state.notice || selected?.error || selected?.resourceWarning || (!state.writesEnabled ? '只读模式 · 登录与文件选择由本人操作' : '');
+  const noticeText = state.notice || selected?.error || selected?.resourceWarning || (state.runtime.status==='ready'&&!state.writesEnabled ? '只读模式 · 登录与文件选择由本人操作' : '');
   $('notice').textContent = noticeText;
   $('notice').title = noticeText;
   $('notice').hidden = !noticeText;

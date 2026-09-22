@@ -10,7 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 mode = sys.argv[1]
-writes = mode in {"writes", "desktop", "delayed-desktop", "filler"} or ("--enable-writes-for-instance" in sys.argv and sys.argv[-1] == "fixture-instance")
+writes = mode in {"writes", "desktop", "delayed-desktop", "filler", "active-task"} or ("--enable-writes-for-instance" in sys.argv and sys.argv[-1] == "fixture-instance")
 fixture_instance = "a" * 32 if mode == "filler" else "fixture-instance"
 token = os.environ["RECRUITOPS_DESKTOP_SHELL_TOKEN"]
 run_id = "fixture-run"
@@ -38,6 +38,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/desktop-runtime/ready":
             self.send_json(dict(status="ready", instance_id="foreign" if mode == "identity-failure" else fixture_instance,
                                 run_id=run_id, writes=writes, websocket=writes))
+        elif self.path == "/desktop-runtime/activity":
+            self.send_json({"active_tasks": ([{"run_id": "active-run-1234567890", "current_step": "discovery"}]
+                                               if mode == "active-task" else [])})
         elif self.path == "/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
             if not writes:
                 self.send_error(403)
@@ -108,7 +111,7 @@ def heartbeat():
     while not heartbeat_stop.wait(0.2):
         emit("heartbeat", "runtime", instance_id=fixture_instance)
 heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
-if mode in {"desktop", "delayed-desktop", "filler"}:
+if mode in {"desktop", "delayed-desktop", "filler", "active-task"}:
     heartbeat_thread.start()
 try:
     for line in sys.stdin:

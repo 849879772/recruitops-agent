@@ -68,6 +68,8 @@ def main():
     async def isolated_guard(request: Request, call_next):
         if request.url.path == "/desktop-runtime/ready":
             return desktop_ready()
+        if request.url.path == "/desktop-runtime/activity" and request.method == "GET":
+            return desktop_activity()
         return await call_next(request)
 
     def desktop_ready():
@@ -78,6 +80,20 @@ def main():
             return JSONResponse({"status": "not_ready"}, status_code=503)
         return JSONResponse({"instance_id": instance, "run_id": run_id, "status": "ready",
                              "writes": writes, "websocket": writes})
+
+    def desktop_activity():
+        try:
+            with get_storage_engine().connect() as connection:
+                rows = connection.execute(text(
+                    "SELECT id, current_step FROM task_runs "
+                    "WHERE status = 'running' ORDER BY updated_at DESC LIMIT 20"
+                )).mappings().all()
+        except Exception:
+            return JSONResponse({"active_tasks": []}, status_code=503)
+        return JSONResponse({"active_tasks": [
+            {"run_id": str(row["id"]), "current_step": str(row["current_step"] or "running")}
+            for row in rows
+        ]})
 
     port = int(os.environ["RECRUITOPS_API_PORT"])
     uvicorn.run(ReadOnlyGuard(app, token, writes=writes, owned_origin=f"http://127.0.0.1:{port}"),

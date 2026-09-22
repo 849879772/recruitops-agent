@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 export type RuntimeState = { status: string; stage: string; code?: string; instanceId?: string; writes: boolean; websocket: boolean };
+export type RuntimeActivity = { activeTasks: { runId: string; currentStep: string }[] };
 export type Launch = { executable: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; expectedInstance?: string; desktop?: boolean };
 
 // No external origin, inherited credential, developer PATH or process ID is accepted.
@@ -120,6 +121,23 @@ export class OwnedRuntime {
     });
   }
   authorization() { return 'Bearer ' + this.token; }
+  async activity(): Promise<RuntimeActivity> {
+    if (!this.origin || this.state.status !== 'ready') return { activeTasks: [] };
+    const result = await this.requestAt(this.origin, '/desktop-runtime/activity');
+    const tasks = result.active_tasks;
+    if (!Array.isArray(tasks) || tasks.length > 20) throw new Error('runtime_activity_invalid');
+    const activeTasks = tasks.map(task => {
+      if (!task || typeof task !== 'object' || Array.isArray(task)) throw new Error('runtime_activity_invalid');
+      const item = task as Record<string, unknown>;
+      if (typeof item.run_id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(item.run_id)
+          || typeof item.current_step !== 'string' || item.current_step.length > 255
+          || Object.keys(item).some(key => !['run_id', 'current_step'].includes(key))) {
+        throw new Error('runtime_activity_invalid');
+      }
+      return { runId: item.run_id, currentStep: item.current_step };
+    });
+    return { activeTasks };
+  }
   allows(url: string, method: string) {
     if (!this.origin || this.state.status !== 'ready') return false;
     try {
