@@ -38,6 +38,7 @@
 当前可用版本为 RecruitOps v0.1.2，请下载 `RecruitOps-v0.1.2.zip`：
 
 - [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.2)
+- [123 云盘（永久有效，无提取码）](https://1835739780.share.123pan.cn/123pan/QbN4Td-N4bXd)
 
 安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
 
