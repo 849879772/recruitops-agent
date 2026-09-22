@@ -187,10 +187,28 @@ class LocalObservationSync(BaseModel):
         return self
 
 
-@router.post("/sync-local-observation")
-def sync_local_observation(body: LocalObservationSync,
-                           authorization: str | None = Header(default=None),
-                           x_recruitops_instance_id: str | None = Header(default=None)):
+class LocalBatchObservationSync(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    application_ids: list[str] = Field(min_length=1, max_length=50)
+    page_url: str = Field(min_length=1, max_length=2048)
+    observation: dict
+
+    @field_validator("application_ids")
+    @classmethod
+    def unique_application_ids(cls, value):
+        if len(value) != len(set(value)) or any(not item or len(item) > 255 for item in value):
+            raise ValueError("application_ids must be unique and nonempty")
+        return value
+
+    @model_validator(mode="after")
+    def bounded_observation(self):
+        if len(json.dumps(self.observation, ensure_ascii=False).encode("utf-8")) > 262144:
+            raise ValueError("observation_too_large")
+        return self
+
+
+def _persist_local_observation(body: LocalObservationSync | LocalBatchObservationSync, application_ids, authorization,
+                               x_recruitops_instance_id):
     settings = authorized_settings(authorization, x_recruitops_instance_id, write=True)
     envelope = body.observation
     operation_id = envelope.get("operation_id")
@@ -202,7 +220,8 @@ def sync_local_observation(body: LocalObservationSync,
         raise HTTPException(409, "normalized_observation_required")
     if (result.get("evidence_only") is not True or result.get("database_updated") is not False or
             normalize_http_page_url(str(result.get("page_url") or "")) != page_url or
-            body.application_id not in result.get("application_ids", [])):
+            not isinstance(result.get("application_ids"), list) or
+            any(application_id not in result["application_ids"] for application_id in application_ids)):
         raise HTTPException(409, "observation_binding_mismatch")
     records = result.get("application_records")
     if not isinstance(records, list) or len(records) > 100:
@@ -214,7 +233,7 @@ def sync_local_observation(body: LocalObservationSync,
     device_id = "desktop-local-" + instance_value
     idem = "local-observation-" + sha256((instance_value + operation_id).encode()).hexdigest()
     command = {"action": "observe_application_page", "selector_key": "application_page",
-               "application_id": body.application_id, "application_ids": [body.application_id],
+               "application_id": application_ids[0], "application_ids": application_ids,
                "application_url": page_url, "page_url": page_url}
     try:
         operation = store.create(OperationName.OBSERVE_APPLICATION_STATUS_PAGE, device_id=device_id,
@@ -230,9 +249,36 @@ def sync_local_observation(body: LocalObservationSync,
                                   event_id=str(envelope.get("event_id") or "desktop-local-terminal"), sequence=3)
     except (KeyError, ValueError) as exc:
         raise HTTPException(409, "observation_persistence_conflict") from exc
+    return operation_id
+
+
+@router.post("/sync-local-observation")
+def sync_local_observation(body: LocalObservationSync,
+                           authorization: str | None = Header(default=None),
+                           x_recruitops_instance_id: str | None = Header(default=None)):
+    operation_id = _persist_local_observation(body, [body.application_id], authorization,
+                                              x_recruitops_instance_id)
     return sync_status(StatusSync(application_id=body.application_id,
                                   observation_operation_id=operation_id, page_url=body.page_url),
                        authorization, x_recruitops_instance_id)
+
+
+@router.post("/sync-local-observations")
+def sync_local_observations(body: LocalBatchObservationSync,
+                            authorization: str | None = Header(default=None),
+                            x_recruitops_instance_id: str | None = Header(default=None)):
+    operation_id = _persist_local_observation(body, body.application_ids, authorization,
+                                              x_recruitops_instance_id)
+    results = []
+    for application_id in body.application_ids:
+        try:
+            result = sync_status(StatusSync(application_id=application_id,
+                                            observation_operation_id=operation_id, page_url=body.page_url),
+                                 authorization, x_recruitops_instance_id)
+            results.append({"application_id": application_id, "success": result.get("success") is True})
+        except HTTPException as exc:
+            results.append({"application_id": application_id, "success": False, "reason": str(exc.detail)})
+    return {"results": results}
 
 
 @router.post("/sync")

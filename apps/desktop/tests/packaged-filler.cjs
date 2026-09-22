@@ -7,7 +7,7 @@ module.exports=async function packagedFiller(desktop,shell,workbench,profile) {
   const requests=[];
   await desktop.context().route('https://example.com/**',async route=>{
     requests.push(await route.request().allHeaders());
-    await route.fulfill({status:200,contentType:'text/html',body:'<!doctype html><title>Synthetic recruitment form</title><h1>Synthetic recruitment form</h1><form><label>姓名<input id="name"></label><label>密码<input type="password" id="password"></label><label>验证码<input id="otp" autocomplete="one-time-code"></label><button type="submit">Submit fixture</button></form><a href="/recruitops-next">Next fixture</a>'});
+    await route.fulfill({status:200,contentType:'text/html; charset=utf-8',body:'<!doctype html><title>Synthetic recruitment form</title><h1>Synthetic recruitment form</h1><form><label>姓名<input id="name"></label><label>密码<input type="password" id="password"></label><label>验证码<input id="otp" autocomplete="one-time-code"></label><button type="submit">Submit fixture</button></form><a href="/recruitops-next">Next fixture</a>'});
   });
   const record=await workbench.evaluate(async url=>{
     const response=await fetch('/api/local-ui/applications/manual',{method:'POST',headers:{'Content-Type':'application/json','X-RecruitOps-Local-UI':'1'},
@@ -26,7 +26,7 @@ module.exports=async function packagedFiller(desktop,shell,workbench,profile) {
   for(const headers of requests){expect(headers.authorization).toBeUndefined();expect(headers.referer).toBeUndefined();}
   const profileFile=path.join(profile,'synthetic-filler.json');
   const resumeFile=path.join(profile,'synthetic-resume.pdf');
-  await fs.writeFile(profileFile,JSON.stringify({name:'Synthetic Packaged Candidate'}));
+  await fs.writeFile(profileFile,JSON.stringify({basic:{fullName:'Synthetic Packaged Candidate'}}));
   await fs.writeFile(resumeFile,Buffer.from('%PDF-1.4\n% anonymous packaged fixture\n'));
   await desktop.evaluate(({dialog},paths)=>{
     const picks=[paths.profile,paths.resume];
@@ -38,6 +38,7 @@ module.exports=async function packagedFiller(desktop,shell,workbench,profile) {
   await shell.locator('#filler-profile-import').click();
   await shell.locator('#filler-attachment-select').click();
   await shell.getByRole('tab',{name:'扫描与填写',exact:true}).click();
+  await shell.locator('#filler-advanced > summary').click();
   await shell.locator('#filler-scan').click();
   await expect(shell.locator('#filler-fields')).toContainText('Synthetic Packaged Candidate');
   await shell.screenshot({path:'test-results/packaged-filler-preview.png'});

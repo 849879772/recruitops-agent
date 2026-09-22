@@ -170,7 +170,7 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         if url.path == "/api/local-ui/configuration/read":
             return route.fulfill(json=config)
         if url.path == "/api/local-ui/configuration/save":
-            return route.fulfill(json={"message": "Saved fixture"})
+            return route.fulfill(json={"message": "Saved fixture", "restart_required": True})
         if url.path == "/api/local-ui/applications/manual":
             assert request.headers["x-recruitops-local-ui"] == "1"
             manual_attempts += 1
@@ -209,6 +209,10 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         browser = playwright.chromium.launch(channel=os.environ.get("RECRUITOPS_TEST_BROWSER_CHANNEL") or None)
         context = browser.new_context(viewport={"width": width, "height": 900}, service_workers="block")
         context.add_init_script("""window.recruitopsDesktop = Object.freeze({
+            applySavedConfiguration() {
+                window.__applyCalls = (window.__applyCalls || 0) + 1;
+                return Promise.resolve({scheduled:true});
+            },
             onApplicationDraft(callback) {
                 window.__fixtureDraft = callback;
                 callback({company_name:'',job_title:'Queued shell draft'});
@@ -305,6 +309,7 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         page.locator('[name="title_keywords"]').fill("Python")
         page.locator("#configuration-save").click()
         expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
+        assert page.evaluate("window.__applyCalls || 0") == 0
         saved = json.loads(next(body for _, path, body in calls if path.endswith("/configuration/save")))
         assert saved["active_model_connection_id"] == "test"
         assert saved["profile"]["scope"]["industry_groups"] == ["test"]
@@ -343,7 +348,8 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         page.locator('#configuration-industry-groups input').check()
         saves_before = sum(path.endswith("/configuration/save") for _, path, _ in calls)
         page.locator("#configuration-complete").click()
-        expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
+        expect(page.locator("#configuration-save-result")).to_contain_text("正在自动应用")
+        assert page.evaluate("window.__applyCalls || 0") == 1
         assert sum(path.endswith("/configuration/save") for _, path, _ in calls) == saves_before + 1
         expect(page.locator('[name="mail_sync_on_startup"]')).to_have_count(0)
         page.locator('[name="mail_imap_host"]').fill("imap.example.test")
@@ -351,7 +357,8 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         page.locator('[name="mail_imap_password"]').fill("synthetic-mail-secret")
         page.locator('#configuration-industry-groups input').check()
         page.locator("#configuration-complete").click()
-        expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
+        expect(page.locator("#configuration-save-result")).to_contain_text("正在自动应用")
+        assert page.evaluate("window.__applyCalls || 0") == 2
         completion = json.loads([body for _, path, body in calls if path.endswith("/configuration/save")][-1])
         assert completion["complete_onboarding"] is True
         assert "llm_enabled" not in completion["settings"]
@@ -385,7 +392,7 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
             assert field not in disabled["settings"]
         assert "complete_onboarding" not in disabled
         assert not any(path.endswith(("/model/test", "/mail/test")) for _, path, _ in calls)
-        expect(page.locator("#configuration-restart-policy")).to_contain_text("保存不会调用模型、同步邮箱或自动重启")
+        expect(page.locator("#configuration-restart-policy")).to_contain_text("普通保存不会调用模型、同步邮箱或自动重启")
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         page.screenshot(path=str(tmp_path / f"runtime-options-{width}.png"), full_page=True)
         config["onboarding"] = {"ready": True, "missing": [], "messages": {}}

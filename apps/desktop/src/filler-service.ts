@@ -25,6 +25,7 @@ export class FillerService {
   private scanId = '';
   private scanState: ScanState = 'idle';
   private scanSummary = emptyScanSummary();
+  private blockedFrameOrigins: string[] = [];
   private undoReady = false;
   private busy = false;
   private operation?: { binding: Omit<Binding, 'frames'>; timedOut: boolean; type: string; cancelRequested: boolean; frames: FrameBinding[] };
@@ -64,6 +65,7 @@ export class FillerService {
   private clearPlan() {
     this.binding = undefined; this.fields = []; this.results = []; this.repeaters = []; this.attachments = [];
     this.scanId = ''; this.scanState = 'idle'; this.scanSummary = emptyScanSummary(); this.undoReady = false;
+    this.blockedFrameOrigins = [];
   }
   private idle() { if (this.busy) throw new Error('原操作尚未结束，请等待或刷新官网。'); }
   private valid(binding: Omit<Binding, 'frames'>) {
@@ -81,6 +83,7 @@ export class FillerService {
       busyOperation: this.operation ? { type: this.operation.type, timedOut: this.operation.timedOut, cancelRequested: this.operation.cancelRequested } : undefined,
       fields: current ? this.fields : [], results: current ? this.results : [], scanId: current ? this.scanId : '',
       scanState: current ? this.scanState : 'idle', scanSummary: current ? this.scanSummary : emptyScanSummary(),
+      blockedFrameOrigins: current ? this.blockedFrameOrigins : [],
       repeaters: current ? this.repeaters : [],
       attachmentTargets: current ? this.attachments.map(item=>({fieldId:item.selectionId,label:item.target.label,accept:item.target.accept,multiple:item.target.multiple})) : [],
       undoReady: current && this.undoReady, diagnostics: this.diagnostics, message: this.message,
@@ -222,6 +225,9 @@ export class FillerService {
       throw error;
     }
     const scanned = outcomes.filter(outcome => outcome.status === 'scanned');
+    this.blockedFrameOrigins = [...new Set(outcomes.filter(outcome => outcome.status === 'blocked')
+      .map(outcome => { try { const url = new URL(outcome.route.href); return url.protocol === 'https:' ? url.origin : ''; } catch { return ''; } })
+      .filter(Boolean))].slice(0, 8);
     const candidateCount = aggregate.candidates?.length || 0;
     const mappableCount = (aggregate.candidates || []).filter(item => item.candidate.customAnswerSupported).length;
     const unsupportedCount = candidateCount - mappableCount;

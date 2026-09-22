@@ -275,6 +275,15 @@
     const enabled = $("configuration-assistant-mode").value !== "disabled";
     return {llm_enabled: enabled, codex_runtime_enabled: enabled};
   }
+  async function savedConfigurationMessage(result) {
+    if (!result.restart_required || !window.recruitopsDesktop?.applySavedConfiguration) return result.message;
+    try {
+      const applied = await window.recruitopsDesktop.applySavedConfiguration();
+      if (applied.scheduled) return "配置已保存，正在自动应用；本地服务会短暂重启，工作台随后恢复。";
+      if (applied.reason === "active_tasks") return "配置已保存。后台任务正在运行，为避免中断任务，暂不自动应用；任务结束后请重新保存配置。";
+      return "配置已保存，但暂时无法自动应用；请退出并重新打开软件。";
+    } catch { return "配置已保存，但自动应用失败；请退出并重新打开软件。"; }
+  }
   $("model-connection-save").addEventListener("click", async () => {
     if (!original || reading || parsingResume) return inlineMessage("model-connection-message", "请先成功读取配置并等待当前操作完成。", true);
     const button = $("model-connection-save"); button.disabled = true;
@@ -347,7 +356,8 @@
       const payload = {settings, profile, model_connections: connections, active_model_connection_id: activeModelConnectionId};
       if (event.submitter === completeButton) payload.complete_onboarding = true;
       const result = await post("save", payload);
-      await load(); inlineMessage("configuration-save-result", result.message);
+      await load(); inlineMessage("configuration-save-result", payload.complete_onboarding
+        ? await savedConfigurationMessage(result) : result.message);
     } catch (error) { inlineMessage("configuration-save-result", `保存失败：${error.message}`, true); }
     finally { button.disabled = false; completeButton.disabled = false; }
   });

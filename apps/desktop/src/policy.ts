@@ -49,7 +49,7 @@ export type Command = { action: 'home' | 'back' | 'forward' | 'reload' | 'hide' 
   'filler-open' | 'filler-close' | 'filler-plugin' | 'filler-profile' | 'filler-profile-import' | 'filler-profile-export' |
   'filler-attachment-select' | 'filler-attachment-clear' | 'filler-demo-enable' | 'filler-demo-restore' |
   'filler-stop' |
-  'filler-scan' | 'filler-prepare' | 'filler-undo' |
+  'filler-scan' | 'filler-frame-allow' | 'filler-prepare' | 'filler-undo' |
   'filler-application-detect' | 'filler-application-flush' } |
   { action: 'filler-fill'; scanId: string; fieldIds: string[] } |
   { action: 'filler-profile-save'; profile: JsonObject; expectedVersion?: number } |
@@ -136,7 +136,7 @@ export function parseCommand(raw: unknown): Command {
   if (action === 'filler-attachment-upload' && exactKeys(r,['action','scanId','fieldId']) && boundedText(r.scanId,128) && boundedText(r.fieldId,512)) return {action,scanId:r.scanId,fieldId:r.fieldId};
   if (['filler-open','filler-close','filler-plugin','filler-profile','filler-profile-import','filler-profile-export',
       'filler-attachment-select','filler-attachment-clear','filler-demo-enable','filler-demo-restore','filler-scan','filler-prepare',
-      'filler-undo','filler-application-detect',
+      'filler-undo','filler-frame-allow','filler-application-detect',
       'filler-application-flush','filler-stop'].includes(String(action)) && Object.keys(r).length === 1) return {action} as Command;
   if (action === 'open' && typeof r.url === 'string' && Object.keys(r).length === 2) return { action, url: r.url };
   if ((action === 'select' || action === 'close') && Number.isSafeInteger(r.id) && Number(r.id) > 0 && Object.keys(r).length === 2) return { action, id: Number(r.id) };

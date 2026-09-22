@@ -17,5 +17,6 @@ contextBridge.exposeInMainWorld('recruitopsDesktop', Object.freeze({
     if (typeof callback !== 'function') throw new Error('Invalid callback');
     changedListener = callback;
     return () => { if (changedListener === callback) changedListener = undefined; };
-  }
+  },
+  applySavedConfiguration() { return ipcRenderer.invoke('desktop:apply-saved-configuration'); }
 }));

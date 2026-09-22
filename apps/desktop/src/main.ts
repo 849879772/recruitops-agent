@@ -55,7 +55,7 @@ let applicationCandidates: Record<string, unknown>[] = [];
 let applicationPage: ApplicationPage | undefined;
 let applicationQueue: PendingRegistration[] = [];
 let applicationMessage = '';
-let applicationBatchResults: {index:number;status:'saved'|'queued'|'failed';error?:string}[] = [];
+let applicationBatchResults: {index:number;status:'saved'|'queued'|'failed';error?:string;applicationId?:string}[] = [];
 let fillerOpen = false;
 const shellUrl = pathToFileURL(path.join(__dirname, '../renderer/index.html')).href;
 let window: BrowserWindow;
@@ -96,7 +96,7 @@ function state() {
     filler: { available:!!filler, open:fillerOpen, ...engine,
       supportedActions: ['filler-open','filler-close','filler-profile-save','filler-profile-import','filler-profile-export',
         'filler-profile-create','filler-profile-select','filler-profile-rename','filler-profile-delete','filler-stop',
-        'filler-attachment-select','filler-attachment-clear','filler-attachment-upload','filler-demo-enable','filler-demo-restore','filler-scan',
+        'filler-attachment-select','filler-attachment-clear','filler-attachment-upload','filler-demo-enable','filler-demo-restore','filler-scan','filler-frame-allow',
         'filler-prepare','filler-fill','filler-undo','filler-custom-save','filler-custom-delete',
         'filler-application-detect','filler-application-save','filler-application-save-batch','filler-application-flush','filler-application-cancel',
         'filler-application-retry','filler-application-correct'],
@@ -217,6 +217,30 @@ async function changeWriteOptIn(enable: boolean) {
     await runtime.stop();
     if (!quitting) startOwnedRuntime(next);
   } finally { runtimeRestarting = false; publish(); }
+}
+async function applySavedConfiguration() {
+  if (quitting || runtimeRestarting || runtime?.state.status !== 'ready' || !launchConfig)
+    return { scheduled: false, reason: 'unavailable' };
+  try {
+    if ((await runtime.activity()).activeTasks.length)
+      return { scheduled: false, reason: 'active_tasks' };
+  } catch { return { scheduled: false, reason: 'activity_unknown' }; }
+  runtimeRestarting = true;
+  notice = '配置已保存，正在应用并重启本地服务…';
+  publish();
+  const next = launchConfig;
+  setTimeout(() => {
+    void (async () => {
+      try {
+        bridge?.stop(); bridge = undefined;
+        await runtime?.stop();
+        if (!quitting) startOwnedRuntime(next);
+      } catch {
+        notice = '配置已保存，但自动应用失败；请退出并重新打开软件。';
+      } finally { runtimeRestarting = false; publish(); }
+    })();
+  }, 150);
+  return { scheduled: true };
 }
 function layout() {
   const [width, height] = window.getContentSize();
@@ -448,6 +472,12 @@ function showWorkbench() {
   active = 'workbench'; layout();
 }
 
+async function syncObservedApplicationStatus(wc: WebContents, context: ApplicationPage, applicationIds: string[]) {
+  if (!applicationIds.length || !browserService || !fillerApplications || wc.getURL() !== context.url) return [];
+  const observation = await browserService.observe(wc, randomUUID(), applicationIds);
+  return fillerApplications.syncObservations(context, applicationIds, observation as Record<string, unknown>);
+}
+
 async function execute(raw: unknown) {
   const command = parseCommand(raw);
   if (['home','select','close','capture'].includes(command.action)) fillerOpen=false;
@@ -517,8 +547,34 @@ async function execute(raw: unknown) {
     if(command.action==='filler-scan') {
       const id=runtime?.state.instanceId;if(!id)throw new Error('本地实例尚未就绪。');
       const settings=fillerStore.snapshot().settings;
-      const origins=Array.isArray(settings.allowedFrameOrigins)?settings.allowedFrameOrigins.filter(value=>typeof value==='string') as string[]:[];
+      const site=new URL(wc.getURL()).origin;
+      const scoped=settings.allowedFrameOriginsBySite;
+      const saved=scoped&&typeof scoped==='object'&&!Array.isArray(scoped)?(scoped as Record<string,unknown>)[site]:undefined;
+      const origins=[...(Array.isArray(settings.allowedFrameOrigins)?settings.allowedFrameOrigins.filter(value=>typeof value==='string') as string[]:[]),
+        ...(Array.isArray(saved)?saved.filter(value=>typeof value==='string') as string[]:[])];
       await filler.scan(wc,id,origins);
+    }
+    if(command.action==='filler-frame-allow') {
+      const id=runtime?.state.instanceId;if(!id)throw new Error('本地实例尚未就绪。');
+      const origin=filler.snapshot(wc).blockedFrameOrigins[0];
+      if(!origin)throw new Error('当前扫描没有可授权的嵌入表单，请重新扫描。');
+      websiteUrl(origin);
+      const pageUrl=wc.getURL(),site=new URL(pageUrl).origin;
+      const {response}=await dialog.showMessageBox(window,{type:'question',buttons:['取消','允许并重新扫描'],defaultId:0,cancelId:0,
+        message:'允许读取此招聘网站的嵌入表单？',
+        detail:`当前网站：${site}\n嵌入表单：${origin}\n只对当前招聘网站授权。仍需您确认后才会填写，不会自动提交。`});
+      if(response!==1)return state();
+      if(wc.isDestroyed()||wc.getURL()!==pageUrl||!filler.snapshot(wc).blockedFrameOrigins.includes(origin))
+        throw new Error('页面已变化，请重新扫描后授权。');
+      const settings=fillerStore.snapshot().settings;
+      const raw=settings.allowedFrameOriginsBySite;
+      const scoped=raw&&typeof raw==='object'&&!Array.isArray(raw)?raw as Record<string,unknown>:{};
+      const prior=Array.isArray(scoped[site])?scoped[site].filter(value=>typeof value==='string') as string[]:[];
+      if(!prior.includes(origin)&&prior.length>=8)throw new Error('当前网站的嵌入表单授权已达到上限。');
+      fillerStoreSnapshot=fillerStore.saveSettings({...settings,allowedFrameOriginsBySite:{...scoped,[site]:[...new Set([...prior,origin])]}});
+      refreshFillerStoreSnapshot();
+      const legacy=Array.isArray(settings.allowedFrameOrigins)?settings.allowedFrameOrigins.filter(value=>typeof value==='string') as string[]:[];
+      await filler.scan(wc,id,[...new Set([...legacy,...prior,origin])]);
     }
     if(command.action==='filler-fill') {
       if(typeof active!=='number' || tabs.get(active)?.view.webContents!==wc) throw new Error('标签页已变化，请重新扫描。');
@@ -554,6 +610,14 @@ async function execute(raw: unknown) {
       const result=await fillerApplications.register(context,{company:command.company,title:command.title,record_url:command.recordUrl,
         ...(command.city?{city:command.city}:{}),progress_url_confirmed:true},true);
       applicationQueue=await fillerApplications.pending();applicationMessage=(result as any).queued?'本地服务暂不可用，已加入待补传队列。':'投递记录已保存。';
+      const applicationId=(result as any).result?.application_id;
+      if(!(result as any).queued&&typeof applicationId==='string'&&command.recordUrl===context.url&&
+          applicationCandidates.some(item=>item.title===command.title&&item.sourceStatus)) {
+        try {
+          const synced=await syncObservedApplicationStatus(wc,context,[applicationId]);
+          applicationMessage=synced[0]?.success?'投递记录已保存，官网状态已核实并同步。':'投递记录已保存；官网状态未能核实，原有进度未改动。';
+        } catch {applicationMessage='投递记录已保存；官网状态同步未完成，原有进度未改动。';}
+      }
     }
     if(command.action==='filler-application-save-batch') {
       if(!fillerApplications) throw new Error('投递记录服务尚未就绪。');
@@ -565,6 +629,15 @@ async function execute(raw: unknown) {
       applicationQueue=await fillerApplications.pending();
       const count=(status:string)=>applicationBatchResults.filter(row=>row.status===status).length;
       applicationMessage=`新增完成：已保存 ${count('saved')} 条，待补传 ${count('queued')} 条，失败 ${count('failed')} 条。`;
+      const ids=applicationBatchResults.filter(row=>row.status==='saved'&&row.applicationId&&
+        applicationCandidates.some(item=>item.title===command.records[row.index]?.title&&item.sourceStatus))
+        .map(row=>row.applicationId!);
+      if(ids.length&&command.records.every(row=>row.recordUrl===context.url)) {
+        try {
+          const synced=await syncObservedApplicationStatus(wc,context,ids);
+          applicationMessage+=` 官网状态核实并同步 ${synced.filter(row=>row.success).length} 条；未核实的记录未改变原有进度。`;
+        } catch {applicationMessage+=' 官网状态同步未完成，原有进度未改动。';}
+      }
     }
     if(command.action==='filler-application-cancel') {if(!fillerApplications)throw new Error('投递记录服务尚未就绪。');await fillerApplications.cancel(command.queueId);applicationQueue=await fillerApplications.pending();}
     if(command.action==='filler-application-correct') {
@@ -700,6 +773,12 @@ else {
     };
     ipcMain.handle('desktop:state', event => { assertSender(event); return state(); });
     ipcMain.handle('desktop:command', async (event, command) => { assertSender(event); try { return await execute(command); } finally { layout(); } });
+    ipcMain.handle('desktop:apply-saved-configuration', event => {
+      if (!workbench || event.sender !== workbench.webContents ||
+          event.senderFrame !== workbench.webContents.mainFrame ||
+          !api || new URL(event.senderFrame.url).origin !== api) throw new Error('Untrusted IPC sender');
+      return applySavedConfiguration();
+    });
     // Native bitmap icon, no personal or external asset dependency.
     const pixels = Buffer.alloc(16 * 16 * 4);
     for (let i = 0; i < pixels.length; i += 4) { pixels[i] = 90; pixels[i + 1] = 145; pixels[i + 2] = 25; pixels[i + 3] = 255; }

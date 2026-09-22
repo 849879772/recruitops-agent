@@ -263,6 +263,55 @@ def test_desktop_local_observation_is_persisted_then_verified_without_stage_inpu
         assert session.get(ApplicationSnapshot, application_id).stage == "written"
 
 
+def test_desktop_batch_observation_syncs_distinct_confirmed_records_once(isolated):
+    from datetime import datetime, timezone
+    client, storage, headers, _ = isolated
+    titles = ["Platform Engineer", "Data Engineer"]
+    ids = [client.post(BASE + "/application", headers=headers,
+                       json={**REGISTRATION, "title": title}).json()["application_id"] for title in titles]
+    result = {
+        "evidence_only": True, "database_updated": False,
+        "application_ids": ids, "page_url": REGISTRATION["record_url"],
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "application_records": [
+            {"title": title, "status": "written", "label": "笔试中",
+             "evidence": f"{title} 笔试中", "context": f"{title} 笔试中", "confidence": 0.99}
+            for title in titles],
+    }
+    body = {"application_ids": ids, "page_url": REGISTRATION["record_url"],
+            "observation": {"protocol_version": 1, "type": "result", "operation_id": "desktop-local-batch",
+                            "event_id": "desktop-local-batch-event", "status": "SUCCEEDED", "result": result}}
+    assert client.post(BASE + "/sync-local-observations", headers=headers,
+                       json={**body, "stage": "offer"}).status_code == 422
+    response = client.post(BASE + "/sync-local-observations", headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["results"] == [{"application_id": item, "success": True} for item in ids]
+    with storage.session() as session:
+        assert [session.get(ApplicationSnapshot, item).stage for item in ids] == ["written", "written"]
+    repeated = client.post(BASE + "/sync-local-observations", headers=headers, json=body)
+    assert repeated.status_code == 200
+    with storage.session() as session:
+        assert all(len(session.get(ApplicationSnapshot, item).stage_history) == 2 for item in ids)
+
+
+def test_desktop_batch_observation_rejects_unbound_application_before_any_write(isolated):
+    from datetime import datetime, timezone
+    client, storage, headers, _ = isolated
+    ids = [client.post(BASE + "/application", headers=headers,
+                       json={**REGISTRATION, "title": title}).json()["application_id"]
+           for title in ["Platform Engineer", "Data Engineer"]]
+    body = {"application_ids": ids, "page_url": REGISTRATION["record_url"],
+            "observation": {"protocol_version": 1, "type": "result", "operation_id": "desktop-batch-unbound",
+                            "event_id": "desktop-batch-unbound-event", "status": "SUCCEEDED", "result": {
+                                "evidence_only": True, "database_updated": False,
+                                "application_ids": [ids[0]], "page_url": REGISTRATION["record_url"],
+                                "captured_at": datetime.now(timezone.utc).isoformat(),
+                                "application_records": []}}}
+    assert client.post(BASE + "/sync-local-observations", headers=headers, json=body).status_code == 409
+    with storage.session() as session:
+        assert [session.get(ApplicationSnapshot, item).stage for item in ids] == ["applied", "applied"]
+
+
 def test_desktop_local_observation_rejects_unbound_or_non_normalized_payload(isolated):
     from datetime import datetime, timezone
     client, storage, headers, _ = isolated

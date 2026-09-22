@@ -94,7 +94,7 @@ export class FillerApplicationService {
     // A renderer notification failure must not turn a committed write into a retry.
     try { this.changed({ applications: true, counts: true, preservePosition: true }); } catch { /* advisory */ }
   }
-  private async api(path: 'applications' | 'application' | 'sync' | 'sync-local-observation', body?: object): Promise<any> {
+  private async api(path: 'applications' | 'application' | 'sync' | 'sync-local-observation' | 'sync-local-observations', body?: object): Promise<any> {
     const connection = this.connection();
     if (!connection) throw new Error('offline');
     if (connection.instanceId !== this.instanceId) throw new Error('instance_changed');
@@ -157,12 +157,13 @@ export class FillerApplicationService {
       const values = inputs.map(registration);
       if (new Set(values.map(value => JSON.stringify([value.company,value.title]))).size !== values.length)
         throw new Error('duplicate_registration_batch');
-      const results: {index:number;status:'saved'|'queued'|'failed';error?:string}[] = [];
+      const results: {index:number;status:'saved'|'queued'|'failed';error?:string;applicationId?:string}[] = [];
       for (const [index,value] of values.entries()) {
         try {
           this.page(context);
           const result = await this.registerValue(value);
-          results.push({index,status:result.queued?'queued':'saved',...('error' in result?{error:result.error}:{})});
+          results.push({index,status:result.queued?'queued':'saved',...('error' in result?{error:result.error}:{}),
+            ...(!result.queued&&typeof result.result?.application_id==='string'?{applicationId:result.result.application_id}:{})});
         } catch (error) {
           const code = error instanceof Error && /^(foreground_changed|queue_full|pending_conflict_correct_first)$/.test(error.message)
             ? error.message : 'registration_failed';
@@ -268,6 +269,23 @@ export class FillerApplicationService {
       this.page(context);
       if (result.success === true) this.refresh();
       return result;
+    });
+  }
+  async syncObservations(context: ApplicationPage, applicationIds: string[], observation: Record<string, unknown>) {
+    return this.exclusive(async () => {
+      this.page(context);
+      if (!Array.isArray(applicationIds) || !applicationIds.length || applicationIds.length > 50 ||
+          new Set(applicationIds).size !== applicationIds.length ||
+          applicationIds.some(id => typeof id !== 'string' || !id || id.length > 255) ||
+          !observation || typeof observation !== 'object' || Array.isArray(observation)) throw new Error('observation_required');
+      const result = await this.api('sync-local-observations', { application_ids: applicationIds,
+        page_url: context.url, observation });
+      this.page(context);
+      if (!Array.isArray(result.results) || result.results.length !== applicationIds.length ||
+          result.results.some((item: any, index: number) => item?.application_id !== applicationIds[index] ||
+            typeof item?.success !== 'boolean')) throw new Error('invalid_response');
+      if (result.results.some((item: any) => item.success)) this.refresh();
+      return result.results as {application_id:string;success:boolean;reason?:string}[];
     });
   }
 }

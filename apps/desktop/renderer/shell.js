@@ -377,6 +377,10 @@ function renderFiller(state) {
   const fields=f.fields||[],eligible=fields.filter(field=>field.fillable!==false&&!field.blocked);
   const needsAnswer=fields.filter(field=>field.fillable===false&&!field.blocked).length,unsupported=fields.filter(field=>field.blocked).length;
   const scanState=f.scanState||(f.scanId?'complete':'idle'),scanSummary=f.scanSummary||{};
+  const blockedOrigins=Array.isArray(f.blockedFrameOrigins)?f.blockedFrameOrigins:[];
+  $('filler-frame-allow').hidden=!blockedOrigins.length;
+  $('filler-frame-allow').textContent=blockedOrigins.length>1?`允许扫描嵌入表单（${blockedOrigins.length} 个待授权）`:'允许扫描嵌入表单';
+  $('filler-frame-allow').disabled=!blockedOrigins.length||!allowed('frame-allow')||!!selected?.loading||profileDirty||profileConflict;
   const fieldsById=new Map(fields.map(field=>[field.fieldId,field]));
   for(const row of $('filler-fields').children) {
     const field=fieldsById.get(row.dataset.fieldId),edit=row.querySelector('.filler-candidate-edit');
@@ -604,7 +608,7 @@ function render(state) {
 window.addEventListener('DOMContentLoaded', () => {
   $('startup-diagnostics').onclick = () => command({action:'home'});
   for(const action of ['open','close','plugin','profile','scan','undo']) $('filler-'+action).onclick=()=>command({action:'filler-'+action});
-  for(const action of ['scan','undo',...Object.keys(capabilityFor).filter(action=>!['profile-save','profile-create','profile-select','profile-rename','profile-delete',
+  for(const action of ['scan','undo','frame-allow',...Object.keys(capabilityFor).filter(action=>!['profile-save','profile-create','profile-select','profile-rename','profile-delete',
     'custom-save','application-save','application-cancel','application-retry','application-correct'].includes(action))]) {
     const button=$('filler-'+action);if(button)button.onclick=()=>fillerAction(action);
   }

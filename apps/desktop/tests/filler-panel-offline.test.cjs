@@ -38,6 +38,7 @@ function descendants(root){return root.children.flatMap(child=>child instanceof 
 class Document {
   constructor(){
     this.elements=new Map();this.activeElement=null;this.body=new Element('body',this);
+    this.documentElement={style:{setProperty(){}}};
     for(const [,id] of html.matchAll(/\bid="([^"]+)"/g))this.getElementById(id);
   }
   getElementById(id){if(!this.elements.has(id)){const item=new Element('div',this);item.id=id;this.elements.set(id,item);}return this.elements.get(id);}
@@ -57,7 +58,7 @@ function initialState({fields,queue=[],candidates=[]}={}){
     runtimeRestarting:false,workbenchLoading:false,workbenchRequested:false,workbenchError:false,configurationError:'',
     filler:{available:true,open:true,pluginReady:true,profileReady:true,scanId:'scan-one',undoReady:false,busy:false,message:'Ready',
       capabilities:{persistentProfile:true,attachment:true,repeatedSections:true,frames:true,customAnswers:true,diagnostics:true,applications:true,offlineQueue:true},
-      supportedActions:['filler-scan','filler-fill','filler-prepare','filler-undo','filler-profile-save','filler-profile-create','filler-profile-select','filler-profile-rename','filler-profile-delete',
+      supportedActions:['filler-scan','filler-frame-allow','filler-fill','filler-prepare','filler-undo','filler-profile-save','filler-profile-create','filler-profile-select','filler-profile-rename','filler-profile-delete',
         'filler-demo-enable','filler-demo-restore','filler-stop','filler-custom-save','filler-custom-delete','filler-application-detect','filler-application-save','filler-application-save-batch',
         'filler-application-flush','filler-application-cancel','filler-application-retry','filler-application-correct'],
       profile:{ready:true,mode:'personal',version:1,data:profile,activeProfileId:profileId,activeProfileName:'个人资料',personalProfiles:[{id:profileId,name:'个人资料'}]},
@@ -130,6 +131,9 @@ async function setup(options={}){
           fillable:item.fillable??true,blocked:item.blocked??false}));
         f.repeaters=clone(step.repeaters||[]);f.scanState=step.scanState||'complete';f.scanSummary=clone(step.scanSummary||{});
       }
+      if(command.action==='filler-frame-allow'){
+        f.blockedFrameOrigins=[];f.scanState='complete';f.scanSummary={framesScanned:2,framesFailed:0};
+      }
       if(command.action==='filler-prepare'){clearScan();f.scanState='consumed';}
       if(command.action==='filler-fill'){
         f.results=command.fieldIds.map(id=>{
@@ -173,6 +177,19 @@ async function setup(options={}){
   return {document,state,commands,push(){listener?.(clone(state));}};
 }
 function byText(root,text){return descendants(root).find(item=>item.textContent===text);}
+
+test('blocked embedded form offers an explicit grant action and clears it after rescanning',async()=>{
+  const ui=await setup();
+  ui.state.filler.blockedFrameOrigins=['https://forms.example.test'];
+  ui.state.filler.scanState='partial';
+  ui.push();
+  const button=ui.document.getElementById('filler-frame-allow');
+  assert.equal(button.hidden,false);
+  assert.equal(button.disabled,false);
+  await button.click();
+  assert.equal(ui.commands.at(-1).action,'filler-frame-allow');
+  assert.equal(button.hidden,true);
+});
 
 test('profile mode version and scoped custom-answer edit flow survive the renderer bridge',async()=>{
   const ui=await setup();

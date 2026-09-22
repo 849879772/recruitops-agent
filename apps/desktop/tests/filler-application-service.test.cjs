@@ -87,9 +87,25 @@ test('batch registration writes each selected role directly and keeps queued fai
     ?new Response('{}',{status:503}):new Response('{"ok":true,"application_id":"fixture"}')});
   const results=await f.service.registerBatch({...f.current},['First','Second','Third'].map(title=>({...input,title})),true);
   assert.deepEqual(results.map(item=>item.status),['saved','queued','saved']);
+  assert.deepEqual(results.map(item=>item.applicationId),['fixture',undefined,'fixture']);
   assert.equal(results[1].error,'http_503');
   assert.deepEqual(f.calls.map(call=>[call.init.method,JSON.parse(call.init.body).title]),[['POST','First'],['POST','Second'],['POST','Third']]);
   assert.deepEqual((await f.service.pending()).map(item=>item.registration.title),['Second']);
+});
+
+test('one page-bound observation can sync confirmed statuses for several saved applications',async()=>{
+  const ids=['application-one','application-two'];
+  const f=fixture({handler:async(url,init)=>{
+    assert.ok(url.endsWith('/sync-local-observations'));
+    const body=JSON.parse(init.body);
+    assert.deepEqual(body.application_ids,ids);
+    assert.equal(body.page_url,input.record_url);
+    return new Response(JSON.stringify({results:ids.map(application_id=>({application_id,success:true}))}));
+  }});
+  const results=await f.service.syncObservations(f.current,ids,{protocol_version:1});
+  assert.deepEqual(results.map(item=>item.success),[true,true]);
+  assert.equal(f.refresh.length,1);
+  await assert.rejects(f.service.syncObservations(f.current,[ids[0],ids[0]],{}),/observation_required/);
 });
 
 test('batch validates all selected roles before writes and rejects empty, duplicate or unconfirmed selection',async()=>{

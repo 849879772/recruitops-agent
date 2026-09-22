@@ -216,6 +216,19 @@ test('frame execution failure is reported as a failed scan, not an unscanned emp
   assert.equal(snapshot.diagnostics[0].code,'filler_frame_unreachable');
 });
 
+test('cross-origin form frame requires an explicit origin grant and clears the blocked hint after rescan',async()=>{
+  const {wc,service,frame,executor}=scanOnlyService();
+  const embedded={processId:8,routingId:10,url:'https://forms.example.test/apply',detached:false,frames:[]};
+  frame.framesInSubtree=[frame,embedded];
+  executor.execute=async(_page,target)=>scanOutcome({...serviceRoute(target,wc),allowSubframe:target!==frame});
+  await service.scan(wc,'a'.repeat(32));
+  assert.deepEqual(service.snapshot(wc).blockedFrameOrigins,['https://forms.example.test']);
+  assert.equal(service.snapshot(wc).scanSummary.framesFailed,1);
+  await service.scan(wc,'a'.repeat(32),['https://forms.example.test']);
+  assert.deepEqual(service.snapshot(wc).blockedFrameOrigins,[]);
+  assert.equal(service.snapshot(wc).scanSummary.framesScanned,2);
+});
+
 test('scan-in-progress is visible even before the first frame finishes',async()=>{
   let finish;
   const harness=scanOnlyService({scanResult:()=>new Promise(resolve=>{finish=resolve;})});
