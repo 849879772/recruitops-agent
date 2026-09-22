@@ -37,7 +37,10 @@ def test_codex_project_instructions_define_only_local_task_ids() -> None:
 
 
 def test_runtime_review_instructions_are_idempotent_on_resume() -> None:
-    from packages.codex_runtime.instructions import with_response_language
+    from packages.codex_runtime.instructions import (
+        USER_FACING_TASK_OUTPUT_INSTRUCTIONS,
+        with_response_language,
+    )
 
     original = {"developerInstructions": "Caller policy"}
     first = with_response_language(original)
@@ -46,8 +49,11 @@ def test_runtime_review_instructions_are_idempotent_on_resume() -> None:
     assert original == {"developerInstructions": "Caller policy"}
     text = resumed["developerInstructions"]
     assert "默认全程使用简体中文" in text
-    assert "all_non_terminal=true" in text and "只传 run_id" in text
+    assert "all_non_terminal=true" in text and "内部保存的 run_id" in text
     assert "不得再次减去" in text
+    assert text.count(USER_FACING_TASK_OUTPUT_INSTRUCTIONS) == 1
+    for phrase in ("不默认展示", "公司发现", "岗位抓取", "任务轨迹"):
+        assert phrase in text
 
 
 def test_recruitops_skills_cover_the_product_capabilities() -> None:
@@ -76,6 +82,8 @@ def test_background_crawl_authorization_is_scoped_and_preserved_on_resume():
     for phrase in ("无需再次确认", "先创建定时任务", "write_enabled", "配置权限不构成启动",
                    "daily_recruitment_sync_status", "不包含投递岗位"):
         assert phrase in BACKGROUND_RECRUITMENT_INSTRUCTIONS
+    assert "run_id 仅在内部保留" in BACKGROUND_RECRUITMENT_INSTRUCTIONS
+    assert "立即告知真实 run_id" not in BACKGROUND_RECRUITMENT_INSTRUCTIONS
     response = describe_capabilities(CapabilitiesInput())
     assert any("后台执行全量抓取" in value for value in response.data.capabilities)
 

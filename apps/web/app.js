@@ -121,6 +121,8 @@
     recruitment_mail_search: "招聘邮件",
     recruitment_mail_detail: "邮件详情",
     recruitment_mail_review: "邮件关联复核",
+    recruitment_mail_process: "处理邮件信息",
+    full_recruitment_sync: "全量爬取",
     operation_run: "手动运营任务",
     automation_plan: "定时计划预览",
   };
@@ -166,13 +168,15 @@
   // This is deliberately deterministic: the UI chooses an existing API task before making a request.
   const INTENT_RULES = [
     { taskType: "automation_plan", label: "定时计划预览", terms: ["制定定时任务", "定时计划", "安排每天", "每天凌晨", "每日凌晨", "每天更新", "每日更新"] },
-    { taskType: "operation_run", label: "手动运营任务", terms: ["运行每日抓取", "运行每日招聘情报", "执行每日招聘情报", "运行爬虫健康", "同步招聘邮箱", "邮箱同步", "运行投递进度任务", "执行投递复核任务"] },
+    { taskType: "full_recruitment_sync", label: "全量爬取", terms: ["全量爬取", "全量抓取", "运行每日抓取", "运行每日招聘情报", "执行每日招聘情报"] },
+    { taskType: "operation_run", label: "手动运营任务", terms: ["运行爬虫健康", "同步招聘邮箱", "邮箱同步", "运行投递进度任务", "执行投递复核任务"] },
     {
       taskType: "recommendation_explanation",
       label: "岗位匹配解释",
       terms: ["为什么匹配", "匹配原因", "适合我", "岗位匹配", "解释岗位", "推荐理由"],
     },
     { taskType: "application_status_review", label: "投递进度复核", terms: ["复核投递", "检查投递", "同步投递", "更新投递", "更新申请", "岗位状态", "官网状态"] },
+    { taskType: "recruitment_mail_process", label: "处理邮件信息", terms: ["处理邮件信息", "处理招聘邮件", "整理招聘邮件", "处理全部待处理邮件"] },
     { taskType: "recruitment_mail_review", label: "邮件关联复核", terms: ["复核邮件", "关联邮件", "邮件关联"] },
     { taskType: "recruitment_mail_search", label: "招聘邮件", terms: ["招聘邮件", "邮箱消息", "企业邮件", "offer 邮件"] },
     { taskType: "application_query", label: "投递状态", terms: ["投递", "申请进度", "投递进度", "申请状态", "已投", "投了哪些"] },
@@ -189,6 +193,8 @@
     application_query: "查询我的投递进度",
     application_status_review: "复核官网投递状态",
     recommendation_explanation: "请解释这个岗位为什么匹配我",
+    full_recruitment_sync: "立即在后台执行一次全量岗位爬取，包括公司发现、岗位抓取、职位详情补全和匹配评分",
+    recruitment_mail_process: "处理全部待处理的招聘邮件，并按照安全规则更新投递进度和日程",
   };
 
   const api = async (path, options = {}) => {
@@ -205,7 +211,7 @@
     return raw
       .replace(
         /Codex turn interrupted after reaching the runtime time limit\.?/gi,
-        "本次对话回合达到运行时限并已结束；已经启动的后台任务不会因此自动取消，请按运行编号查询实际状态。中断前已经完成的写入会保留。",
+        "本次对话回合达到运行时限并已结束；已经启动的后台任务不会因此自动取消，可以直接询问最近任务的进度。中断前已经完成的写入会保留。",
       )
       .replace(
         /Codex turn interrupted after reaching the tool-call budget\.?/gi,
@@ -216,6 +222,28 @@
         "本次任务连续多次没有产生新进展，已被运行时中断；中断前已经完成的写入会保留。",
       );
   };
+  const RUNTIME_STAGE_LABELS = {
+    starting: "准备任务",
+    scope_pending: "准备抓取范围",
+    scope_frozen: "抓取范围已确认",
+    discovery: "公司发现",
+    reconciliation: "公司整理",
+    companies: "岗位抓取",
+    details: "职位详情补全",
+    crawl: "岗位抓取",
+    matching: "岗位评分",
+    offline_reconciliation: "岗位状态整理",
+    reporting: "生成结果",
+  };
+  function friendlyRuntimeProgress(value) {
+    const raw = text(value, "").trim();
+    if (!raw) return "处理中";
+    const [stage, detail = ""] = raw.split(":", 2);
+    const label = RUNTIME_STAGE_LABELS[stage];
+    if (!label) return raw;
+    const count = detail.match(/^\d+\/\d+$/)?.[0];
+    return count ? `${label} ${count}` : label;
+  }
   const setText = (id, value) => { const node = $(id); if (node) node.textContent = text(value); };
   const clear = (node) => { while (node?.firstChild) node.removeChild(node.firstChild); };
   const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
@@ -550,7 +578,9 @@
     const contextPolicy = $("assistant-context-policy");
     const diagnostic = assistantAvailability();
     const available = diagnostic.status === "ready";
-    if (strip) strip.hidden = !available;
+    // Raw thread, turn, item and tool identifiers remain available in task traces.
+    // They are diagnostic metadata, not useful status for ordinary assistant users.
+    if (strip) strip.hidden = true;
     if ($("assistant-thread-label")) $("assistant-thread-label").hidden = !available;
     const availability = $("assistant-availability");
     if (availability) { availability.hidden = available; availability.dataset.state = diagnostic.status; }
@@ -3032,7 +3062,7 @@
     const title = document.createElement("strong"); title.textContent = `${result.display_label || TASK_LABELS[result.task_type] || text(result.task_type, "助理任务")} · ${text(result.steps, 0)} 步`;
     statusLine.append(badge, title);
     const meta = document.createElement("span"); meta.className = "result-meta";
-    meta.textContent = [response.tool_name, response.elapsed_ms == null ? null : `${response.elapsed_ms} ms`, result.current_step ? `当前：${result.current_step}` : null].filter(Boolean).join(" · ");
+    meta.textContent = [response.tool_name, response.elapsed_ms == null ? null : `${response.elapsed_ms} ms`, result.current_step ? `当前：${friendlyRuntimeProgress(result.current_step)}` : null].filter(Boolean).join(" · ");
     header.append(statusLine, meta); node.appendChild(header);
 
     if (result.answer) {
@@ -3223,8 +3253,8 @@
         const meta = document.createElement("span");
         const turnCount = conversation.turn_count ?? conversation.turnCount ?? (Array.isArray(conversation.turns) ? conversation.turns.length : null);
         const countLabel = turnCount === null || turnCount === undefined ? "Codex 线程" : `${turnCount} 轮`;
-        meta.textContent = `${countLabel} · thread ${threadId} · ${codexThreadUpdatedAt(conversation)}`;
-        button.title = `thread ${text(threadId, "未绑定")}`;
+        meta.textContent = `${countLabel} · ${codexThreadUpdatedAt(conversation)}`;
+        button.title = codexThreadTitle(conversation);
         button.append(title, meta);
         button.addEventListener("click", () => void loadConversation(threadId));
         const remove = appendUiIcon(element("button", "conversation-delete-button"), "close");
@@ -3437,13 +3467,10 @@
         note.textContent = `为保持页面流畅，较早的 ${hiddenCount} 条消息未在当前窗口渲染。`;
         node.appendChild(note);
       }
-      visibleMessages.forEach((record, index) => {
-        const isLatestResult = index === visibleMessages.length - 1 && record.role === "assistant";
-        renderMessageRecord(record, node, isLatestResult);
-      });
+      visibleMessages.forEach((record) => renderMessageRecord(record, node, false));
     }
     node.dataset.state = state.messages.length ? "ready" : "empty";
-    setText("assistant-thread-label", `thread ${text(state.codexThreadId, "未绑定")} · ${state.messages.length} 条`);
+    setText("assistant-thread-label", `当前会话 · ${state.messages.length} 条`);
     if (shouldScroll) node.scrollTop = node.scrollHeight;
   }
 
@@ -3693,7 +3720,9 @@
       const progressValue = data.progress && typeof data.progress === "object"
         ? pick(data.progress.message, data.progress.status, data.progress.phase)
         : pick(data.progress, data.message, data.status, data.phase);
-      if (progressValue || /progress/.test(signal)) setCodexEventStatus("progress", progressValue || eventDetail(event, data), "active");
+      if (progressValue || /progress/.test(signal)) {
+        setCodexEventStatus("progress", friendlyRuntimeProgress(progressValue || eventDetail(event, data)), "active");
+      }
 
       const phase = /tool|mcp|command|shell|function/.test(signal)
         ? "tool"
@@ -3742,24 +3771,24 @@
           streamedAnswer += delta;
           if (streamingMessageId) updateMessage(streamingMessageId, streamedAnswer, undefined, true);
           setText("assistant-live-label", "正在生成回答");
-          setText("assistant-live-detail", `已接收 ${streamedAnswer.length} 个字符`);
+          setText("assistant-live-detail", "正在整理结果");
         }
         return;
       }
       if (kind === "thread_started" || kind === "thread_updated") {
-        setText("assistant-live-label", "Codex 会话已连接");
-        setText("assistant-live-detail", threadId || state.codexThreadId);
+        setText("assistant-live-label", "求职助理已连接");
+        setText("assistant-live-detail", "正在准备本次任务");
       } else if (kind === "turn" || kind === "turn_started") {
-        setText("assistant-live-label", "Codex 正在执行");
-        setText("assistant-live-detail", turnId || "等待 turn id");
+        setText("assistant-live-label", "求职助理正在处理");
+        setText("assistant-live-detail", "正在分析请求");
       } else if (kind === "item_started") {
-        setText("assistant-live-label", "正在处理执行项");
-        setText("assistant-live-detail", itemId || "等待 item id");
+        setText("assistant-live-label", "正在执行当前步骤");
+        setText("assistant-live-detail", "请稍候");
       } else if (kind === "turn_completed") {
         turnCompleted = true;
         setCodexEventStatus("progress", "已完成", "ok");
         setText("assistant-live-label", "执行完成");
-        setText("assistant-live-detail", turnId || "turn 已完成");
+        setText("assistant-live-detail", "正在显示结果");
       }
       if (kind === "error" || /error|failed/.test(signal)) {
         const detail = friendlyRuntimeError(
@@ -3767,7 +3796,7 @@
         );
         streamError = detail;
         setCodexEventStatus("error", detail, "error");
-        setText("assistant-live-label", "Codex 执行失败");
+        setText("assistant-live-label", "求职助理执行失败");
         setText("assistant-live-detail", detail);
       }
     };
@@ -3933,7 +3962,7 @@
     resetCodexEventStatuses();
     updateIntentHint(""); setAssistantStatus(newThread ? "已新建 Codex 会话" : "已清空当前会话", "ok");
     await refreshConversationList();
-    showToast(newThread ? `已新建 Codex 会话：${state.codexThreadId}` : "已清空当前会话", "success");
+    showToast(newThread ? "已新建会话" : "已清空当前会话", "success");
   }
 
   async function deleteConversation(threadId) {
@@ -4624,6 +4653,7 @@
     stopAssistantExecution,
     submitAssistantQuestion,
     appendMessage,
+    friendlyRuntimeProgress,
     deleteConversation,
     state,
   };

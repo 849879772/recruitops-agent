@@ -371,6 +371,45 @@ test("assistant diagnoses missing model, restart, deliberate disable and runtime
   hooks.renderCodexRuntimeStatus();
   assert.equal(hooks.assistantAvailability().status, "ready");
   assert.equal(document.getElementById("run-task-button").disabled, false);
+  assert.equal(document.getElementById("assistant-codex-event-strip").hidden, true);
+});
+
+test("assistant presents business stages without raw runtime metadata", () => {
+  const { document, hooks } = loadApp(async () => { throw new Error("no fetch"); });
+  assert.equal(hooks.friendlyRuntimeProgress("discovery:running"), "公司发现");
+  assert.equal(hooks.friendlyRuntimeProgress("matching:12/48"), "岗位评分 12/48");
+  assert.equal(hooks.friendlyRuntimeProgress("reporting:succeeded"), "生成结果");
+
+  hooks.state.codexThreadId = "thread-secret-id";
+  hooks.appendMessage("assistant", "正在处理");
+  const label = document.getElementById("assistant-thread-label").textContent;
+  assert.equal(label, "当前会话 · 1 条");
+  assert.doesNotMatch(label, /thread-secret-id/);
+});
+
+test("assistant keeps structured execution metadata collapsed by default", () => {
+  const { document, hooks } = loadApp(async () => { throw new Error("no fetch"); });
+  hooks.state.tasks = [{
+    task_id: "task-secret-id",
+    task_type: "operation_run",
+    status: "succeeded",
+    steps: 1,
+    tool_response: {data: {run_id: "run-secret-id"}},
+  }];
+  hooks.state.messages = [{
+    id: "message-1",
+    role: "assistant",
+    body: "全量爬取正在运行",
+    created_at: new Date().toISOString(),
+    task_id: "task-secret-id",
+    streaming: false,
+  }];
+  hooks.renderConversation();
+
+  const disclosure = document.getElementById("assistant-messages").querySelector("details");
+  assert.ok(disclosure);
+  assert.equal(disclosure.open, false);
+  assert.doesNotMatch(document.getElementById("assistant-messages").textContent, /run-secret-id|task-secret-id/);
 });
 
 test("consumes SSE events in wire order and completes the turn", async () => {

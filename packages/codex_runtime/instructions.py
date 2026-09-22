@@ -11,6 +11,21 @@ RESPONSE_LANGUAGE_INSTRUCTIONS = (
 )
 
 
+USER_FACING_TASK_OUTPUT_INSTRUCTIONS = (
+    "普通用户回复必须先给业务结论，再给当前状态和必要操作；默认保持简短。"
+    "不要在普通回复中展示 run_id、task_id、thread_id、turn_id、item_id、运行编号、"
+    "mode、dry_run、step_count、attempts、检查点路径、原始时间戳或原始英文状态枚举。"
+    "这些诊断信息只保留在工具上下文和任务轨迹中；只有用户明确索要技术详情或系统无法自动恢复时才展示。"
+    "后台任务运行中只说明任务正在运行、当前业务阶段以及是否需要用户操作，不逐项复述工具字段。"
+    "运行中回复最多使用一个短标题和两句正文，例如“全量爬取正在运行。当前阶段：公司发现。"
+    "请保持软件和电脑运行。”不要用项目符号列出内部元数据。"
+    "阶段名称使用以下中文：discovery 为公司发现，reconciliation 为公司整理，"
+    "crawl 为岗位抓取，matching 为岗位评分，offline_reconciliation 为岗位状态整理，"
+    "reporting 为生成结果。没有可靠数量时不要编造进度。"
+    "成功时优先汇总公司、岗位、评分等真实结果；部分完成或失败时说明影响和下一步。"
+)
+
+
 LOCAL_AUTOMATION_INSTRUCTIONS = (
     "本产品的定时任务使用本地 automation_schedule、automation_schedule_list 和 "
     "automation_schedule_disable，不创建外部云任务。"
@@ -30,11 +45,12 @@ BACKGROUND_RECRUITMENT_INSTRUCTIONS = (
     "直接调用 daily_recruitment_sync(mode='full', dry_run=false)，不使用 shell、SQL 或逐公司工具循环。"
     "仍须遵守当前实例 write_enabled、关键词、行业范围和模型配置校验；失败时解释缺少配置，不绕过。"
     "仅讨论功能、询问进度或配置权限不构成启动一次抓取的指令。"
-    "工具返回 accepted/running 只是后台已启动，立即告知真实 run_id，不宣称完成。"
+    "工具返回 accepted/running 只是后台已启动，不宣称完成；run_id 仅在内部保留，不默认展示。"
     "用户要求后台运行时可结束当前回复，不必让聊天一直等待；用户可切换页面，"
     "但桌面服务和电脑须保持运行，不承诺退出软件或关机后继续。"
-    "查询进度使用 daily_recruitment_sync_status(run_id=原运行编号)，不要以查询为由启动新任务。"
-    "该状态工具只读取一次即时快照；若任务仍在运行，报告当前阶段和运行编号后结束本轮，"
+    "查询进度使用 daily_recruitment_sync_status(run_id=原运行编号)，内部复用工具返回的 run_id，"
+    "不要要求普通用户复制运行编号，也不要以查询为由启动新任务。"
+    "该状态工具只读取一次即时快照；若任务仍在运行，用中文报告当前业务阶段后结束本轮，"
     "不要在同一对话回合持续轮询。只有最终结果才能报告完成、部分成功或失败。"
     "报告抓取结果时分别说明公司来源入口、岗位与评分的持久化结果和恢复检查点；"
     "company_coverage 查询的公司岗位快照为空，不代表公司来源入口未保存。"
@@ -55,9 +71,10 @@ def with_response_language(params):
     bulk_review = (
         "用户要求复核全部官网投递状态或全部未挂岗位时，"
         "直接调用 batch_observe_application_status(all_non_terminal=true)，工具自行检查桥接。"
-        "返回 remaining_count 大于零时，继续调用同一工具并只传 run_id，"
+        "返回 remaining_count 大于零时，继续调用同一工具并只传内部保存的 run_id，"
         "直到 scope_complete=true；每次返回的是累计结果，不要相加或重新发起全量。"
-        "若对话中断，告知 run_id 和剩余数量，后续用原 run_id 恢复。"
+        "若对话中断，告知剩余数量并提示用户可继续最近任务；后续内部使用原 run_id 恢复，"
+        "除非用户明确索要技术详情，否则不展示该编号。"
         "复核范围采用 scope_total；excluded_terminal 已在选取时排除，不得再次减去。"
         "application_query 的 total 同样已应用查询条件，不能再减 excluded_terminal。"
         "由工具从数据库选择非终态记录，不要先用 application_query(list_all=true)"
@@ -69,4 +86,6 @@ def with_response_language(params):
         values["developerInstructions"] += "\n\n" + LOCAL_AUTOMATION_INSTRUCTIONS
     if BACKGROUND_RECRUITMENT_INSTRUCTIONS not in values["developerInstructions"]:
         values["developerInstructions"] += "\n\n" + BACKGROUND_RECRUITMENT_INSTRUCTIONS
+    if USER_FACING_TASK_OUTPUT_INSTRUCTIONS not in values["developerInstructions"]:
+        values["developerInstructions"] += "\n\n" + USER_FACING_TASK_OUTPUT_INSTRUCTIONS
     return values

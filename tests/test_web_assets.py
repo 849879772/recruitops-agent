@@ -188,6 +188,21 @@ def test_assistant_uses_natural_language_intents_and_renders_messages() -> None:
     assert "display_label" in js
 
 
+def test_assistant_quick_actions_are_user_facing_and_explicit() -> None:
+    html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    js = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+
+    quick_questions = html.split('id="quick-questions"', 1)[1].split("</div>", 1)[0]
+    assert quick_questions.count('class="command-button"') == 5
+    assert 'data-task="full_recruitment_sync"' in quick_questions
+    assert "全量爬取" in quick_questions
+    assert 'data-task="recruitment_mail_process"' in quick_questions
+    assert "处理邮件信息" in quick_questions
+    assert "163 邮件情报" not in quick_questions
+    assert 'recruitment_mail_process: "处理邮件信息"' in js
+    assert "处理全部待处理的招聘邮件" in html + js
+
+
 def test_assistant_labels_knowledge_search_separately_from_company_coverage() -> None:
     js = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
 
