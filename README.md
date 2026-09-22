@@ -38,7 +38,7 @@
 当前可用版本为 RecruitOps v0.1.3，请下载 `RecruitOps-v0.1.3.zip`：
 
 - [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.3)
-- [Gitee Releases](https://gitee.com/zs-k/recruitops-agent/releases/tag/v0.1.3)
+- [Gitee v0.1.3 源码标签](https://gitee.com/zs-k/recruitops-agent/tree/v0.1.3)（安装包请从 GitHub 或 123 云盘下载）
 - [123 云盘（永久有效，无提取码）](https://1835739780.share.123pan.cn/123pan/QbN4Td-1nW2d)
 
 安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
@@ -210,15 +210,7 @@ RecruitOps-Desktop-Preview.exe
 
 其中包含本地数据库、配置、任务检查点和招聘网站登录状态。建议定期备份整个 `.data` 目录。
 
-升级步骤：
-
-1. 退出 RecruitOps。
-2. 备份旧版本的 `.data`。
-3. 将新版本完整解压到新的短路径。
-4. 将旧版本 `.data` 复制到新版本相同位置。
-5. 启动新版本唯一的 EXE，等待数据库迁移完成。
-
-不要在软件运行时复制数据库，也不要把新版本直接覆盖到正在使用的旧目录。
+若旧版已经爬取岗位，或已有投递记录、邮件等数据，必须先正常退出软件并完整备份 `.data`。新版本先解压到临时目录，随后让新程序回到旧版的**相同绝对路径**，再把整个旧 `.data` 同盘移回；使用原 Windows 用户启动。不要在软件运行时复制数据库，也不要直接覆盖正在使用的旧目录。逐步操作及回退方法见[已有数据的桌面版升级步骤](docs/UPGRADE_EXISTING_DATA.md)。
 
 ## 常见问题
 
