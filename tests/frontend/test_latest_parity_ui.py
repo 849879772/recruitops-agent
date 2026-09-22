@@ -85,7 +85,7 @@ def test_assistant_diagnostics_and_model_only_save(width, tmp_path):
         expect(page.locator("#configuration-view")).to_be_visible()
         page.locator('[data-model-field="api_key"]').fill("synthetic-key")
         page.locator("#model-connection-save").click()
-        expect(page.locator("#configuration-message")).to_contain_text("模型已保存")
+        expect(page.locator("#model-connection-message")).to_contain_text("模型已保存")
         saved = json.loads(next(body for path, body in calls if path.endswith("/configuration/save")))
         assert saved["settings"] == {}  # Backend owns automatic defaults, not false checkboxes.
         assert config["profile"] == original_profile
@@ -111,10 +111,9 @@ def test_assistant_diagnostics_and_model_only_save(width, tmp_path):
             saves_before = sum(path.endswith("/configuration/save") for path, _ in calls)
             page.locator('[name="title_keywords"]').fill(value)
             page.locator("#configuration-save").click()
-            expect(page.locator("#configuration-keywords-dialog")).to_be_visible()
-            expect(page.locator("#configuration-keywords-dialog")).to_contain_text("至少填写一个关键词")
+            expect(page.locator("#title-keywords-error")).to_be_visible()
+            expect(page.locator("#title-keywords-error")).to_contain_text("至少填写一个岗位标题关键词")
             page.screenshot(path=str(tmp_path / f"keywords-required-{width}.png"))
-            page.locator("#configuration-keywords-dismiss").click()
             expect(page.locator('[name="title_keywords"]')).to_be_focused()
             assert sum(path.endswith("/configuration/save") for path, _ in calls) == saves_before
         page.locator("#assistant-advanced-options summary").click()
@@ -285,7 +284,7 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         page.locator('[data-view="configuration"]').click()
         expect(page.locator("#configuration-model-status")).to_have_text("待配置模型")
         expect(page.locator("#configuration-analysis-status")).to_have_text("未就绪")
-        expect(page.locator("#configuration-mail-status")).to_have_text("未就绪")
+        expect(page.locator("#configuration-mail-status")).to_have_text("可选，未配置")
         expect(page.locator("#configuration-readiness")).to_have_text("首次配置尚未完成")
         expect(page.locator("#configuration-missing")).to_contain_text("请先上传简历")
         expect(page.locator('[name="degree"]')).to_have_value("")
@@ -302,10 +301,10 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         page.locator('#configuration-industry-groups input').check()
         page.locator("#configuration-runtime-options summary").click()
         expect(page.locator('[name="vision_enabled"]')).not_to_be_checked()
-        expect(page.locator('[name="mail_sync_on_startup"]')).to_be_disabled()
+        expect(page.locator('[name="mail_sync_on_startup"]')).to_have_count(0)
         page.locator('[name="title_keywords"]').fill("Python")
         page.locator("#configuration-save").click()
-        expect(page.locator("#configuration-message")).to_have_text("Saved fixture")
+        expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
         saved = json.loads(next(body for _, path, body in calls if path.endswith("/configuration/save")))
         assert saved["active_model_connection_id"] == "test"
         assert saved["profile"]["scope"]["industry_groups"] == ["test"]
@@ -315,7 +314,7 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         for field in ("mail_enabled", "job_analysis_enabled", "automation_enabled"):
             assert field not in saved["settings"]
         assert saved["settings"]["vision_enabled"] is False
-        assert saved["settings"]["mail_sync_on_startup"] is False
+        assert "mail_sync_on_startup" not in saved["settings"]
         assert saved["profile"]["degree"] is None
         assert "complete_onboarding" not in saved
         assert saved["model_connections"][0]["api_key"] == "synthetic-key-for-offline-test"
@@ -325,7 +324,7 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         page.locator('#configuration-industry-groups input').check()
         saves_before_model = sum(path.endswith("/configuration/save") for _, path, _ in calls)
         page.locator("#configuration-save").click()
-        expect(page.locator("#configuration-message")).to_contain_text("请完成主模型连接配置")
+        expect(page.locator("#configuration-save-result")).to_contain_text("请完成主模型连接配置")
         assert sum(path.endswith("/configuration/save") for _, path, _ in calls) == saves_before_model
         config["configured_capabilities"] = {"llm_enabled": True, "codex_runtime_enabled": True,
             "job_analysis_enabled": True, "mail_enabled": False, "automation_enabled": True,
@@ -339,21 +338,20 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         expect(page.locator("#configuration-assistant-mode")).to_have_value("auto")
         expect(page.locator("#configuration-model-status")).to_have_text("待重启")
         expect(page.locator('[name="vision_enabled"]')).to_be_checked()
-        expect(page.locator("#configuration-runtime-status")).to_have_text("定时任务：已开启 · 视觉辅助：未启用 · 启动同步：未启用")
-        expect(page.locator("#configuration-message")).to_contain_text("重启桌面后生效")
+        expect(page.locator("#configuration-runtime-status")).to_have_text("定时任务：已开启 · 浏览器截图识别：未启用 · 邮箱：未配置（可选）")
+        expect(page.locator("#configuration-message")).to_have_text("")
         page.locator('#configuration-industry-groups input').check()
         saves_before = sum(path.endswith("/configuration/save") for _, path, _ in calls)
         page.locator("#configuration-complete").click()
-        expect(page.locator("#configuration-message")).to_have_text("Saved fixture")
+        expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
         assert sum(path.endswith("/configuration/save") for _, path, _ in calls) == saves_before + 1
-        expect(page.locator('[name="mail_sync_on_startup"]')).to_be_disabled()
+        expect(page.locator('[name="mail_sync_on_startup"]')).to_have_count(0)
         page.locator('[name="mail_imap_host"]').fill("imap.example.test")
         page.locator('[name="mail_imap_username"]').fill("fixture@example.test")
         page.locator('[name="mail_imap_password"]').fill("synthetic-mail-secret")
-        page.locator('[name="mail_sync_on_startup"]').check()
         page.locator('#configuration-industry-groups input').check()
         page.locator("#configuration-complete").click()
-        expect(page.locator("#configuration-message")).to_have_text("Saved fixture")
+        expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
         completion = json.loads([body for _, path, body in calls if path.endswith("/configuration/save")][-1])
         assert completion["complete_onboarding"] is True
         assert "llm_enabled" not in completion["settings"]
@@ -361,7 +359,7 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         for field in ("mail_enabled", "job_analysis_enabled", "automation_enabled"):
             assert field not in completion["settings"]
         assert completion["settings"]["vision_enabled"] is True
-        assert completion["settings"]["mail_sync_on_startup"] is True
+        assert "mail_sync_on_startup" not in completion["settings"]
         assert "write_enabled" not in completion["settings"]
         # Saved secrets and configured flags survive readback without being live yet.
         config["settings"].update(mail_imap_host="imap.example.test", mail_imap_username="fixture@example.test")
@@ -369,26 +367,25 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         config["configured_capabilities"].update(mail_enabled=True, mail_sync_on_startup=True)
         config["module_readiness"]["mail"].update(status="configured", ready=True)
         page.locator("#configuration-reload").click()
-        expect(page.locator('[name="mail_sync_on_startup"]')).to_be_checked()
+        expect(page.locator('[name="mail_sync_on_startup"]')).to_have_count(0)
         expect(page.locator('[name="mail_imap_password"]')).to_have_value("")
         expect(page.locator("#configuration-mail-status")).to_have_text("已配置")
         page.locator("#assistant-advanced-options summary").click()
         page.locator("#configuration-assistant-mode").select_option("disabled")
         expect(page.locator('[name="vision_enabled"]')).not_to_be_checked()
-        expect(page.locator('[name="mail_sync_on_startup"]')).to_be_checked()
         page.locator('#configuration-industry-groups input').check()
         page.locator("#configuration-save").click()
-        expect(page.locator("#configuration-message")).to_have_text("Saved fixture")
+        expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
         disabled = json.loads([body for _, path, body in calls if path.endswith("/configuration/save")][-1])
         assert disabled["settings"]["llm_enabled"] is False
         assert disabled["settings"]["codex_runtime_enabled"] is False
         assert disabled["settings"]["vision_enabled"] is False
-        assert disabled["settings"]["mail_sync_on_startup"] is True
+        assert "mail_sync_on_startup" not in disabled["settings"]
         for field in ("job_analysis_enabled", "mail_enabled", "automation_enabled"):
             assert field not in disabled["settings"]
         assert "complete_onboarding" not in disabled
         assert not any(path.endswith(("/model/test", "/mail/test")) for _, path, _ in calls)
-        expect(page.locator("#configuration-restart-policy")).to_contain_text("不会自动重启")
+        expect(page.locator("#configuration-restart-policy")).to_contain_text("保存不会调用模型、同步邮箱或自动重启")
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         page.screenshot(path=str(tmp_path / f"runtime-options-{width}.png"), full_page=True)
         config["onboarding"] = {"ready": True, "missing": [], "messages": {}}

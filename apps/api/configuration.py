@@ -474,14 +474,27 @@ def save_configuration(body: ConfigEdit):
     if settings.env == "desktop-isolated":
         from packages.desktop_runtime.capabilities import saved_mail_configured, saved_model_configured
 
-        prospective = {**saved_preferences, **overrides}
+        # Empty secret inputs mean "keep the saved secret". Build the
+        # prospective configuration with the same rule before deriving
+        # automatic capabilities, otherwise an unchanged mailbox password
+        # would be mistaken for a removed password.
+        prospective_overrides = {
+            key: value
+            for key, value in overrides.items()
+            if key not in SECRET_FIELDS or value
+        }
+        prospective = {**saved_preferences, **prospective_overrides}
         model_configured = saved_model_configured(prospective)
         if model_configured and prospective.get("llm_enabled") is True:
             overrides["job_analysis_enabled"] = True
             if prospective.get("codex_runtime_enabled") is True:
                 overrides["automation_enabled"] = True
-        if saved_mail_configured(prospective):
-            overrides["mail_enabled"] = True
+        mail_configured = saved_mail_configured(prospective)
+        # Mail is optional. A complete saved mailbox enables read-only mail
+        # and startup sync automatically; an absent/incomplete mailbox keeps
+        # both disabled without affecting the rest of onboarding.
+        overrides["mail_enabled"] = mail_configured
+        overrides["mail_sync_on_startup"] = mail_configured
     if "model_api_base_url" in overrides:
         try:
             overrides["model_api_base_url"] = _valid_api_base(str(overrides["model_api_base_url"]))

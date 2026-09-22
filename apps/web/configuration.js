@@ -10,7 +10,7 @@
   let modelConnections = [];
   let activeModelConnectionId = "";
   let assistantModeEdited = false;
-  const CAPABILITY_FIELDS = ["vision_enabled", "mail_sync_on_startup"];
+  const CAPABILITY_FIELDS = ["vision_enabled"];
   const split = (value) => value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const MODEL_PRESETS = {
     deepseek: {label: "DeepSeek", api_style: "anthropic", base_url: "https://api.deepseek.com", model: "deepseek-flash"},
@@ -36,19 +36,33 @@
     $("configuration-message").textContent = text;
     $("configuration-message").className = failed ? "configuration-error" : "configuration-message";
   }
-  let keywordField = null;
+  function inlineMessage(id, text, failed = false) {
+    const region = $(id);
+    region.textContent = text;
+    region.hidden = !text;
+    region.className = `configuration-inline-message${failed ? " is-error" : text ? " is-success" : ""}`;
+  }
   function requireKeywords(control) {
-    if (split(control.value).length) return true;
-    keywordField = control;
+    if (split(control.value).length) {
+      control.removeAttribute("aria-invalid");
+      if (control === form.elements.title_keywords) inlineMessage("title-keywords-error", "");
+      return true;
+    }
     control.setAttribute("aria-invalid", "true");
-    message("岗位筛选关键词不能为空，请至少填写一个关键词。", true);
-    $("configuration-keywords-dialog").showModal();
+    if (control === form.elements.title_keywords) {
+      inlineMessage("title-keywords-error", "请至少填写一个岗位标题关键词。", true);
+    } else {
+      inlineMessage("resume-operation-message", "请至少保留一个岗位筛选关键词后再应用。", true);
+    }
+    control.scrollIntoView({behavior: "smooth", block: "center"});
+    control.focus();
     return false;
   }
-  $("configuration-keywords-dismiss").addEventListener("click", () => $("configuration-keywords-dialog").close());
-  $("configuration-keywords-dialog").addEventListener("close", () => keywordField?.focus());
   for (const control of [form.elements.title_keywords, $("resume-title-keywords")]) {
-    control.addEventListener("input", () => control.removeAttribute("aria-invalid"));
+    control.addEventListener("input", () => {
+      control.removeAttribute("aria-invalid");
+      if (control === form.elements.title_keywords) inlineMessage("title-keywords-error", "");
+    });
   }
   function mailboxConfigured() {
     return ["mail_imap_host", "mail_imap_username"].every((key) => form.elements.namedItem(key).value.trim())
@@ -61,33 +75,29 @@
       control.disabled = !modelEnabled;
       if (control.disabled) control.checked = false;
     }
-    const startup = form.elements.mail_sync_on_startup;
-    startup.disabled = !mailboxConfigured();
-    if (startup.disabled) startup.checked = false;
   }
   function renderReadiness(payload) {
     const onboarding = payload?.onboarding;
     $("configuration-readiness").textContent = onboarding?.ready === true ? "基础配置已就绪" : onboarding ? "首次配置尚未完成" : "配置能力状态暂不可用";
     const list = $("configuration-missing"); list.replaceChildren();
-    const messages = Object.values(onboarding?.messages || {});
+    const messages = [...new Set(Object.values(onboarding?.messages || {}))];
     if (!onboarding) messages.push("后端未返回配置检查结果，请重新读取或更新后端。");
-    for (const key of ["job_scoring", "scheduled_tasks", "mail"]) {
-      const capability = payload?.module_readiness?.[key];
-      if (capability && capability.ready !== true) messages.push(capability.message);
-    }
     for (const message of messages) {
       const item = document.createElement("li"); item.textContent = message; list.append(item);
     }
     $("onboarding-notice").hidden = onboarding?.ready === true;
     $("onboarding-notice-text").textContent = onboarding ? "首次配置待完成：模型连接、简历事实、岗位关键词与行业范围。" : "配置状态不可用，智能功能可能尚未就绪。";
   }
-  function input(label, field, type = "text") {
+  function input(label, field, type = "text", help = "") {
     const wrapper = document.createElement("label"), caption = document.createElement("span");
     caption.textContent = label;
     const control = document.createElement("input");
     control.type = type; control.dataset.modelField = field;
     if (type === "password") control.autocomplete = "new-password";
     wrapper.append(caption, control);
+    if (help) {
+      const hint = document.createElement("small"); hint.textContent = help; wrapper.append(hint);
+    }
     return {wrapper, control};
   }
   function collectModelConnections() {
@@ -116,7 +126,7 @@
       state.textContent = connection.key_configured ? "密钥已保存" : "待配置";
       heading.append(primaryLabel, state);
       const grid = document.createElement("div"); grid.className = "model-connection-grid";
-      const name = input("连接名称", "name"); name.control.value = connection.name || "";
+      const name = input("连接名称", "name", "text", "仅用于区分主连接与备用连接。"); name.control.value = connection.name || "";
       const providerLabel = document.createElement("label"), providerCaption = document.createElement("span");
       providerCaption.textContent = "接口类型";
       const provider = document.createElement("select"); provider.dataset.modelField = "provider";
@@ -125,10 +135,11 @@
         provider.append(option);
       }
       provider.value = connection.provider || "deepseek";
-      providerLabel.append(providerCaption, provider);
-      const base = input("API 服务地址", "base_url", "url"); base.control.value = connection.base_url || "";
-      const model = input("模型名称", "model"); model.control.value = connection.model || "";
-      const key = input("API 密钥", "api_key", "password");
+      const providerHint = document.createElement("small"); providerHint.textContent = "官方 DeepSeek 直接选 DeepSeek，其他兼容服务选择兼容接口。";
+      providerLabel.append(providerCaption, provider, providerHint);
+      const base = input("API 服务地址", "base_url", "url", "DeepSeek 会自动填写；其他服务填写其接口基础地址。"); base.control.value = connection.base_url || "";
+      const model = input("模型名称", "model", "text", "填写服务商提供的准确模型标识。"); model.control.value = connection.model || "";
+      const key = input("API 密钥", "api_key", "password", "已保存时留空表示不修改。");
       key.control.value = connection.api_key || "";
       key.control.placeholder = connection.key_configured ? "已保存，留空不修改" : "请输入 API 密钥";
       provider.addEventListener("change", () => {
@@ -159,7 +170,7 @@
         finally { test.disabled = false; }
       });
       remove.addEventListener("click", () => {
-        if (modelConnections.length === 1) return message("至少保留一个模型连接", true);
+        if (modelConnections.length === 1) return inlineMessage("model-connection-message", "至少保留一个模型连接。", true);
         modelConnections = collectModelConnections()
           .filter((item) => item.id !== connection.id)
           .map((item) => ({...item, key_configured: modelConnections.find((saved) => saved.id === item.id)?.key_configured || false}));
@@ -178,6 +189,7 @@
       const label = document.createElement("label");
       const checkbox = document.createElement("input"); checkbox.type = "checkbox";
       checkbox.value = option.code; checkbox.checked = chosen.has(option.code);
+      checkbox.addEventListener("change", () => inlineMessage("industry-groups-error", ""));
       label.append(checkbox, document.createTextNode(option.label)); region.append(label);
     }
   }
@@ -231,16 +243,16 @@
       $("configuration-model-status").textContent = ({missing_model: "待配置模型", disabled: "已主动关闭", restart_required: "待重启", configured: "模型已配置"})[diagnostic.status] || "状态待检查";
       document.dispatchEvent(new CustomEvent("recruitops:assistant-configuration", {detail: {status: diagnostic.status}}));
       const scoringReady = payload.module_readiness?.job_scoring?.ready === true;
-      const mailReady = payload.module_readiness?.mail?.ready === true;
+      const mailConfigured = mailboxConfigured();
       const scheduledReady = payload.module_readiness?.scheduled_tasks?.ready === true;
       $("configuration-analysis-status").textContent = scoringReady ? "已开启" : "未就绪";
-      $("configuration-mail-status").textContent = mailReady ? "已配置" : "未就绪";
+      $("configuration-mail-status").textContent = mailConfigured ? "已配置" : "可选，未配置";
       $("configuration-runtime-status").textContent = [
         ["定时任务", scheduledReady ? "已开启" : "未就绪"],
-        ["视觉辅助", payload.settings.llm_enabled && payload.settings.vision_enabled],
-        ["启动同步", mailReady && payload.settings.mail_sync_on_startup],
+        ["浏览器截图识别", payload.settings.llm_enabled && payload.settings.vision_enabled],
+        ["邮箱", mailConfigured ? "启动时自动同步" : "未配置（可选）"],
       ].map(([label, state]) => `${label}：${typeof state === "boolean" ? state ? "已启用" : "未启用" : state}`).join(" · ");
-      message(payload.restart_required ? "配置已保存，重启桌面后生效；当前能力状态仍以本次启动为准。" : "");
+      message("");
     } catch (error) {
       original = null;
       renderReadiness(null);
@@ -264,24 +276,25 @@
     return {llm_enabled: enabled, codex_runtime_enabled: enabled};
   }
   $("model-connection-save").addEventListener("click", async () => {
-    if (!original || reading || parsingResume) return message("请先成功读取配置并等待当前操作完成", true);
+    if (!original || reading || parsingResume) return inlineMessage("model-connection-message", "请先成功读取配置并等待当前操作完成。", true);
     const button = $("model-connection-save"); button.disabled = true;
+    inlineMessage("model-connection-message", "正在保存…");
     try {
       const connections = collectModelConnections();
       const active = connections.find((item) => item.id === activeModelConnectionId);
       if (!active?.base_url || !active?.model || !(active.api_key || modelConnections.find((item) => item.id === activeModelConnectionId)?.key_configured)) {
-        return message("请填写主模型的服务地址、模型名称和 API 密钥。", true);
+        return inlineMessage("model-connection-message", "请填写主模型的服务地址、模型名称和 API 密钥。", true);
       }
       const result = await post("save", {settings: assistantOverrides(), model_connections: connections,
         active_model_connection_id: activeModelConnectionId});
-      await load(); message(result.message);
-    } catch (error) { message(`保存失败：${error.message}`, true); }
+      await load(); inlineMessage("model-connection-message", result.message);
+    } catch (error) { inlineMessage("model-connection-message", `保存失败：${error.message}`, true); }
     finally { button.disabled = false; }
   });
   void load();
   $("model-connection-add").addEventListener("click", () => {
-    if (!original) return message("请先成功读取配置", true);
-    if (modelConnections.length >= 8) return message("最多保留 8 个模型连接", true);
+    if (!original) return inlineMessage("model-connection-message", "请先成功读取配置。", true);
+    if (modelConnections.length >= 8) return inlineMessage("model-connection-message", "最多保留 8 个模型连接。", true);
     modelConnections = collectModelConnections().map((item) => ({
       ...item,
       key_configured: modelConnections.find((saved) => saved.id === item.id)?.key_configured || false,
@@ -289,11 +302,13 @@
     const id = `model-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
     modelConnections.push({id, name: "备用模型", provider: "openai-compatible", api_style: "openai", base_url: "", model: "", key_configured: false});
     renderModelConnections();
+    inlineMessage("model-connection-message", "已添加备用连接，请填写后保存。", false);
   });
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (parsingResume || resumeDraft) return message("请先确认或取消简历解析结果", true);
-    if (!original) return message("请先读取配置", true);
+    inlineMessage("configuration-save-result", "");
+    if (parsingResume || resumeDraft) return inlineMessage("resume-operation-message", "请先确认或取消简历解析结果。", true);
+    if (!original) return inlineMessage("configuration-save-result", "请先重新读取配置。", true);
     if (!requireKeywords(form.elements.title_keywords)) return;
     const button = $("configuration-save"); button.disabled = true;
     const completeButton = $("configuration-complete"); completeButton.disabled = true;
@@ -305,26 +320,35 @@
         if (!control) continue;
         settings[key] = control.type === "checkbox" ? control.checked : control.type === "number" ? Number(control.value) : control.value.trim();
       }
-      if (settings.mail_sync_on_startup && !mailboxConfigured()) return message("启动同步前，请填写 IMAP 服务器、邮箱账号和授权码。", true);
+      const mailboxRequested = Boolean(settings.mail_imap_username || settings.mail_imap_password);
+      if (mailboxRequested && !mailboxConfigured()) {
+        inlineMessage("mail-test-result", "邮箱配置不完整，请填写账号、IMAP 服务器和授权码；不使用邮箱时请清空邮箱账号。", true);
+        form.elements.mail_imap_username.focus();
+        return;
+      }
       const profile = structuredClone(workingProfile);
       profile.degree = form.elements.degree.value || null;
       profile.job_type = "校招";
       profile.matching.title_keywords = split(form.elements.title_keywords.value);
       const industryGroups = [...$("configuration-industry-groups").querySelectorAll('input[type="checkbox"]:checked')].map((item) => item.value);
-      if (!industryGroups.length) return message("请至少选择一个行业方向。", true);
+      if (!industryGroups.length) {
+        inlineMessage("industry-groups-error", "请至少选择一个行业方向。", true);
+        $("configuration-industry-groups").scrollIntoView({behavior: "smooth", block: "center"});
+        return;
+      }
       profile.scope = {...(profile.scope || {}), recruit_types: ["秋招"], industry_groups: industryGroups};
       profile.exclusions = {...(profile.exclusions || {}), internships: "exclude", social: true};
       const connections = collectModelConnections();
-      if (!connections.some((item) => item.id === activeModelConnectionId)) return message("请选择主模型连接", true);
+      if (!connections.some((item) => item.id === activeModelConnectionId)) return inlineMessage("model-connection-message", "请选择主模型连接。", true);
       const active = connections.find((item) => item.id === activeModelConnectionId);
       if (settings.vision_enabled && (!active.base_url || !active.model || !(active.api_key || modelConnections.find((item) => item.id === active.id)?.key_configured))) {
-        return message("启用视觉辅助前，请完成主模型连接配置。", true);
+        return inlineMessage("configuration-save-result", "启用浏览器截图识别前，请完成主模型连接配置。", true);
       }
       const payload = {settings, profile, model_connections: connections, active_model_connection_id: activeModelConnectionId};
       if (event.submitter === completeButton) payload.complete_onboarding = true;
       const result = await post("save", payload);
-      await load(); message(result.message);
-    } catch (error) { message(`保存失败：${error.message}`, true); }
+      await load(); inlineMessage("configuration-save-result", result.message);
+    } catch (error) { inlineMessage("configuration-save-result", `保存失败：${error.message}`, true); }
     finally { button.disabled = false; completeButton.disabled = false; }
   });
   async function upload(file) {
@@ -339,9 +363,9 @@
     $("resume-file-state").textContent = event.target.files[0]?.name || "支持文字版 PDF、TXT、Markdown，最大 10 MB";
   });
   $("resume-analyze").addEventListener("click", async () => {
-    if (!original || reading || parsingResume) return message("请先成功读取配置并等待当前操作完成", true);
+    if (!original || reading || parsingResume) return inlineMessage("resume-operation-message", "请先成功读取配置并等待当前操作完成。", true);
     const file = $("resume-upload").files[0];
-    if (!file) return message("请先选择简历文件", true);
+    if (!file) return inlineMessage("resume-operation-message", "请先选择简历文件。", true);
     parsingResume = true;
     resumeDraft = null;
     $("resume-preview").hidden = true;
@@ -349,7 +373,7 @@
     $("resume-analyze").disabled = true;
     $("configuration-save").disabled = true;
     try {
-      message("正在解析简历，原配置保持不变…");
+      inlineMessage("resume-operation-message", "正在解析简历，原配置保持不变…");
       const result = await post("resume", await upload(file));
       const parsed = await post("resume/parse", {text: result.text});
       resumeDraft = parsed;
@@ -364,8 +388,8 @@
         ...(draft.title_keywords || []), ...(draft.directions || []),
       ].filter(Boolean).map((fact) => `${fact.value || fact.name}：${fact.evidence}`).join("\n\n");
       $("resume-preview").hidden = false;
-      message("简历解析完成。请检查岗位筛选关键词，然后应用分析结果。");
-    } catch (error) { message(error.message, true); }
+      inlineMessage("resume-operation-message", "简历解析完成。请检查岗位筛选关键词，然后应用分析结果。");
+    } catch (error) { inlineMessage("resume-operation-message", error.message, true); }
     finally { parsingResume = false; $("resume-upload").disabled = false; $("resume-analyze").disabled = false; $("configuration-save").disabled = false; }
   });
   $("resume-confirm").addEventListener("click", () => {
@@ -386,14 +410,15 @@
     form.elements.title_keywords.value = workingProfile.matching.title_keywords.join("\n");
     resumeDraft = null;
     $("resume-preview").hidden = true;
-    message("简历分析结果已应用到表单，保存配置后用于岗位筛选和匹配度评分。");
+    inlineMessage("title-keywords-error", "");
+    inlineMessage("resume-operation-message", "简历分析结果已应用到表单，保存配置后用于岗位筛选和匹配度评分。");
   });
   $("resume-cancel").addEventListener("click", () => {
     resumeDraft = null;
     $("resume-preview").hidden = true;
     $("resume-upload").value = "";
     $("resume-file-state").textContent = "支持文字版 PDF、TXT、Markdown，最大 10 MB";
-    message("已取消，原资料未修改。");
+    inlineMessage("resume-operation-message", "已取消，原资料未修改。");
   });
   $("mail-provider").addEventListener("change", () => {
     const option = $("mail-provider").selectedOptions[0];

@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f2f7ff">
     <title>秋招工作台 | RecruitOps Agent</title>
-    <link rel="stylesheet" href="./styles.css?v=public-ui-20260918">
+    <link rel="stylesheet" href="./styles.css?v=public-ui-20260923">
     <script defer src="./app.js?v=public-ui-20260918"></script>
     <script defer src="./company-sources.js?v=public-ui-20260918"></script>
-    <script defer src="./configuration.js?v=public-ui-20260918"></script>
+    <script defer src="./configuration.js?v=public-ui-20260923"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -413,6 +413,7 @@
             <div id="configuration-message" role="status" aria-live="polite"></div>
             <section class="configuration-onboarding" aria-label="首次配置" aria-live="polite">
               <h3 id="configuration-readiness">配置状态尚未读取</h3>
+              <p class="configuration-section-copy">首次使用只需完成模型连接、简历资料、岗位筛选关键词和行业范围。招聘邮箱与高级选项可以稍后配置。</p>
               <ul id="configuration-missing"></ul>
             </section>
             <div class="configuration-status" aria-label="核心能力状态">
@@ -425,6 +426,7 @@
                 <div class="configuration-section-heading"><p>所有智能功能使用主连接；可以保留备用连接，切换后统一生效。</p><button class="button button--secondary" id="model-connection-add" type="button">添加连接</button></div>
                 <div class="model-connection-list" id="model-connection-list"></div>
                 <button class="button button--primary" id="model-connection-save" type="button">保存模型连接</button>
+                <span class="configuration-inline-message" id="model-connection-message" role="status" aria-live="polite"></span>
                 <details class="configuration-guide" id="assistant-advanced-options"><summary>高级：助理模式</summary>
                   <label>求职助理<select id="configuration-assistant-mode"><option value="auto">随有效模型连接启用</option><option value="disabled">保持关闭</option></select></label>
                 </details>
@@ -435,8 +437,9 @@
                 <div class="configuration-grid">
                   <label class="configuration-wide">上传简历<div class="configuration-file-row"><input id="resume-upload" type="file" accept=".pdf,.txt,.md"><button type="button" class="button button--secondary" id="resume-analyze">分析简历</button></div><small id="resume-file-state">支持文字版 PDF、TXT、Markdown，最大 10 MB</small></label>
                   <label>学历<select name="degree"><option value="">尚未填写</option><option value="本科">本科</option><option value="硕士">硕士</option><option value="博士">博士</option></select></label>
-                  <label class="configuration-wide">岗位筛选关键词（必填）<textarea name="title_keywords" aria-required="true" rows="5" placeholder="上传简历后自动生成；每行一个，可自行增删"></textarea><small>至少填写一个关键词。先按岗位标题筛选相关岗位，再抓取详情并进行匹配度评分。</small></label>
+                  <label class="configuration-wide">岗位筛选关键词（必填）<textarea name="title_keywords" aria-required="true" aria-describedby="title-keywords-help title-keywords-error" rows="5" placeholder="上传简历后自动生成；每行一个，可自行增删"></textarea><small id="title-keywords-help">填写希望保留的岗位标题词，每行一个；标题不含这些词的岗位不会继续抓取。</small><span class="configuration-inline-message is-error" id="title-keywords-error" role="alert" hidden></span></label>
                 </div>
+                <p class="configuration-inline-message" id="resume-operation-message" role="status" aria-live="polite"></p>
                 <section id="resume-preview" hidden aria-label="简历分析结果">
                   <h3>简历分析结果</h3>
                   <p class="configuration-hint">以下内容都有简历原文依据。请重点检查岗位筛选关键词，确认后再保存整页配置。</p>
@@ -453,17 +456,17 @@
               </fieldset>
               <fieldset><legend>岗位来源范围</legend>
                 <div class="configuration-policy"><strong>固定规则</strong><span>仅收集校招正式岗位，默认排除社招、实习和不符合当前学历要求的岗位。</span></div>
-                <div><span class="configuration-field-label">OfferBiu 行业大类</span><div class="configuration-industry-grid" id="configuration-industry-groups"></div></div>
+                <div><span class="configuration-field-label">OfferBiu 行业大类（必选）</span><p class="configuration-hint">至少选择一个。行业决定从哪些公司寻找岗位，岗位关键词决定继续抓取哪些岗位。</p><div class="configuration-industry-grid" id="configuration-industry-groups"></div><span class="configuration-inline-message is-error" id="industry-groups-error" role="alert" hidden></span></div>
               </fieldset>
-              <fieldset><legend>招聘邮箱</legend>
-                <p class="configuration-section-copy">保存有效的 IMAP 连接后启用只读招聘邮件同步；不会发送、删除邮件，也不会主动标记为已读。</p>
+              <fieldset><legend>招聘邮箱（可选）</legend>
+                <p class="configuration-section-copy">不配置不会影响助理、岗位抓取、评分、投递记录和日程；仅邮件查询与处理不可用。配置成功后，启动时会自动同步。系统不会发送、删除邮件或主动标记为已读。</p>
                 <div class="configuration-grid">
-                  <label>邮箱服务商<select id="mail-provider"></select></label>
-                  <label>邮箱账号<input name="mail_imap_username" autocomplete="username"></label>
-                  <label>IMAP 服务器<input name="mail_imap_host"></label>
-                  <label>SSL 端口<input name="mail_imap_port" type="number" min="1" max="65535" required></label>
-                  <label>邮箱授权码<input name="mail_imap_password" type="password" autocomplete="new-password"><span id="mail-secret-state"></span></label>
-                  <label>邮件文件夹<input name="mail_imap_mailbox"></label>
+                  <label>邮箱服务商<select id="mail-provider"></select><small>选择后自动填写服务器和端口。</small></label>
+                  <label>邮箱账号<input name="mail_imap_username" autocomplete="username"><small>填写完整邮箱地址。</small></label>
+                  <label>IMAP 服务器<input name="mail_imap_host"><small>通常无需修改。</small></label>
+                  <label>SSL 端口<input name="mail_imap_port" type="number" min="1" max="65535" required><small>常用端口为 993。</small></label>
+                  <label>邮箱授权码<input name="mail_imap_password" type="password" autocomplete="new-password"><span id="mail-secret-state"></span><small>请填写授权码或应用专用密码，不是网页登录密码。</small></label>
+                  <label>邮件文件夹<input name="mail_imap_mailbox"><small>一般保持 INBOX。</small></label>
                 </div>
                 <div class="configuration-inline-actions"><button class="button button--secondary" id="mail-connection-test" type="button">测试邮箱连接</button><span id="mail-test-result" role="status"></span></div>
                 <details class="configuration-guide"><summary>查看邮箱配置教程</summary><ol><li>登录邮箱网页版，在设置中开启 IMAP 服务。</li><li>创建授权码或应用专用密码，不要填写网页登录密码。</li><li>填写完整邮箱地址和授权码，点击“测试邮箱连接”。</li><li>Gmail、Outlook 等若强制要求 OAuth2，当前版本暂时无法连接。</li></ol></details>
@@ -471,14 +474,15 @@
               <details class="configuration-guide" id="configuration-runtime-options">
                 <summary>其他运行选项</summary>
                 <div class="configuration-choices">
-                  <label class="configuration-toggle"><input type="checkbox" name="vision_enabled">视觉辅助（需启用模型）</label>
-                  <label class="configuration-toggle"><input type="checkbox" name="mail_sync_on_startup">启动时同步邮箱（需配置邮箱）</label>
+                  <label class="configuration-toggle"><input type="checkbox" name="vision_enabled">浏览器截图识别（高级，需启用模型）</label>
                 </div>
+                <p class="configuration-hint">普通方式无法读取招聘页面时，允许模型识别用户授权的当前页面截图；可能产生额外模型费用。</p>
                 <p id="configuration-runtime-status" role="status">运行能力状态尚未读取</p>
               </details>
-              <p class="configuration-hint" id="configuration-restart-policy">助理使用已保存的模型连接，无需先填写简历或关键词。需要重启的配置会另行提示；保存不会调用模型、同步邮箱，也不会自动重启。模型与邮箱就绪后，评分和定时任务能力默认开启；每条日程仍可单独启用或暂停。</p>
+              <p class="configuration-hint" id="configuration-restart-policy">助理使用已保存的模型连接，无需先填写简历或关键词。保存不会调用模型、同步邮箱或自动重启；需要重启的模块会单独提示。邮箱配置完整时自动启用启动同步，未配置时自动跳过。</p>
               <button class="button button--primary" id="configuration-save" type="submit">保存配置</button>
               <button class="button button--secondary" id="configuration-complete" type="submit">保存并完成首次配置</button>
+              <span class="configuration-inline-message" id="configuration-save-result" role="status" aria-live="polite"></span>
             </form>
             <section class="workspace-section configuration-import"><div class="section-heading"><h3>投递记录导入</h3><button type="button" class="button button--secondary" id="application-import-template">下载 CSV 模板</button></div>
               <label>CSV / JSON 文件<input id="application-import-file" type="file" accept=".csv,.json"></label>
@@ -731,11 +735,6 @@
       </main>
     </div>
 
-    <dialog class="job-detail-dialog configuration-keywords-dialog" id="configuration-keywords-dialog" aria-labelledby="configuration-keywords-heading">
-      <h2 id="configuration-keywords-heading">请填写岗位筛选关键词</h2>
-      <p>岗位筛选关键词不能为空，请至少填写一个关键词后再保存。</p>
-      <button class="button button--primary" type="button" id="configuration-keywords-dismiss">返回填写</button>
-    </dialog>
     <dialog class="job-detail-dialog" id="job-detail-dialog" aria-labelledby="job-detail-title">
       <div class="job-detail-shell">
         <header class="job-detail-header">

@@ -183,6 +183,51 @@ def test_runtime_capabilities_can_be_saved_without_saving_launch_authority(owner
         assert response.status_code == 422
 
 
+def test_desktop_mail_sync_is_automatic_and_preserves_saved_secret(owner, monkeypatch):
+    client, headers, root, _ = owner
+    monkeypatch.setenv("RECRUITOPS_ENV", "desktop-isolated")
+    get_settings.cache_clear()
+    url = "/api/local-ui/configuration/save"
+
+    response = client.post(url, headers=headers, json={"settings": {
+        "mail_imap_host": "imap.example.test",
+        "mail_imap_port": 993,
+        "mail_imap_username": "fixture@example.test",
+        "mail_imap_password": "synthetic-mail-password",
+        "mail_imap_mailbox": "INBOX",
+    }})
+    assert response.status_code == 200, response.text
+    path = root / ".data/settings/preferences.json"
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["mail_enabled"] is True
+    assert persisted["mail_sync_on_startup"] is True
+
+    # The browser deliberately submits an empty password after it has been
+    # saved. That must retain both the secret and automatic startup sync.
+    response = client.post(url, headers=headers, json={"settings": {
+        "mail_imap_username": "fixture@example.test",
+        "mail_imap_password": "",
+        "vision_enabled": True,
+    }})
+    assert response.status_code == 200, response.text
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["mail_imap_password"] == "synthetic-mail-password"
+    assert persisted["mail_enabled"] is True
+    assert persisted["mail_sync_on_startup"] is True
+
+    # Clearing the account explicitly opts out without affecting other
+    # capabilities saved in the same preferences file.
+    response = client.post(url, headers=headers, json={"settings": {
+        "mail_imap_username": "",
+        "mail_imap_password": "",
+    }})
+    assert response.status_code == 200, response.text
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["mail_enabled"] is False
+    assert persisted["mail_sync_on_startup"] is False
+    assert persisted["vision_enabled"] is True
+
+
 @pytest.mark.parametrize("mask", [None, "invalid", "[]", "null", "{}",
                                   '{"llm_enabled":false}', '{"llm_enabled":"true"}'])
 def test_desktop_mask_is_authoritative_after_preferences(owner, monkeypatch, mask):

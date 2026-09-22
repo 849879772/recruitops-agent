@@ -25,8 +25,10 @@ def test_latest_ui_assets_and_manual_api_contract():
     assert 'write_enabled' not in configuration
     for field in ("mail_enabled", "job_analysis_enabled", "automation_enabled"):
         assert f'name="{field}"' not in html
-    assert 'name="mail_sync_on_startup"' in html
+    assert 'name="mail_sync_on_startup"' not in html
     assert 'name="vision_enabled"' in html
+    assert "配置成功后，启动时会自动同步" in html
+    assert "不配置不会影响助理、岗位抓取、评分、投递记录和日程" in html
     for private_marker in ('8012', '5433', 'D:/RecruitOps-Agent', '周帅康'):
         assert private_marker not in html + app + configuration
 
