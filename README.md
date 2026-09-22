@@ -35,16 +35,18 @@
 
 ### 1. 下载桌面版
 
-当前可用版本为 RecruitOps v0.1.2，请下载 `RecruitOps-v0.1.2.zip`：
+当前可用版本为 RecruitOps v0.1.3，请下载 `RecruitOps-v0.1.3.zip`：
 
-- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.2)
-- [123 云盘（永久有效，无提取码）](https://1835739780.share.123pan.cn/123pan/QbN4Td-N4bXd)
+- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.3)
+- [Gitee Releases](https://gitee.com/zs-k/recruitops-agent/releases/tag/v0.1.3)
 
 安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
 
 ```text
-5B3BC2FC33CED011111FFDCF66DF20956D2286A0228F3F7D70DB3552B892199D
+ADBC8CE8154488BEFA0E73FFB114488F6C0D32C1D59DDFB4E9A1E329046CD721
 ```
+
+如果旧版已经爬取到岗位，或已有投递记录、招聘邮件，请先阅读[已有数据的桌面版升级步骤](docs/UPGRADE_EXISTING_DATA.md)。不要直接把旧版 `.data` 复制到不同安装路径。
 
 ### 2. 完整解压
 

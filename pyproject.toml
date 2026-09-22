@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "recruitops-agent"
-version = "0.1.2"
+version = "0.1.3"
 description = "Local-first recruitment intelligence and application operations agent"
 readme = "README.md"
 requires-python = ">=3.11"
