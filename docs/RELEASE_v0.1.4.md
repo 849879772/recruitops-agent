@@ -4,7 +4,7 @@
 
 打包校验现在强制检查爬虫、MCP 及其他实际使用的 Python 子进程入口。发布前还会用安装包内置 Python 执行爬虫入口的无网络烟测，以阻止同类缺文件问题再次通过验收。
 
-下载文件：`RecruitOps-v0.1.4.zip`（约 704 MB）。完整解压后运行 `RecruitOps-Desktop-Preview.exe`，不要只复制 EXE。
+下载文件：`RecruitOps-v0.1.4.zip`（约 704 MB），可从 [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.4) 或 [123 云盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-UX5nd) 下载；[Gitee Releases](https://gitee.com/zs-k/recruitops-agent/releases/tag/v0.1.4) 提供发布说明和校验附件。完整解压后运行 `RecruitOps-Desktop-Preview.exe`，不要只复制 EXE。
 
 SHA-256：`F05D9DB4BBF6C49F7C309FBE5245C49178F4CB8C53250F16F6F4D6EB5D9EDA41`
 
