@@ -38,7 +38,7 @@
 当前可用版本为 RecruitOps v0.1.3，请下载 `RecruitOps-v0.1.3.zip`：
 
 - [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.3)
-- [Gitee v0.1.3 源码标签](https://gitee.com/zs-k/recruitops-agent/tree/v0.1.3)（安装包请从 GitHub 或 123 云盘下载）
+- [Gitee Releases](https://gitee.com/zs-k/recruitops-agent/releases/tag/v0.1.3)（受 100 MB 附件限制，安装包请从页面提供的 GitHub 或 123 云盘链接下载）
 - [123 云盘（永久有效，无提取码）](https://1835739780.share.123pan.cn/123pan/QbN4Td-1nW2d)
 
 安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
