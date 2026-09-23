@@ -25,7 +25,7 @@ function fixture(t) {
   for (const key of ['python','codex','node','chromium','postgres','initdb','psql','pg_dump','pg_restore','pg_ctl','pg_config','vector_dll','vector_control','vector_sql']) { const name=`${key}/${key}.exe`;put(name);manifest.entrypoints[key]=name; }
   // Non-executable PE-header fixture for structural validation only. Never launched.
   const pe=Buffer.alloc(134);pe.write('MZ');pe.writeUInt32LE(128,60);pe.write('PE\0\0',128);pe.writeUInt16LE(0x8664,132);put(manifest.entrypoints.python,pe);
-  for(const name of ['packages/desktop_runtime/__main__.py','packages/desktop_runtime/api_bootstrap.py','apps/api/main.py','apps/web/index.html','apps/web/app.js','scripts/apply_migrations.py','migrations/001_fixture.sql']) put('app/'+name);
+  for(const name of ['packages/desktop_runtime/__main__.py','packages/desktop_runtime/api_bootstrap.py','packages/recruitment_core/worker.py','packages/recruitment_core/candidate_worker.py','packages/recruitment_core/candidate_live_worker.py','apps/api/main.py','apps/web/index.html','apps/web/app.js','scripts/__init__.py','scripts/apply_migrations.py','scripts/run_agent_crawler.py','scripts/run_mcp_server.py','migrations/001_fixture.sql']) put('app/'+name);
   manifest.entrypoints.api_bootstrap='app/packages/desktop_runtime/api_bootstrap.py';manifest.entrypoints.migration_script='app/scripts/apply_migrations.py';
   for(const key of ['python','codex','node','chromium','postgres','pgvector','application']) {put(`licenses/${key}.txt`);manifest.components[key]={version:'16.0',source:'https://fixtures.example/fixture',license_file:`licenses/${key}.txt`};}
   const save=()=>fs.writeFileSync(path.join(root,'runtime-manifest.json'),JSON.stringify(manifest));save();
@@ -33,7 +33,7 @@ function fixture(t) {
 }
 test('application inclusion inventory includes all migrations/active sources and no local data',()=>{
   const files=sourceInventory(repo);
-  for(const file of ['packages/desktop_runtime/__main__.py','apps/api/main.py','apps/web/app.js','scripts/apply_migrations.py','config/companies.example.yaml','migrations/023_automation_multiple_daily_times.sql']) assert.ok(files.includes(file),file);
+  for(const file of ['packages/desktop_runtime/__main__.py','packages/recruitment_core/worker.py','packages/recruitment_core/candidate_worker.py','packages/recruitment_core/candidate_live_worker.py','apps/api/main.py','apps/web/app.js','scripts/__init__.py','scripts/apply_migrations.py','scripts/run_agent_crawler.py','scripts/run_mcp_server.py','config/companies.example.yaml','migrations/023_automation_multiple_daily_times.sql']) assert.ok(files.includes(file),file);
   assert.ok(!files.some(file=>file.includes('.venv') || file.endsWith('.db') || file.includes('node_modules') || file.includes('.env')));
 });
 test('manifest paths, missing resources, extra files and drift fail before Python execution',async t=>{
@@ -41,12 +41,15 @@ test('manifest paths, missing resources, extra files and drift fail before Pytho
   for(const name of ['../x','C:/x','/x','app/../x','app\\x','app/CON.txt','app/x.']) assert.throws(()=>inside(f.root,name));
   fs.writeFileSync(path.join(f.root,'untracked.txt'),'x');await assert.rejects(validateRuntime(f.root),/untracked_resource/);fs.unlinkSync(path.join(f.root,'untracked.txt'));
   fs.writeFileSync(path.join(f.root,'app/apps/web/app.js'),'changed');await assert.rejects(validateRuntime(f.root),/hash_mismatch/);
+  f.put('app/apps/web/app.js');f.save();
+  fs.unlinkSync(path.join(f.root,'app/scripts/run_agent_crawler.py'));await assert.rejects(validateRuntime(f.root),/missing_or_hash_invalid/);
   await assert.rejects(validateRuntime(path.join(f.home,'absent')),/manifest_missing/);
 });
 test('missing app source/native key and corrupt Python PE fail explicitly',async t=>{
   const f=fixture(t);delete f.manifest.entrypoints.postgres;f.save();await assert.rejects(validateRuntime(f.root),/entrypoint_missing/);
   f.manifest.entrypoints.postgres='postgres/postgres.exe';delete f.manifest.files['app/apps/api/main.py'];f.save();await assert.rejects(validateRuntime(f.root),/source_missing/);
-  f.put('app/apps/api/main.py');f.put(f.manifest.entrypoints.python,'not an executable');f.save();await assert.rejects(validateRuntime(f.root),/python_not_x64/);
+  f.put('app/apps/api/main.py');delete f.manifest.files['app/scripts/run_agent_crawler.py'];f.save();await assert.rejects(validateRuntime(f.root),/source_missing/);
+  f.put('app/scripts/run_agent_crawler.py');f.put(f.manifest.entrypoints.python,'not an executable');f.save();await assert.rejects(validateRuntime(f.root),/python_not_x64/);
 });
 test('packaged launch uses only sealed resources, ignores dev paths and pins isolated profile',async t=>{
   const f=fixture(t);const resources=path.dirname(f.root);

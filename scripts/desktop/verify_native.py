@@ -49,6 +49,10 @@ def main():
         if browser.wait(60) != 0:
             raise RuntimeError("packaged_playwright_launch_failed")
         evidence["packaged_playwright_default_headless_launch"] = True
+        crawler = runtime.tree.spawn(runtime.command("python", "-I", "-B", "-m", "scripts.run_agent_crawler", "--help"), layout.data, runtime.env)
+        if crawler.wait(30) != 0:
+            raise RuntimeError("packaged_candidate_crawler_entrypoint_missing")
+        evidence["packaged_candidate_crawler_entrypoint"] = True
         runtime.backup()
     finally:
         runtime.stop()

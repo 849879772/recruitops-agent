@@ -4,7 +4,12 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 
 const entrypoints = ['python','codex','node','chromium','postgres','initdb','psql','pg_dump','pg_restore','pg_ctl','pg_config','vector_dll','vector_control','vector_sql','api_bootstrap','migration_script'];
-const essentialSources = ['packages/desktop_runtime/__main__.py','packages/desktop_runtime/api_bootstrap.py','apps/api/main.py','apps/web/index.html','apps/web/app.js','scripts/apply_migrations.py'];
+const essentialSources = [
+  'packages/desktop_runtime/__main__.py','packages/desktop_runtime/api_bootstrap.py',
+  'packages/recruitment_core/worker.py','packages/recruitment_core/candidate_worker.py','packages/recruitment_core/candidate_live_worker.py',
+  'apps/api/main.py','apps/web/index.html','apps/web/app.js',
+  'scripts/__init__.py','scripts/apply_migrations.py','scripts/run_agent_crawler.py','scripts/run_mcp_server.py',
+];
 function fail(code) { throw new Error(code); }
 function inside(root, relative) {
   if (typeof relative !== 'string' || relative.includes('\\') || relative.includes(':') || relative.startsWith('/') || relative.split('/').some(p => !p || p === '.' || p === '..' || /[. ]$/.test(p) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p))) fail('packaged_resource_path_invalid');
@@ -50,7 +55,7 @@ function sourceInventory(repo) {
     }
   }
   for (const relative of walk(path.join(repo,'config'))) if (relative.includes('.example.') || relative === 'README.md') paths.push(`config/${relative}`);
-  for (const relative of ['scripts/apply_migrations.py','scripts/run_mcp_server.py','pyproject.toml','LICENSE']) if (fs.existsSync(path.join(repo,relative))) paths.push(relative);
+  for (const relative of ['scripts/__init__.py','scripts/apply_migrations.py','scripts/run_agent_crawler.py','scripts/run_mcp_server.py','pyproject.toml','LICENSE']) if (fs.existsSync(path.join(repo,relative))) paths.push(relative);
   return [...new Set(paths)].sort();
 }
 async function validateRuntime(root, options = {}) {
