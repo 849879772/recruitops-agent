@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f2f7ff">
     <title>秋招工作台 | RecruitOps Agent</title>
-    <link rel="stylesheet" href="./styles.css?v=public-ui-20260923">
-    <script defer src="./app.js?v=public-ui-20260918"></script>
-    <script defer src="./company-sources.js?v=public-ui-20260918"></script>
-    <script defer src="./configuration.js?v=public-ui-20260923"></script>
+    <link rel="stylesheet" href="./styles.css?v=public-ui-20260924-1">
+    <script defer src="./app.js?v=public-ui-20260924-1"></script>
+    <script defer src="./company-sources.js?v=public-ui-20260924-1"></script>
+    <script defer src="./configuration.js?v=public-ui-20260924-1"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -339,6 +339,11 @@
                 <button class="icon-button" id="applications-refresh-button" type="button" aria-label="刷新投递记录" title="刷新投递记录"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg></button>
               </div>
             </div>
+            <form id="application-filter-form" class="application-filter-bar" role="search">
+              <label for="application-search">搜索投递记录</label>
+              <input id="application-search" type="search" maxlength="200" placeholder="搜索公司名称或岗位名称" autocomplete="off">
+              <button class="button button--ghost" type="reset">重置</button>
+            </form>
             <div class="application-summary" id="application-summary" aria-label="投递漏斗"></div>
             <div class="application-kanban" id="application-kanban" data-state="loading"><div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div></div>
           </section>
@@ -540,6 +545,18 @@
                   <button type="button" class="text-button" id="assistant-open-configuration">配置模型连接</button>
                   <button type="button" class="text-button" id="assistant-recheck">重新检查</button>
                 </div>
+                <section class="assistant-task-progress" id="assistant-task-progress" aria-label="当前后台任务进度" hidden>
+                  <div class="assistant-task-progress-head">
+                    <strong id="assistant-task-progress-title">后台任务</strong>
+                    <span id="assistant-task-progress-state"></span>
+                  </div>
+                  <p id="assistant-task-progress-detail"></p>
+                  <progress id="assistant-task-progress-bar" max="100" value="0" hidden></progress>
+                  <small id="assistant-task-progress-stages"></small>
+                  <div class="inline-actions" id="assistant-task-progress-actions"></div>
+                </section>
+                <div id="assistant-more-task-progress" aria-live="polite"></div>
+                <div id="assistant-mail-binding-approvals" aria-live="polite"></div>
                 <div class="message-list agent-message-list" id="assistant-messages" aria-live="polite" aria-relevant="additions" aria-atomic="false">
                   <article class="message message--assistant">
                     <div class="message-meta"><strong>求职助理</strong><span>待命</span></div>

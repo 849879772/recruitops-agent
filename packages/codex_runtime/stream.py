@@ -440,6 +440,14 @@ def cursor_signature(event: CodexEvent) -> tuple[tuple[str, str], ...] | None:
 
 
 def _is_cursor_poll(event: CodexEvent) -> bool:
+    # Mail waiting is bounded by the tool (20 seconds), not a cursor. It is
+    # legitimate to receive an unchanged snapshot while a model call is running.
+    # Zero-wait repeated reads retain the ordinary no-progress protection.
+    if _tool_name(event).casefold() == "recruitment_mail_run_status":
+        for mapping in _walk_mappings(event.payload):
+            wait = mapping.get("wait_ms")
+            if isinstance(wait, (int, float)) and not isinstance(wait, bool) and 0 < wait <= 20_000:
+                return True
     cursor = cursor_signature(event)
     if cursor is None:
         return False

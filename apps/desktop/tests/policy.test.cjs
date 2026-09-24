@@ -30,6 +30,9 @@ test('filler parity commands accept only finite bounded payloads', () => {
     {action:'filler-custom-save',question:'期望城市',answer:'北京',scope:'global',answerId:'answer-1'});
   assert.deepEqual(parseCommand({action:'filler-custom-delete',answerId:'answer-1'}),{action:'filler-custom-delete',answerId:'answer-1'});
   assert.equal(parseCommand({action:'filler-attachment-select'}).action,'filler-attachment-select');
+  assert.deepEqual(parseCommand({action:'filler-attachment-upload',scanId:'scan',fieldId:'resume',confirmed:true}),
+    {action:'filler-attachment-upload',scanId:'scan',fieldId:'resume',confirmed:true});
+  assert.throws(()=>parseCommand({action:'filler-attachment-upload',scanId:'scan',fieldId:'resume',confirmed:false}));
   assert.equal(parseCommand({action:'filler-application-save',company:'示例公司',title:'软件工程师',recordUrl:'https://careers.example/applications'}).action,'filler-application-save');
   for (const value of [
     {action:'filler-profile-save',profile:[],expectedVersion:0},
@@ -85,15 +88,20 @@ test('profile, single queue and stop commands enforce exact bounded contracts',(
   ]) assert.throws(()=>parseCommand(value));
 });
 
-test('desktop registration is add-only without lookup, binding, sync or diagnostic commands',()=>{
+test('desktop registration remains add-only; page progress sync is a separate bounded command',()=>{
   const create={action:'filler-application-save',company:'Synthetic Company',title:'Engineer',recordUrl:'https://careers.example.test/applications'};
   assert.deepEqual(parseCommand(create),create);
+  assert.deepEqual(parseCommand({...create,recordUrl:''}),{...create,recordUrl:''});
   for(const value of [
     {...create,applicationId:'saved-application'}, {...create,candidateIds:['candidate-one']},
     {action:'filler-application-sync',applicationId:'saved-application'},
     {action:'filler-application-find',company:'Synthetic Company',title:'Engineer'},
     {action:'filler-diagnostics-copy'}, {action:'filler-diagnostics-clear'},
   ]) assert.throws(()=>parseCommand(value));
+  const sync={action:'filler-application-sync-page',company:'Synthetic Company',candidateIds:['candidate-0','candidate-1']};
+  assert.deepEqual(parseCommand(sync),sync);
+  for(const value of [{...sync,candidateIds:[]},{...sync,candidateIds:['candidate-0','candidate-0']},
+    {...sync,candidateIds:['other']},{...sync,currentStage:'rejected'}])assert.throws(()=>parseCommand(value));
 });
 test('batch registration accepts bounded new records only, never stage or existing-application binding',()=>{
   const record={company:'Synthetic Company',title:'Engineer',recordUrl:'https://careers.example.test/applications'};

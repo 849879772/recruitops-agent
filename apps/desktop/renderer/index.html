@@ -15,19 +15,20 @@
   <p id="filler-status" role="status" aria-live="polite"></p><p id="filler-ui-error" class="error" role="alert" hidden></p>
   <div class="filler-scroll">
     <div id="filler-view-scan" role="tabpanel" aria-labelledby="filler-tab-scan">
-      <button id="filler-one-click" class="filler-primary" disabled>一键填写</button>
+      <div class="filler-actions"><button id="filler-scan" class="filler-primary">扫描当前页面</button><button id="filler-prepare" disabled>同步重复经历</button></div>
+      <p id="filler-frame-note" class="filler-muted"></p>
+      <button id="filler-frame-allow" type="button" hidden disabled>允许扫描嵌入表单</button>
+      <label class="filler-check"><input id="filler-select-all" type="checkbox" disabled>全选可填字段</label><p id="filler-counts" class="filler-muted"></p>
+      <div id="filler-fields"></div><p id="filler-empty">尚未扫描当前页面。</p>
+      <button id="filler-confirm" class="filler-primary" disabled>确认填写所选字段</button>
+      <button id="filler-one-click" disabled>一键扫描并填写</button>
+      <label class="filler-check"><input id="filler-one-click-upload" type="checkbox" checked>填写前上传默认简历（可取消）</label>
       <p id="filler-one-click-feedback" role="status" aria-live="polite" hidden></p>
       <div class="filler-actions"><button id="filler-undo" disabled>撤销本次填写</button><button id="filler-stop" disabled title="停止后续填写；已填写内容保留，不会刷新官网">停止</button></div>
       <div id="filler-upload-row" class="filler-actions" hidden><select id="filler-upload-target" aria-label="简历附件目标"></select><button id="filler-attachment-upload" disabled>上传默认简历</button></div>
       <p id="filler-plan-note" role="status"></p>
       <details id="filler-advanced"><summary>未完成字段与高级选项</summary>
       <div id="filler-remaining" hidden></div>
-      <p id="filler-frame-note" class="filler-muted"></p>
-      <div class="filler-actions"><button id="filler-scan">扫描当前页面</button><button id="filler-prepare" disabled>同步重复经历</button></div>
-      <button id="filler-frame-allow" type="button" hidden disabled>允许扫描嵌入表单</button>
-      <label class="filler-check"><input id="filler-select-all" type="checkbox" disabled>全选可填字段</label><p id="filler-counts" class="filler-muted"></p>
-      <div id="filler-fields"></div><p id="filler-empty">尚未扫描当前页面。</p>
-      <button id="filler-confirm" class="filler-primary" disabled>确认填写所选字段</button>
       <p id="filler-fill-feedback" class="filler-muted" hidden></p><button id="filler-retry-failed" disabled hidden>重新扫描失败字段</button>
       <details id="filler-custom"><summary>自定义补充答案</summary>
         <label>目标字段<select id="filler-custom-field"><option value="">仅保存答案</option></select></label>
@@ -51,7 +52,7 @@
       <div class="filler-actions"><button id="filler-demo-enable" disabled>切换演示资料</button><button id="filler-demo-restore" disabled>恢复个人资料</button></div>
       <div id="filler-profile-editor"></div>
       <div class="filler-actions"><button id="filler-profile-save" class="filler-primary" disabled>保存资料</button><button id="filler-profile-discard" disabled>放弃未保存改动</button></div>
-      <section class="filler-section"><h3>默认简历附件</h3><p id="filler-attachment-status">未选择附件</p><div class="filler-actions"><button id="filler-attachment-select" disabled>选择或替换附件</button><button id="filler-attachment-clear" disabled>清除附件</button></div><p class="filler-muted">选择附件不代表上传。上传需单独确认，已上传到网站的文件不能通过本地撤销收回。</p></section>
+      <section class="filler-section"><h3>默认简历附件</h3><p id="filler-attachment-status">未选择附件</p><div class="filler-actions"><button id="filler-attachment-select" disabled>选择或替换附件</button><button id="filler-attachment-clear" disabled>清除附件</button></div><p class="filler-muted">选择附件不会立即上传；点击一键扫描并填写且保留上传选项时，才会上传到唯一匹配的简历入口。已上传的文件不能通过本地撤销收回。</p></section>
     </div>
     <div id="filler-view-applications" role="tabpanel" aria-labelledby="filler-tab-applications" hidden>
       <div class="filler-actions"><button id="filler-application-detect" disabled>识别当前页面</button></div>
@@ -59,9 +60,10 @@
       <div id="filler-candidate-toolbar" hidden><label class="filler-check"><input id="filler-candidate-all" type="checkbox">全选</label><span id="filler-candidate-count"></span></div>
       <div id="filler-candidates"></div>
       <label>公司<input id="filler-application-company" maxlength="255"></label><label id="filler-application-title-label">岗位<input id="filler-application-title" maxlength="512"></label>
-      <label>投递进度链接<input id="filler-application-url" type="url" maxlength="2048" placeholder="https://"></label><label>城市<input id="filler-application-city" maxlength="255"></label>
+      <label>投递进度链接（可留空）<input id="filler-application-url" type="url" maxlength="2048" placeholder="https://"></label><p id="filler-application-url-note" class="filler-muted"></p><label>城市<input id="filler-application-city" maxlength="255"></label>
       <label class="filler-check"><input id="filler-application-confirm" type="checkbox">已核对当前页面、公司、岗位和进度链接</label>
       <button id="filler-application-save" class="filler-primary" disabled>确认新增登记</button>
+      <div class="filler-actions"><button id="filler-application-sync-page" disabled>同步所选岗位的官网进度</button></div>
       <section class="filler-section"><h3>待补传记录 <span id="filler-queue-count">0</span></h3><p class="filler-muted">仅补传已确认的新增登记。</p><div id="filler-queue"></div><button id="filler-application-flush" disabled>重试全部待补传记录</button></section>
     </div>
   </div>

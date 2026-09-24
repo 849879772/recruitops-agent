@@ -13,6 +13,7 @@ export type ApplicationConnection = { instanceId: string; origin: string; token:
 
 function progressUrl(value: string, confirmed = false): string {
   if (typeof value !== 'string' || value.length > 2048 || /[\s\\]/.test(value)) throw new Error('invalid_progress_url');
+  if (value === '') return '';
   const url = new URL(value);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('invalid_progress_url');
   const route = decodeURIComponent(url.pathname.replace(/\/+$/, '') + '/' + url.hash).toLowerCase();
@@ -43,6 +44,17 @@ export function companyNameFromPageTitle(value: unknown): string {
   if (!title || title.length > 500) return '';
   const company = title.replace(/(?:\s*[-|｜—·]\s*|\s*)(?:校园招聘(?:官网|平台)?|社会招聘(?:官网|平台)?|实习招聘(?:官网|平台)?|招聘官网|招聘平台|招聘门户|campus\s+recruitment|campus\s+hiring|careers?)\s*$/i, '').trim();
   return company && company !== title && company.length <= 255 ? company : '';
+}
+
+export function recruitCompanyCacheKey(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    const host = url.hostname.toLowerCase();
+    if (host !== 'app.mokahr.com') return host;
+    const match = url.pathname.match(/^\/(campus-recruitment|social-recruitment)\/([^/]+)\/([^/]+)/i);
+    return match ? `${host}/${match[1].toLowerCase()}/${match[2].toLowerCase()}/${match[3].toLowerCase()}` : `${host}${url.pathname}`;
+  } catch { return ''; }
 }
 
 // Main supplies a verified native connection and an instance-private atomic store.

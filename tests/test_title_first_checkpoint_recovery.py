@@ -1,8 +1,10 @@
 """Offline recovery regressions; all state lives in pytest's temporary directory."""
 
 from dataclasses import replace
+from datetime import datetime, time, timezone
 from hashlib import sha256
 import json
+from threading import Event
 
 import pytest
 from sqlalchemy import select
@@ -11,6 +13,10 @@ import yaml
 
 from packages.discovery.company_registry import CompanySourceRecord, CompanySourceRegistry
 from packages.pipeline import CrawlResult, DailyRecruitmentPipeline
+from packages.pipeline.daily import PipelineInterrupted
+from packages.orchestration import DailyRecruitmentSync
+from packages.scheduler import DailySchedule, LocalTaskScheduler, RunStatus, TaskDefinition
+from packages.scheduler.runtime import _initialize_empty_company_checkpoint
 from packages.storage import JobAnalysisSnapshot, JobSnapshot, Storage
 
 
@@ -68,6 +74,137 @@ def setup_pipeline(tmp_path):
 
 def forbidden(*args, **kwargs):
     pytest.fail("unexpected external/repeated operation")
+
+
+def test_pause_drains_only_in_flight_company_and_resume_reuses_it(setup_pipeline):
+    build, _storage, checkpoint = setup_pipeline
+    stop = Event()
+    attempted = []
+
+    def first_crawl(company):
+        attempted.append(company.id)
+        stop.set()
+        return crawl(job(company.id))
+
+    with pytest.raises(PipelineInterrupted):
+        build(("a", "b", "c"), crawler=first_crawl, stop_requested=stop).run()
+
+    assert attempted == ["a"]
+    entries = json.loads(checkpoint.read_text(encoding="utf-8"))["companies"]
+    assert list(entries) == ["a"]
+    assert entries["a"]["status"] == "complete"
+
+    resumed = []
+    progress = []
+    build(
+        ("a", "b", "c"),
+        crawler=lambda company: resumed.append(company.id) or crawl(job(company.id)),
+        resume_from_checkpoint=True,
+        progress_callback=lambda *args: progress.append(args),
+    ).run()
+
+    assert resumed == ["b", "c"]
+    assert ("companies", 1, 3) in progress
+    assert progress[-1][0] != "companies" or progress[-1] == ("companies", 3, 3)
+
+
+def test_company_batch_limit_pauses_and_next_batch_keeps_frozen_scope(setup_pipeline):
+    build, _storage, checkpoint = setup_pipeline
+    attempted = []
+
+    def crawler(company):
+        attempted.append(company.id)
+        return crawl(job(company.id))
+
+    with pytest.raises(PipelineInterrupted) as first:
+        build(("a", "b", "c"), crawler=crawler, company_batch_limit=2).run()
+
+    assert first.value.reason_code == "company_batch_limit_reached"
+    assert attempted == ["a", "b"]
+    assert set(json.loads(checkpoint.read_text(encoding="utf-8"))["companies"]) == {"a", "b"}
+
+    build(
+        ("a", "b", "c"), crawler=crawler,
+        company_batch_limit=2, resume_from_checkpoint=True,
+    ).run()
+
+    assert attempted == ["a", "b", "c"]
+
+
+def test_scope_frozen_before_first_company_has_resumable_empty_checkpoint(setup_pipeline):
+    build, _storage, checkpoint = setup_pipeline
+    pipeline = build(("a", "b"))
+
+    _initialize_empty_company_checkpoint(checkpoint, pipeline.companies_path)
+
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["company_ids"] == ["a", "b"]
+    result = build(("a", "b"), resume_from_checkpoint=True).run()
+    assert result.selected_companies == 2
+
+
+def test_later_batch_prioritizes_unattempted_companies_over_partial_retries(setup_pipeline):
+    build, _storage, _checkpoint = setup_pipeline
+    attempted = []
+
+    def incomplete(company):
+        attempted.append(company.id)
+        return replace(crawl(job(company.id)), pagination_complete=False, has_more=True)
+
+    with pytest.raises(PipelineInterrupted):
+        build(("a", "b", "c"), crawler=incomplete, company_batch_limit=2).run()
+    with pytest.raises(PipelineInterrupted):
+        build(
+            ("a", "b", "c"), crawler=incomplete,
+            company_batch_limit=2, resume_from_checkpoint=True,
+        ).run()
+
+    assert attempted == ["a", "b", "c", "a"]
+
+
+def test_scheduler_timeout_pauses_and_restart_resumes_offline_fixture(setup_pipeline, tmp_path):
+    build, _storage, checkpoint = setup_pipeline
+    task = TaskDefinition(
+        task_id="daily-fixture", label="daily fixture",
+        schedule=DailySchedule(time(8, 0)), timeout_seconds=0.5,
+        max_retries=0, cooperative_timeout=True,
+    )
+    scheduler = LocalTaskScheduler(
+        tasks={task.task_id: task}, lock_path=tmp_path / "scheduler.lock"
+    )
+    now = datetime(2026, 9, 23, tzinfo=timezone.utc)
+    crawled = []
+
+    def first_handler(context):
+        def crawler(company):
+            crawled.append(company.id)
+            assert context.stop_requested.wait(2)
+            return crawl(job(company.id))
+
+        return DailyRecruitmentSync(crawl=lambda _: build(
+            ("a", "b"), crawler=crawler,
+            stop_requested=context.stop_requested,
+        ).run()).run().model_dump(mode="json")
+
+    first = scheduler.run("daily-fixture", first_handler, now=now, scheduled_for=now)
+
+    assert first.status is RunStatus.PAUSED
+    assert crawled == ["a"]
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["companies"]["a"]["status"] == "complete"
+
+    def resumed_handler(_context):
+        return DailyRecruitmentSync(crawl=lambda _: build(
+            ("a", "b"),
+            crawler=lambda company: crawled.append(company.id) or crawl(job(company.id)),
+            resume_from_checkpoint=True,
+        ).run()).run().model_dump(mode="json")
+
+    second = scheduler.run(
+        "daily-fixture", resumed_handler, now=now, scheduled_for=now,
+        timeout_seconds=3,
+    )
+
+    assert second.status is RunStatus.SUCCESS
+    assert crawled == ["a", "b"]
 
 
 def hydration_path(checkpoint, company_id="a"):

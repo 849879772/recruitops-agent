@@ -201,7 +201,7 @@ def test_structured_analysis_retains_evidence_versions_and_fingerprints() -> Non
     assert outcome.decision.action is DecisionAction.ANALYZE
     assert result.analysis_status is AnalysisStatus.COMPLETE
     assert result.analysis_version == ANALYSIS_VERSION
-    assert result.prompt_version == "matching-prompt-v1"
+    assert result.prompt_version == "matching-prompt-v3"
     assert result.content_fingerprint == content_fingerprint(job)
     assert result.profile_fingerprint == profile_fingerprint(profile)
     assert result.match_score == 84
@@ -209,6 +209,69 @@ def test_structured_analysis_retains_evidence_versions_and_fingerprints() -> Non
     assert result.input_tokens == 11
     assert result.output_tokens == 7
     assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"direction_match": 30, "skill_match": 20, "project_evidence": 30,
+         "degree_job_type": 10, "location": 5, "total": 95},
+        {"core_direction": 28, "required_skills": 24, "project_evidence": 30,
+         "engineering_stack": 12},
+        {"core_direction": 28, "required_skills": 24, "project_evidence": 20},
+    ],
+)
+def test_malformed_score_breakdown_fails_instead_of_saving_false_low_score(
+    malformed: dict[str, int],
+) -> None:
+    response = _model_result()
+    response["score_breakdown"] = malformed
+
+    fake = FakeDeepSeek(response, response, response)
+    outcome = MatchingService(fake).analyze(_job(), _profile())
+
+    assert outcome.result.analysis_status is AnalysisStatus.FAILED
+    assert outcome.result.error_code == "model_output_invalid"
+    assert outcome.result.match_score is None
+    assert len(fake.calls) == 3
+
+
+def test_unrecognized_evidence_fields_fail_instead_of_losing_resume_evidence() -> None:
+    response = _model_result()
+    response["evidence"] = [
+        {"content": "C++项目", "relation": "direct", "requirement_type": "core"}
+    ]
+
+    outcome = MatchingService(FakeDeepSeek(response, response, response)).analyze(_job(), _profile())
+
+    assert outcome.result.analysis_status is AnalysisStatus.FAILED
+    assert outcome.result.error_code == "model_output_invalid"
+    assert outcome.result.match_score is None
+
+
+def test_explicit_zero_breakdown_is_still_a_valid_low_score() -> None:
+    response = _model_result()
+    response["score_breakdown"] = dict.fromkeys(response["score_breakdown"], 0)
+    response["evidence"] = []
+    response["evidence_level"] = "insufficient"
+
+    outcome = MatchingService(FakeDeepSeek(response)).analyze(_job(), _profile())
+
+    assert outcome.result.analysis_status is AnalysisStatus.COMPLETE
+    assert outcome.result.match_score == 0
+
+
+def test_matching_prompt_names_exact_score_and_evidence_fields() -> None:
+    fake = FakeDeepSeek(_model_result())
+
+    MatchingService(fake).analyze(_job(), _profile())
+
+    prompt = fake.calls[0]["system_prompt"]
+    for field in (
+        "core_direction", "required_skills", "project_evidence", "engineering_stack",
+        "jd_requirement", "profile_evidence",
+    ):
+        assert field in prompt
 
 
 def test_same_version_and_fingerprints_reuse_without_second_model_call() -> None:
@@ -305,6 +368,8 @@ def test_refusal_and_failure_are_explicit_and_failure_can_retry() -> None:
     fake = FakeDeepSeek(
         {"status": "refused", "refusal_reason": "证据不足"},
         "not-json",
+        "not-json",
+        "not-json",
         _model_result(),
     )
     service = MatchingService(fake)
@@ -319,7 +384,7 @@ def test_refusal_and_failure_are_explicit_and_failure_can_retry() -> None:
     assert failed.result.error_code == "model_output_invalid"
     assert retried.result.analysis_status is AnalysisStatus.COMPLETE
     assert retried.decision.reason == "previous_failure_retry"
-    assert len(fake.calls) == 3
+    assert len(fake.calls) == 5
 
 
 def test_deepseek_client_uses_injected_transport_without_real_api() -> None:
@@ -446,11 +511,10 @@ def test_matching_does_not_enable_thinking_when_disabled() -> None:
     )
     result = MatchingService(client).analyze(_job(), _profile())
 
-    assert result.result.analysis_status is AnalysisStatus.FAILED
-    assert result.result.error_code == "model_output_invalid"
-    assert len(calls) == 1
-    assert calls[0]["reasoning"] == {"effort": "none"}
-    assert calls[0]["thinking"] == {"type": "disabled"}
+    assert result.result.analysis_status is AnalysisStatus.COMPLETE
+    assert len(calls) == 2
+    assert all(call["reasoning"] == {"effort": "none"} for call in calls)
+    assert all(call["thinking"] == {"type": "disabled"} for call in calls)
 
 
 def test_deepseek_client_reports_thinking_only_token_exhaustion_as_truncated() -> None:

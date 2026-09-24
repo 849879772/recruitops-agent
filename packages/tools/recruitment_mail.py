@@ -41,7 +41,16 @@ class RecruitmentMailSummary(ToolModel):
     sender: str | None = None
     received_at: datetime | None = None
     category: RecruitmentMessageCategory
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    legacy_confidence: float | None = None
+    confidence_kind: str = "not_evaluated"
+    analysis_state: str = "unassessed"
+    binding_state: str = "unassessed"
+    association_required: bool = True
+    event_type: str | None = None
+    processing_label: str = "待分析"
+    binding_revision: int = 0
+    content_digest: str | None = None
     processing_status: str
     requires_confirmation: bool
     application_id: str | None = None
@@ -97,6 +106,55 @@ class RecruitmentMailReviewResponse(ToolResponse[RecruitmentMailReviewData]):
     freshness: dict[str, Any] | None = None
 
 
+class RecruitmentMailBindingCandidatesInput(ToolInput):
+    record_id: str = Field(min_length=1, max_length=128)
+    query: str = Field(default="", max_length=500)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class RecruitmentMailBindingProposeInput(ToolInput):
+    record_id: str = Field(min_length=1, max_length=128)
+    application_id: str | None = Field(default=None, max_length=255)
+    action: Literal["bind", "unbind", "correct"] = "bind"
+    content_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    binding_revision: int = Field(ge=0)
+
+
+class RecruitmentMailBindingProposeResponse(ToolResponse[dict[str, Any]]):
+    read_only: Literal[False] = False
+
+
+class RecruitmentMailBindingCandidatesResponse(ToolResponse[dict[str, Any]]):
+    pass
+
+
+def recruitment_mail_binding_candidates(request: RecruitmentMailBindingCandidatesInput,
+                                        store: RecruitmentMailStore) -> RecruitmentMailBindingCandidatesResponse:
+    from packages.recruitment_mail.binding import binding_candidates
+    result = binding_candidates(store, request.record_id, query=request.query, limit=request.limit)
+    return RecruitmentMailBindingCandidatesResponse(tool_name="recruitment_mail_binding_candidates", status=ToolStatus.SUCCESS,
+                        success=True, data=result, read_only=True, timeout_ms=request.timeout_ms, elapsed_ms=0,
+                        evidence=[EvidenceSource(source="recruitment_mail", source_ref=request.record_id)])
+
+
+def recruitment_mail_binding_propose(request: RecruitmentMailBindingProposeInput,
+                                     store: RecruitmentMailStore, registry) -> ToolResponse[dict[str, Any]]:
+    from packages.recruitment_mail.binding import binding_preview
+    preview = binding_preview(store, request.record_id, application_id=request.application_id,
+                              action=request.action, expected_digest=request.content_digest,
+                              expected_revision=request.binding_revision)
+    decision = registry.issue(preview)
+    return RecruitmentMailBindingProposeResponse(tool_name="recruitment_mail_binding_propose",
+        status=ToolStatus.SUCCESS if decision.allowed else ToolStatus.FAILURE, success=decision.allowed,
+        read_only=False, timeout_ms=request.timeout_ms, elapsed_ms=0,
+        error_code=None if decision.allowed else ToolErrorCode.INVALID_INPUT,
+        error_message=None if decision.allowed else decision.reason,
+        data={"approval_id": decision.token.token_id if decision.token else None,
+              "approval_status": decision.status.value, "requires_user_confirmation": True,
+              "business_write_performed": False, "preview": preview.model_dump(mode="json")},
+        evidence=[EvidenceSource(source="recruitment_mail", source_ref=request.record_id)])
+
+
 class RecruitmentMailSyncInput(ToolInput):
     limit: int = Field(default=100, ge=1, le=500)
 
@@ -116,13 +174,14 @@ def _elapsed(started: float) -> int:
 
 def _summary(record) -> RecruitmentMailSummary:
     parsed = parsed_record(record)
+    from packages.recruitment_mail.presentation import mail_semantics
     return RecruitmentMailSummary(
         id=record.id,
         subject=record.subject,
         sender=record.sender,
         received_at=record.received_at,
         category=RecruitmentMessageCategory(record.category),
-        confidence=record.confidence,
+        **mail_semantics(record),
         processing_status=record.processing_status,
         requires_confirmation=record.requires_confirmation,
         application_id=record.application_id,

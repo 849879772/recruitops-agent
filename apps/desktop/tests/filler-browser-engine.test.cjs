@@ -5,13 +5,13 @@ const api = require('../../../packages/desktop_filler/index.cjs');
 const executablePath = process.env.RECRUITOPS_TEST_CHROMIUM;
 const bundle = api.loadDesktopFiller();
 
-async function fixture(t, body) {
+async function fixture(t, body, url = 'https://fixture.example/form') {
   const browser = await chromium.launch({ headless: true, executablePath });
   t.after(() => browser.close());
   const page = await browser.newPage();
-  await page.route('**/*', route => route.request().url() === 'https://fixture.example/form'
+  await page.route('**/*', route => route.request().url() === url
     ? route.fulfill({ contentType: 'text/html; charset=utf-8', body }) : route.abort());
-  await page.goto('https://fixture.example/form');
+  await page.goto(url);
   return page;
 }
 
@@ -65,6 +65,108 @@ test('original engine respects cancellation queued before fill', { skip: !execut
   await page.evaluate(api.buildCancelScript(bundle));
   assert.equal((await page.evaluate(script)).code, 'filler_fill_cancelled');
   assert.equal(await page.locator('input').inputValue(), '');
+});
+
+test('desktop fill continues after a framework replaces a later field with the same verified control', { skip: !executablePath }, async t => {
+  const page = await fixture(t, `<div class="form-item"><label for="name">姓名</label><input id="name"></div>
+    <div class="form-item"><label for="email">电子邮箱</label><input id="email"></div>
+    <script>document.querySelector('#name').addEventListener('input',()=>{
+      const old=document.querySelector('#email');old.replaceWith(old.cloneNode(true));
+    })</script>`);
+  const scan = await page.evaluate(api.buildScanScript(bundle, { basic: { fullName: 'Synthetic', email: 'fixture@example.test' } }));
+  assert.equal(scan.matches.length, 2);
+  const result = await page.evaluate(api.buildFillScript(bundle, { scanId: scan.scanId, fieldIds: scan.matches.map(m => m.fieldId), confirmed: true }));
+  assert.equal(result.filled, 2, JSON.stringify(result));
+  assert.equal(await page.locator('#email').inputValue(), 'fixture@example.test');
+});
+
+test('desktop filler reports a missing site option instead of a generic failed field', { skip: !executablePath }, async t => {
+  const page = await fixture(t, '<div class="form-item"><label for="site">面试地点</label><select id="site"><option value="">请选择</option><option>北京</option></select></div>');
+  const scan = await page.evaluate(api.buildScanScript(bundle, { basic: { interviewSite: '武汉' } }));
+  assert.equal(scan.matches.length, 1);
+  const result = await page.evaluate(api.buildFillScript(bundle, { scanId: scan.scanId, fieldIds: scan.matches.map(m => m.fieldId), confirmed: true }));
+  assert.equal(result.filled, 0);
+  assert.equal(result.results[0].reason, 'filler_option_missing');
+});
+
+test('only an actual resume attachment is offered for automatic upload', { skip: !executablePath }, async t => {
+  const page = await fixture(t, `<label>简历附件<input type="file" id="resume"></label>
+    <label>其他附件<input type="file" id="other"></label>
+    <label>智能解析简历<input type="file" id="parser"></label>`);
+  const scan = await page.evaluate(api.buildScanScript(bundle, { basic: { fullName: 'Synthetic' } }));
+  assert.equal(scan.attachments.length, 1, JSON.stringify(scan.attachments));
+  assert.match(scan.attachments[0].label, /简历附件/);
+});
+
+test('formily repeated education cards are discovered, expanded and rescanned', { skip: !executablePath }, async t => {
+  const page = await fixture(t, `<section class="applyFormModuleWrapper"><h2>教育经历</h2>
+    <div class="apply-form-array-card__item"><label>学校名称<input></label><label>专业名称<input></label></div>
+    <button type="button" id="add">添加</button></section><script>
+      document.querySelector('#add').onclick=()=>{const card=document.querySelector('.apply-form-array-card__item');card.before(card.cloneNode(true))};
+    </script>`);
+  const profile = { education: [{ school: 'Synthetic A' }, { school: 'Synthetic B' }] };
+  const scan = await page.evaluate(api.buildScanScript(bundle, profile));
+  assert.equal(scan.repeaters.length, 1, JSON.stringify(scan.repeaters));
+  const result = await page.evaluate(api.buildPrepareScript(bundle, { scanId: scan.scanId, sectionIds: scan.repeaters.map(r => r.sectionId), confirmed: true }));
+  assert.equal(result.results[0].added, 1, JSON.stringify(result));
+  assert.equal(await page.locator('.apply-form-array-card__item').count(), 2);
+  assert.equal((await page.evaluate(api.buildScanScript(bundle, profile))).repeaters.length, 0);
+});
+
+test('ambiguous add buttons inside a known repeater section are not clicked', { skip: !executablePath }, async t => {
+  const page = await fixture(t, `<section class="applyFormModuleWrapper"><h2>教育经历</h2>
+    <div class="apply-form-array-card__item"><label>学校名称<input></label><label>专业名称<input></label></div>
+    <button type="button">添加</button><button type="button">添加</button></section><script>
+      window.clicks=0;document.querySelectorAll('button').forEach(button=>button.onclick=()=>window.clicks++);
+    </script>`);
+  const profile = { education: [{ school: 'Synthetic A' }, { school: 'Synthetic B' }] };
+  const scan = await page.evaluate(api.buildScanScript(bundle, profile));
+  assert.equal(scan.repeaters.length, 0, JSON.stringify(scan.repeaters));
+  assert.equal(await page.evaluate('window.clicks'), 0);
+});
+
+test('kuaishou repeated education rows use the original platform section', { skip: !executablePath }, async t => {
+  const page = await fixture(t, `<section class="edit-resume-form-item"><h2 class="edit-resume-form-item-title">教育经历</h2>
+    <div class="edit-resume-form-item-container"><label>学校名称<input></label><label>专业名称<input></label></div>
+    <div class="action-button"><button type="button" id="add">添加</button></div></section><script>
+      document.querySelector('#add').onclick=()=>{const row=document.querySelector('.edit-resume-form-item-container');row.before(row.cloneNode(true))};
+    </script>`, 'https://campus.kuaishou.cn/form');
+  const profile = { education: [{ school: 'Synthetic A' }, { school: 'Synthetic B' }] };
+  const scan = await page.evaluate(api.buildScanScript(bundle, profile));
+  assert.equal(scan.repeaters.length, 1, JSON.stringify(scan.repeaters));
+  const result = await page.evaluate(api.buildPrepareScript(bundle, { scanId: scan.scanId, sectionIds: scan.repeaters.map(r => r.sectionId), confirmed: true }));
+  assert.equal(result.results[0].added, 1, JSON.stringify(result));
+  assert.equal(await page.locator('.edit-resume-form-item-container').count(), 2);
+});
+
+test('tencent repeated education rows retain their known section boundary', { skip: !executablePath }, async t => {
+  const page = await fixture(t, `<section class="send_box" id="page-resume-sections4"><h2>教育经历</h2>
+    <div class="experience_box"><div class="info_list"><label>学校名称<input></label><label>专业名称<input></label></div></div>
+    <button type="button" id="add">添加学历</button></section><script>
+      document.querySelector('#add').onclick=()=>{const row=document.querySelector('.info_list');row.before(row.cloneNode(true))};
+    </script>`, 'https://join.qq.com/form');
+  const profile = { education: [{ school: 'Synthetic A' }, { school: 'Synthetic B' }] };
+  const scan = await page.evaluate(api.buildScanScript(bundle, profile));
+  assert.equal(scan.repeaters.length, 1, JSON.stringify(scan.repeaters));
+  const result = await page.evaluate(api.buildPrepareScript(bundle, { scanId: scan.scanId, sectionIds: scan.repeaters.map(r => r.sectionId), confirmed: true }));
+  assert.equal(result.results[0].added, 1, JSON.stringify(result));
+  assert.equal(await page.locator('.info_list').count(), 2);
+});
+
+test('moka repeated education rows are prepared from their navigation section', { skip: !executablePath }, async t => {
+  const page = await fixture(t, `<div class="sd-Select-container"></div>
+    <section data-nav-id="education"><h2>教育经历</h2>
+      <div class="form-item"><label>学校名称<input name="educations_0_school"></label><label>专业名称<input name="educations_0_major"></label></div>
+      <button type="button" id="add">添加</button></section><script>
+      document.querySelector('#add').onclick=()=>{const row=document.querySelector('.form-item');const copy=row.cloneNode(true);
+        copy.querySelectorAll('input').forEach(input=>input.name=input.name.replace('_0_','_1_'));row.before(copy)};
+    </script>`, 'https://app.mokahr.com/form');
+  const profile = { education: [{ school: 'Synthetic A' }, { school: 'Synthetic B' }] };
+  const scan = await page.evaluate(api.buildScanScript(bundle, profile));
+  assert.equal(scan.repeaters.length, 1, JSON.stringify(scan.repeaters));
+  const result = await page.evaluate(api.buildPrepareScript(bundle, { scanId: scan.scanId, sectionIds: scan.repeaters.map(r => r.sectionId), confirmed: true }));
+  assert.equal(result.results[0].added, 1, JSON.stringify(result));
+  assert.equal(await page.locator('.form-item').count(), 2);
 });
 
 test('original engine fills Beisen framework labels and Phoenix dropdowns', { skip: !executablePath }, async t => {

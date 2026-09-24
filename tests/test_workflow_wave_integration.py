@@ -99,7 +99,7 @@ def test_failed_review_drains_siblings_before_resume_and_keeps_scope(tmp_path, m
 
         monkeypatch.setattr(review, "batch_observe_application_status", recovered)
         resumed = await review.continue_application_review(
-            BatchObserveApplicationStatusInput(all_non_terminal=True), object(), repo)
+            BatchObserveApplicationStatusInput(run_id=run_id), object(), repo)
         assert resumed.summary["run_id"] == run_id
         assert resumed.summary["processed_count"] == 10
         assert resumed.summary["scope_complete"] and resumed.success

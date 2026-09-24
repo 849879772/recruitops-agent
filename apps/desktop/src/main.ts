@@ -14,7 +14,7 @@ import type { ReviewStage } from './bridge-client';
 import { packagedRuntimeLaunch } from './packaged-runtime';
 import { FillerService } from './filler-service';
 import { FillerStore, FillerSnapshot } from './filler-store';
-import { FillerApplicationService, PendingRegistration } from './filler-application-service';
+import { FillerApplicationService, PendingRegistration, recruitCompanyCacheKey } from './filler-application-service';
 import type { ApplicationPage } from './filler-application-service';
 
 // A dedicated profile is selected before any Chromium session is created.
@@ -99,7 +99,7 @@ function state() {
         'filler-attachment-select','filler-attachment-clear','filler-attachment-upload','filler-demo-enable','filler-demo-restore','filler-scan','filler-frame-allow',
         'filler-prepare','filler-fill','filler-undo','filler-custom-save','filler-custom-delete',
         'filler-application-detect','filler-application-save','filler-application-save-batch','filler-application-flush','filler-application-cancel',
-        'filler-application-retry','filler-application-correct'],
+        'filler-application-retry','filler-application-correct','filler-application-sync-page'],
       capabilities: { ...(engine as {capabilities?: object}).capabilities, persistentProfile:!!fillerStore, attachment:!!fillerStore,
         applications:!!fillerApplications, offlineQueue:!!fillerApplications },
       profile: { ready:Object.keys(profileData).length>0, mode:fillerStoreSnapshot?.mode ?? 'personal', data:profileData,
@@ -478,6 +478,27 @@ async function syncObservedApplicationStatus(wc: WebContents, context: Applicati
   return fillerApplications.syncObservations(context, applicationIds, observation as Record<string, unknown>);
 }
 
+function learnedRecruitCompany(url: string): string {
+  const key=recruitCompanyCacheKey(url);
+  const raw=fillerStore?.snapshot().settings.recruitCompanyByHost;
+  if(!key || !raw || typeof raw!=='object' || Array.isArray(raw)) return '';
+  const company=(raw as Record<string,unknown>)[key];
+  return typeof company==='string' && company.trim().length<=255 ? company.trim() : '';
+}
+
+function rememberRecruitCompany(url: string, company: string) {
+  const key=recruitCompanyCacheKey(url), name=company.trim();
+  if(!key || !name || name.length>255 || !fillerStore) return;
+  const settings=fillerStore.snapshot().settings;
+  const raw=settings.recruitCompanyByHost;
+  const prior=raw && typeof raw==='object' && !Array.isArray(raw) ? raw as Record<string,unknown> : {};
+  if(prior[key]===name) return;
+  const entries=Object.entries({...prior,[key]:name}).filter(([site,value])=>
+    site!=='app.mokahr.com' && typeof value==='string' && value.trim() && value.length<=255).slice(-199);
+  fillerStoreSnapshot=fillerStore.saveSettings({...settings,recruitCompanyByHost:Object.fromEntries(entries)});
+  refreshFillerStoreSnapshot();
+}
+
 async function execute(raw: unknown) {
   const command = parseCommand(raw);
   if (['home','select','close','capture'].includes(command.action)) fillerOpen=false;
@@ -520,8 +541,15 @@ async function execute(raw: unknown) {
     }
     if(command.action==='filler-attachment-clear') fillerStoreSnapshot=fillerStore.clearAttachment();
     if(command.action==='filler-attachment-upload') {
-      const confirmation=await dialog.showMessageBox(window,{type:'question',buttons:['取消','确认上传'],defaultId:0,cancelId:0,message:'上传默认简历到当前官网？',detail:`${wc.getURL()}\n${fillerStoreSnapshot.attachment?.name||''}\n网站接收后的文件不能通过本地撤销收回。`});
-      if(confirmation.response===1)await filler.uploadAttachment(wc,command.scanId,command.fieldId,fillerStore);
+      let confirmed=command.confirmed===true;
+      if(!confirmed) {
+        const confirmation=await dialog.showMessageBox(window,{type:'question',buttons:['取消','确认上传'],defaultId:0,cancelId:0,message:'上传默认简历到当前官网？',detail:`${wc.getURL()}\n${fillerStoreSnapshot.attachment?.name||''}\n网站接收后的文件不能通过本地撤销收回。`});
+        confirmed=confirmation.response===1;
+      }
+      if(confirmed) {
+        const result=await filler.uploadAttachment(wc,command.scanId,command.fieldId,fillerStore);
+        if(!result.ok)throw new Error('网站未确认简历附件，已停止后续填写；请检查页面。');
+      }
     }
     if(command.action==='filler-demo-enable') {fillerStoreSnapshot=fillerStore.setMode('demo');refreshFillerStoreSnapshot();}
     if(command.action==='filler-demo-restore') {fillerStoreSnapshot=fillerStore.setMode('personal');refreshFillerStoreSnapshot();}
@@ -590,7 +618,13 @@ async function execute(raw: unknown) {
       applicationMessage='';
       await waitForReviewLoad(wc,Date.now()+12000);
       applicationPage=filler.pageContext(wc,id);
-      const context=await filler.readApplicationContext(wc,id);
+      const settings=fillerStore.snapshot().settings;
+      const site=new URL(wc.getURL()).origin;
+      const scoped=settings.allowedFrameOriginsBySite;
+      const saved=scoped&&typeof scoped==='object'&&!Array.isArray(scoped)?(scoped as Record<string,unknown>)[site]:undefined;
+      const origins=[...(Array.isArray(settings.allowedFrameOrigins)?settings.allowedFrameOrigins.filter(value=>typeof value==='string') as string[]:[]),
+        ...(Array.isArray(saved)?saved.filter(value=>typeof value==='string') as string[]:[])];
+      const context=await filler.readApplicationContext(wc,id,origins);
       if(!context.titles.length && browserService) {
         const observed=await browserService.observe(wc,randomUUID(),[]) as any;
         const records=Array.isArray(observed?.result?.application_records)?observed.result.application_records:[];
@@ -599,7 +633,10 @@ async function execute(raw: unknown) {
       const current=filler.pageContext(wc,id);
       if(!applicationPage || !current || current.generation!==applicationPage.generation || current.url!==context.url ||
           typeof active!=='number' || tabs.get(active)?.view.webContents!==wc) throw new Error('当前页面已变化，请重新识别岗位。');
-      applicationCandidates=context.titles.map((title,index)=>({id:`candidate-${index}`,company:context.company,title,recordUrl:context.url,
+      // A company identified on the current page outranks a previously saved
+      // host-level hint (shared ATS hosts can serve multiple employers).
+      const company=context.company||learnedRecruitCompany(context.url);
+      applicationCandidates=context.titles.map((title,index)=>({id:`candidate-${index}`,company,title,recordUrl:context.url,
         date:context.records.find(row=>row.title===title)?.date||'',sourceStatus:context.records.find(row=>row.title===title)?.sourceStatus||''}));
       applicationMessage=context.titles.length?`已读取 ${context.titles.length} 个岗位，请核对后新增。`:'未识别到岗位，可手动填写后新增。';
     }
@@ -609,7 +646,9 @@ async function execute(raw: unknown) {
       const context=filler.pageContext(wc,id);if(!context)throw new Error('当前页面已变化。');
       const result=await fillerApplications.register(context,{company:command.company,title:command.title,record_url:command.recordUrl,
         ...(command.city?{city:command.city}:{}),progress_url_confirmed:true},true);
-      applicationQueue=await fillerApplications.pending();applicationMessage=(result as any).queued?'本地服务暂不可用，已加入待补传队列。':'投递记录已保存。';
+      applicationQueue=await fillerApplications.pending();applicationMessage=(result as any).queued?'本地服务暂不可用，已加入待补传队列。':
+        command.recordUrl?'投递记录已保存。':'投递记录已保存；进度链接待补，官网状态暂不能自动复核。';
+      try {rememberRecruitCompany(command.recordUrl,command.company);} catch { /* Registration is already committed. */ }
       const applicationId=(result as any).result?.application_id;
       if(!(result as any).queued&&typeof applicationId==='string'&&command.recordUrl===context.url&&
           applicationCandidates.some(item=>item.title===command.title&&item.sourceStatus)) {
@@ -627,6 +666,8 @@ async function execute(raw: unknown) {
       applicationBatchResults=await fillerApplications.registerBatch(context,command.records.map(record=>({
         company:record.company,title:record.title,record_url:record.recordUrl,city:record.city,progress_url_confirmed:true})),true);
       applicationQueue=await fillerApplications.pending();
+      if(applicationBatchResults.some(row=>row.status==='saved'||row.status==='queued'))
+        try {rememberRecruitCompany(context.url,command.records[0].company);} catch { /* Registration is already committed. */ }
       const count=(status:string)=>applicationBatchResults.filter(row=>row.status===status).length;
       applicationMessage=`新增完成：已保存 ${count('saved')} 条，待补传 ${count('queued')} 条，失败 ${count('failed')} 条。`;
       const ids=applicationBatchResults.filter(row=>row.status==='saved'&&row.applicationId&&
@@ -638,6 +679,26 @@ async function execute(raw: unknown) {
           applicationMessage+=` 官网状态核实并同步 ${synced.filter(row=>row.success).length} 条；未核实的记录未改变原有进度。`;
         } catch {applicationMessage+=' 官网状态同步未完成，原有进度未改动。';}
       }
+    }
+    if(command.action==='filler-application-sync-page') {
+      if(!fillerApplications || !browserService) throw new Error('官网进度同步尚未就绪。');
+      const id=runtime?.state.instanceId;if(!id)throw new Error('本地实例尚未就绪。');
+      const context=filler.pageContext(wc,id);
+      if(!context || !applicationPage || context.generation!==applicationPage.generation ||
+          context.tabId!==applicationPage.tabId || context.url!==applicationPage.url) throw new Error('页面已变化，请重新识别。');
+      const cards=command.candidateIds.map(candidateId=>applicationCandidates.find(item=>item.id===candidateId));
+      const titles=cards.map(item=>{
+        if(typeof item?.title!=='string' || !item.title.trim() || typeof item.sourceStatus!=='string' || !item.sourceStatus.trim())
+          throw new Error('所选岗位缺少当前页官网状态，请重新识别。');
+        return item.title;
+      });
+      const matches=await fillerApplications.candidates(context,titles.map(title=>({company:command.company,title})));
+      if(matches.some(item=>item.existing.length!==1 || typeof item.existing[0]?.id!=='string'))
+        throw new Error('所选岗位没有唯一的已有投递记录，请在工作台核对后重试。');
+      const ids=matches.map(item=>item.existing[0].id as string);
+      if(new Set(ids).size!==ids.length) throw new Error('所选岗位对应同一投递记录，无法批量同步。');
+      const synced=await syncObservedApplicationStatus(wc,context,ids);
+      applicationMessage=`当前页进度已核实并同步 ${synced.filter(row=>row.success).length} 条；未核实 ${synced.filter(row=>!row.success).length} 条，原阶段未改动。`;
     }
     if(command.action==='filler-application-cancel') {if(!fillerApplications)throw new Error('投递记录服务尚未就绪。');await fillerApplications.cancel(command.queueId);applicationQueue=await fillerApplications.pending();}
     if(command.action==='filler-application-correct') {

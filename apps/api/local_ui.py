@@ -128,7 +128,19 @@ class ApplicationEdit(BaseModel):
     stage: ApplicationStage
     result: Literal["待", "进行中", "通过", "淘汰", "放弃"] = "进行中"
     note: str = Field(default="", max_length=4000)
+    company_name: str | None = Field(default=None, min_length=1, max_length=255)
+    job_title: str | None = Field(default=None, min_length=1, max_length=512)
     expected_updated_at: datetime
+
+    @field_validator("company_name", "job_title")
+    @classmethod
+    def nonblank_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("公司和岗位名称不能为空")
+        return value
 
 
 class ApplicationRecord(BaseModel):
@@ -192,11 +204,42 @@ def edit_application(application_id: str, body: ApplicationEdit):
     with _storage().write_transaction() as session:
         row = _row(session, application_id, body.expected_updated_at)
         now = datetime.now(timezone.utc)
-        row.stage_history = [*(row.stage_history or []), {
+        company_name = body.company_name if body.company_name is not None else row.company_name
+        job_title = body.job_title if body.job_title is not None else row.job_title
+        identity_changed = (company_name, job_title) != (row.company_name, row.job_title)
+        if identity_changed:
+            identity = sha256((company_name + "\n" + job_title).encode()).hexdigest()
+            if session.bind.dialect.name == "postgresql":
+                from sqlalchemy import text
+                session.execute(text("select pg_advisory_xact_lock(:key)"), {"key": int(identity[:15], 16)})
+            existing = session.scalar(select(ApplicationSnapshot.id).where(
+                ApplicationSnapshot.id != application_id,
+                ApplicationSnapshot.company_name == company_name,
+                ApplicationSnapshot.job_title == job_title,
+            ))
+            if existing is not None:
+                raise HTTPException(409, "已有相同公司和岗位的投递记录，请先核对")
+            events = session.scalars(select(ScheduleEventSnapshot).where(
+                ScheduleEventSnapshot.application_id == application_id)).all()
+            for event in events:
+                if event.title == f"{row.company_name} · {event.event_type}":
+                    event.title = f"{company_name} · {event.event_type}"
+                if event.company_name == row.company_name:
+                    event.company_name = company_name
+                if event.job_title == row.job_title:
+                    event.job_title = job_title
+        history = {
             "stage": body.stage.value, "previous_stage": row.stage,
             "result": body.result, "note": body.note,
             "source": "manual", "at": now.isoformat(),
-        }]
+        }
+        if identity_changed:
+            history.update(previous_company_name=row.company_name,
+                           previous_job_title=row.job_title,
+                           company_name=company_name, job_title=job_title)
+        row.stage_history = [*(row.stage_history or []), history]
+        row.company_name = company_name
+        row.job_title = job_title
         row.stage = ("rejected" if body.result == "淘汰" else
                      "withdrawn" if body.result == "放弃" else body.stage.value)
         row.note = body.note

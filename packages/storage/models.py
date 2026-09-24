@@ -58,6 +58,9 @@ class TaskRun(AuditMixin, Base):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_task_runs_idempotency_key"),
         Index("ix_task_runs_status", "status"),
+        # Match 001_agent_storage.sql, including SQLite-backed regressions.
+        CheckConstraint("step_count >= 0", name="task_runs_step_count_check"),
+        CheckConstraint("max_steps BETWEEN 1 AND 50", name="task_runs_max_steps_check"),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)

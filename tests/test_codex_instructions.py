@@ -96,3 +96,17 @@ def test_crawl_reporting_distinguishes_persistence_and_bounded_samples():
     for phrase in ("company_coverage", "不代表公司来源入口未保存", "pending_entries 是有界样本",
                    "必须披露内部失败", "不代表已保存完整 JD"):
         assert phrase in text
+
+
+def test_reviews_and_mail_remain_in_current_turn_while_crawl_stays_background():
+    from packages.codex_runtime.instructions import with_response_language
+    instructions = with_response_language({})["developerInstructions"]
+    assert "all_non_terminal=true,background=false" in instructions
+    assert "all_non_terminal=true,background=true" not in instructions
+    assert "continuation_required=true" in instructions
+    assert "wait_ms=20000" in instructions
+    assert "不另问是否继续" in instructions
+    assert "completed_count" in instructions and "已完成14、待完成72" in instructions
+    assert "用户要求后台运行时可结束当前回复" in instructions
+    assert "暂停或取消须由用户明确要求" in instructions
+    assert "不得要求用户复制内部编号" in instructions

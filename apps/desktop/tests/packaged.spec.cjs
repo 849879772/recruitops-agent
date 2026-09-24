@@ -8,7 +8,9 @@ test('NEW native package owns backend, authenticates workbench and persists synt
   test.setTimeout(900000);
   const executable=process.env.RECRUITOPS_DESKTOP_TEST_NEW_BUILD;
   test.skip(!executable,'No integrated native package supplied; fixtures are not packaged runtime acceptance');
-  const buildRoot=path.join(root,'artifacts/desktop-builds');
+  const buildRoot=process.env.RECRUITOPS_DESKTOP_TEST_BUILD_ROOT
+    ? path.resolve(process.env.RECRUITOPS_DESKTOP_TEST_BUILD_ROOT)
+    : path.join(root,'artifacts/desktop-builds');
   const relative=path.relative(buildRoot,path.resolve(executable));
   expect(relative.startsWith('..')||path.isAbsolute(relative)).toBe(false);
   const isolated=path.join(root,'.desktop-runtime-tests');

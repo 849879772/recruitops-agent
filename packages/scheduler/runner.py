@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 import threading
@@ -87,6 +87,7 @@ class LocalTaskScheduler:
         dry_run: bool = False,
         run_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        stop_requested: threading.Event | None = None,
     ) -> TaskRunResult:
         """Run one task, or return a plan when ``dry_run`` is true.
 
@@ -177,13 +178,35 @@ class LocalTaskScheduler:
                     read_only=True,
                     write_enabled=definition.agent_write_enabled,
                     metadata=run_metadata.to_dict(),
+                    stop_requested=(stop_requested if stop_requested is not None and not definition.auto_continue_on_timeout else threading.Event()),
                 )
-                state, timed_out, lock_deferred = self._invoke_with_timeout(
-                    handler,
-                    context,
-                    timeout,
-                    lock,
-                )
+                last_progress = None
+                while True:
+                    state, timed_out, lock_deferred = self._invoke_with_timeout(
+                        handler, context, timeout, lock,
+                        cooperative_timeout=definition.cooperative_timeout,
+                        external_stop=stop_requested if definition.auto_continue_on_timeout else None,
+                    )
+                    continuation = state.value.get("continuation") if isinstance(state.value, Mapping) else None
+                    if not (definition.auto_continue_on_timeout and context.budget_expired.is_set()
+                            and state.error is None and not _business_failure(state.value)
+                            and _business_paused(state.value) and isinstance(continuation, Mapping)
+                            and (stop_requested is None or not stop_requested.is_set())):
+                        break
+                    progress = continuation.get("progress")
+                    if not progress or progress == last_progress:
+                        state.value = {**state.value, "continuation_blocked": "no_progress"}
+                        break  # Do not loop forever over a stalled checkpoint.
+                    last_progress = progress
+                    details = dict(context.metadata.get("details") or {})
+                    details.update(mode="resume", resume_run_id=context.run_id,
+                                   company_ids=[], source_record_ids=[])
+                    context = replace(context, segment=context.segment + 1,
+                                      metadata={**context.metadata, "details": details},
+                                      stop_requested=threading.Event(), budget_expired=threading.Event())
+                if isinstance(state.value, Mapping) and definition.auto_continue_on_timeout:
+                    state.value = {key: value for key, value in state.value.items() if key != "continuation"}
+                    state.value["execution_segments"] = context.segment
                 if timed_out:
                     deferred_lock_release = lock_deferred
                     return TaskRunResult(
@@ -201,11 +224,12 @@ class LocalTaskScheduler:
 
                 if state.error is None:
                     business_error = _business_failure(state.value)
+                    paused = _business_paused(state.value) or context.stop_requested.is_set()
                     return TaskRunResult(
                         task_id=definition.task_id,
                         task_label=definition.label,
                         run_id=actual_run_id,
-                        status=RunStatus.FAILED if business_error else RunStatus.SUCCESS,
+                        status=(RunStatus.FAILED if business_error else RunStatus.PAUSED if paused else RunStatus.SUCCESS),
                         attempts=attempt,
                         read_only=True,
                         run_metadata=run_metadata,
@@ -213,6 +237,14 @@ class LocalTaskScheduler:
                         finished_at=self._not_before(started_at),
                         value=state.value,
                         error=business_error,
+                    )
+
+                if context.stop_requested.is_set():
+                    return TaskRunResult(
+                        task_id=definition.task_id, task_label=definition.label,
+                        run_id=actual_run_id, status=RunStatus.PAUSED, attempts=attempt,
+                        read_only=True, run_metadata=run_metadata, started_at=started_at,
+                        finished_at=self._not_before(started_at), error=_format_exception(state.error),
                     )
 
                 if attempt < max_attempts and definition.retry_backoff_seconds:
@@ -268,6 +300,9 @@ class LocalTaskScheduler:
         context: TaskContext,
         timeout_seconds: float,
         lock: LocalInstanceLock,
+        *,
+        cooperative_timeout: bool = False,
+        external_stop: threading.Event | None = None,
     ) -> tuple[_AttemptState, bool, bool]:
         state = _AttemptState()
 
@@ -288,8 +323,29 @@ class LocalTaskScheduler:
             name=f"recruitops-task-{context.task_id}",
             daemon=True,
         )
+        if external_stop is not None and external_stop.is_set():
+            context.stop_requested.set()
         worker.start()
-        if state.done.wait(timeout_seconds):
+        deadline = time_module.monotonic() + timeout_seconds
+        while external_stop is not None and not external_stop.is_set() and not state.done.is_set():
+            remaining = deadline - time_module.monotonic()
+            if remaining <= 0:
+                break
+            state.done.wait(min(0.05, remaining))
+        if external_stop is not None and external_stop.is_set():
+            context.stop_requested.set()
+            state.done.wait()  # Cooperative daily worker owns lock until drained.
+            return state, False, False
+        if state.done.wait(max(0, deadline - time_module.monotonic())):
+            return state, False, False
+
+        context.budget_expired.set()
+        context.stop_requested.set()
+        if cooperative_timeout:
+            # The result remains running until the handler has drained and
+            # saved its in-flight work. Reporting a terminal timeout earlier
+            # would expose an inconsistent checkpoint and release the lock.
+            state.done.wait()
             return state, False, False
 
         with state.state_lock:
@@ -339,3 +395,12 @@ def _business_failure(value: Any) -> str | None:
                     or f"task returned {key}={status}"
                 )
     return None
+
+
+def _business_paused(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    daily_sync = value.get("daily_sync")
+    return value.get("status") == "paused" or (
+        isinstance(daily_sync, Mapping) and daily_sync.get("status") == "paused"
+    )

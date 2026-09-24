@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from threading import Event
 import time
 from typing import Any
 
@@ -21,7 +22,7 @@ from .title_policy import screen_title_job
 
 QUOTA_ERROR_CODES = frozenset({"http_401", "http_402", "http_403"})
 RETRYABLE_ERROR_CODES = frozenset({
-    "model_output_invalid", "structured_response_invalid",
+    "structured_response_invalid",
     "transport_failed", "http_429",
 })
 
@@ -235,6 +236,7 @@ def resume_pending_analyses(
     max_attempts: int = 3,
     retry_backoff_seconds: float = 1.0,
     sleeper: Callable[[float], None] = time.sleep,
+    stop_requested: Event | None = None,
 ) -> AnalysisResumeResult:
     """Analyze pending candidates in bounded waves with provider-error circuit breaking."""
 
@@ -257,6 +259,9 @@ def resume_pending_analyses(
     result = AnalysisResumeResult(planned=len(candidates))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         for offset in range(0, len(candidates), worker_count):
+            if stop_requested is not None and stop_requested.is_set():
+                result.stopped_reason = "time_budget_reached"
+                break
             wave = tuple(candidates[offset : offset + worker_count])
             outcomes = list(
                 executor.map(
@@ -284,6 +289,9 @@ def resume_pending_analyses(
             if progress is not None:
                 progress(result)
             if result.stopped_reason is not None:
+                break
+            if stop_requested is not None and stop_requested.is_set():
+                result.stopped_reason = "time_budget_reached"
                 break
     return result
 

@@ -8,11 +8,18 @@ description: Verify and update recorded applications from page evidence through 
 ## Batch Review
 
 For "复核官网投递状态" or all current applications, call
-`batch_observe_application_status(all_non_terminal=true)` directly. The service selects
+`batch_observe_application_status(all_non_terminal=true,background=false)` directly. Keep
+the current assistant turn open through the bounded waves and return the final result;
+do not leave this request running in the background and ask the user to query again. The service selects
 all saved applications except rejected/withdrawn; do not query or infer IDs first.
+Each new full-review request creates a scope from the current database. Resume a prior
+interrupted review only when the user explicitly asks to continue it, using its `run_id`.
+If this turn's tool call fails, do not present counts from an older checkpoint as current work.
 Omit `timeout_ms`, or set it to at most `120000`. The complete review uses bounded waves,
-not a longer single call. Continue using only the returned `run_id` while `remaining_count`
-is positive; do not start a new full review after a timeout. A completed checkpoint is not
+not a longer single call. Continue using only the returned `run_id` while
+`continuation_required=true`; do not ask for permission again merely because a wave returned.
+Stop on explicit pause/cancel, real unrecoverable failure, or a user-action requirement.
+Do not start a new full review after a timeout. A completed checkpoint is not
 the same as successful verification: report updated/unchanged separately from errors.
 `processed_count` counts attempted unique records, including retryable failures; use
 `completed_count` for completed records and `remaining_count` for those still needing work.

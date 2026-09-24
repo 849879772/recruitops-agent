@@ -126,6 +126,7 @@ def _mail_update(
         return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
                          error_code=ToolErrorCode.NOT_FOUND, error_message="Persisted mail evidence was not found.")
     from packages.recruitment_mail.analysis_binding import parsed_model_evidence, model_application_matches
+    from packages.recruitment_mail.binding import confirmed_binding_matches, binding_revision
     from packages.recruitment_mail.model_analysis import MAIL_ANALYSIS_VERSION
 
     analysis = (record.raw_metadata or {}).get("model_analysis")
@@ -141,7 +142,8 @@ def _mail_update(
                 raise ValueError("stale_model_analysis")
             parsed = parsed_model_evidence(record, analysis["payload"])
             proposed_id = analysis["payload"].get("candidate_application_id")
-            if proposed_id is not None and proposed_id != application.id:
+            if (proposed_id is not None and proposed_id != application.id
+                    and confirmed_binding_matches(record, application) is not True):
                 raise ValueError("model_candidate_mismatch")
         except (ValueError, KeyError, TypeError, AttributeError):
             return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
@@ -166,6 +168,7 @@ def _mail_update(
     stale_company_match = find_stale_company_only_match(parsed, applications)
     safe_stale_noop = (
         len(matches) == 0
+        and "confirmed_application_binding" not in (record.raw_metadata or {})
         and stale_company_match is not None
         and str(stale_company_match.id) == str(application.id)
     )
@@ -350,6 +353,8 @@ def _mail_update(
             "audit_id": audit_id,
             "event_time": parsed.received_at.isoformat(),
             "mail_record_id": record.id,
+            "mail_content_digest": record.content_digest,
+            "mail_binding_revision": binding_revision(record),
         })
     except ValueError as exc:
         base.update(reason_code="write_conflict", reason=str(exc))

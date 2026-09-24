@@ -44,6 +44,29 @@ def test_registration_auth_dedup_and_existing_status(tmp_path, monkeypatch):
     assert client.post(endpoint, json={**selected, "application_id": "missing"}, headers=headers).status_code == 404
 
 
+def test_registration_without_progress_url_keeps_stage_and_leaves_review_link_empty(tmp_path, monkeypatch):
+    url = f"sqlite:///{tmp_path / 'no-progress.db'}"
+    storage = Storage.from_url(url, initialize=True)
+    monkeypatch.setattr(module, "get_settings", lambda: SimpleNamespace(database_url=url, api_token="test", write_enabled=True))
+    app = FastAPI(); app.include_router(module.router)
+    client = TestClient(app)
+    endpoint = "/api/integrations/resume-filler/application"
+    headers = {"Authorization": "Bearer test"}
+    body = dict(company="测试公司", title="测试开发工程师", record_url="")
+    created = client.post(endpoint, json=body, headers=headers)
+    assert created.status_code == 200
+    application_id = created.json()["application_id"]
+    with storage.session() as session:
+        row = session.get(ApplicationSnapshot, application_id)
+        assert row.record_url is None and row.stage == "applied"
+    assert client.post(endpoint, json={**body, "record_url": "https://ats.example/campus/jobs", "progress_url_confirmed": True}, headers=headers).status_code == 422
+    linked = client.post(endpoint, json={**body, "record_url": "https://ats.example/applications"}, headers=headers)
+    assert linked.status_code == 200
+    with storage.session() as session:
+        row = session.get(ApplicationSnapshot, application_id)
+        assert row.record_url == "https://ats.example/applications" and row.stage == "applied"
+
+
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
     url = f"sqlite:///{tmp_path / 'desktop-filler.db'}"

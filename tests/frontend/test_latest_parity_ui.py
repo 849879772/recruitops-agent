@@ -266,6 +266,14 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         expect(page.get_by_role("button", name="编辑 Example 的投递记录", exact=True)).to_have_attribute("aria-expanded", "false")
         expect(page.locator(".application-card").locator("form").first.locator("select").first).to_have_value("written")
         assert applications[0]["stage"] == "written"
+        page.get_by_role("button", name="编辑 Example 的投递记录", exact=True).click()
+        editor = page.locator(".application-card").locator("form").first
+        editor.get_by_label("公司名称").fill("新的公司")
+        editor.get_by_label("岗位名称").fill("新的岗位")
+        editor.get_by_role("button", name="更新", exact=True).click()
+        expect(page.locator(".application-card-identity")).to_contain_text("新的公司")
+        expect(page.locator(".application-card-identity")).to_contain_text("新的岗位")
+        assert (applications[0]["company_name"], applications[0]["job_title"]) == ("新的公司", "新的岗位")
         page.screenshot(path=str(tmp_path / f"applications-{width}.png"))
         if width < 700:
             page.locator("#mobile-menu-button").click()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
+from threading import Event
 
 from packages.domain.models import Company, Job, JobAnalysis, RecruitmentBatch
 from packages.matching import DeepSeekResponse, MatchingService
@@ -125,6 +126,9 @@ class FakeClient:
                         }
                     ],
                     "summary": "方向与工程技能匹配。",
+                    "missing_core_requirements": [],
+                    "advantages": [],
+                    "gaps": [],
                 },
                 ensure_ascii=False,
             ),
@@ -188,7 +192,30 @@ def test_quota_error_stops_after_bounded_wave() -> None:
         assert untouched is None
 
 
-def test_empty_model_response_is_not_retried_by_outer_resume_loop() -> None:
+def test_time_budget_stops_after_persisted_scoring_wave() -> None:
+    storage = _storage()
+    plan = build_analysis_resume_plan(storage, PROFILE)
+    stop = Event()
+    client = FakeClient()
+    result = resume_pending_analyses(
+        storage,
+        PROFILE,
+        MatchingService(client),
+        plan.pending_jobs,
+        concurrency=1,
+        progress=lambda _: stop.set(),
+        stop_requested=stop,
+    )
+
+    assert result.stopped_reason == "time_budget_reached"
+    assert result.processed == 1
+    assert client.calls == 1
+    with storage.session() as session:
+        assert session.get(JobAnalysisSnapshot, "failed").analysis_status == "complete"
+        assert session.get(JobAnalysisSnapshot, "missing") is None
+
+
+def test_empty_model_response_is_corrected_inside_service() -> None:
     class FlakyClient(FakeClient):
         def complete(self, **kwargs):
             if self.calls == 0:
@@ -210,7 +237,8 @@ def test_empty_model_response_is_not_retried_by_outer_resume_loop() -> None:
         retry_backoff_seconds=0,
     )
 
-    assert result.failed == 1
-    assert client.calls == 1
+    assert result.failed == 0
+    assert result.completed == 1
+    assert client.calls == 2
     with storage.session() as session:
         assert session.get(JobSnapshot, "failed").jd_raw == _job("failed").jd_raw

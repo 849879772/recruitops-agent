@@ -103,6 +103,23 @@ def test_incomplete_refresh_never_writes_registry():
     assert CompanySourceRegistry(storage).list_sources()["total"] == 0
 
 
+def test_refresh_reports_validated_page_progress_without_early_writes():
+    storage = Storage.from_url("sqlite+pysqlite:///:memory:", initialize=True)
+    service = OfferBiuRefreshService(
+        CompanySourceRegistry(storage),
+        session=_Session([
+            _payload(0, [_row("one", "https://jobs.example.com/campus")]),
+            _payload(1, [_row("two", "https://jobs.example.com/other")]),
+        ]),
+    )
+    seen = []
+    result = service.refresh(apply=False, delay_seconds=0,
+                             progress_callback=lambda pages, total, records: seen.append((pages, total, records)))
+    assert seen == [(1, 2, 1), (2, 2, 2)]
+    assert result["complete"] is True
+    assert CompanySourceRegistry(storage).list_sources()["total"] == 0
+
+
 def test_refresh_links_exact_existing_company_and_excludes_it_from_pending():
     storage = Storage.from_url("sqlite+pysqlite:///:memory:", initialize=True)
     with storage.write_transaction() as db:

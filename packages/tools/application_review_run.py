@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+import os
 from time import perf_counter, time
 from uuid import uuid4
 
 from sqlalchemy import select
 
 from packages.domain.urls import normalize_http_page_url
-from packages.storage.models import TaskRun, ToolCall
+from packages.storage.models import TaskRun, ToolCall, utc_now
+from .application_review_tasks import REVIEW_CONTEXT, lease_active, lock_review_scope, review_summary
 from .batch_browser_operations import (
     ApplicationStatusResult, BatchObserveApplicationStatusInput,
     BatchObserveApplicationStatusResponse, _error_response, _origin_concurrency_key,
@@ -24,6 +26,7 @@ _STATES = ("updated", "unchanged", "excluded", "blocked", "unresolved", "failed"
 _WAVE_PAGES = 10
 _WAVE_TIMEOUT_SECONDS = 105
 _LEASE_SECONDS = 115
+_CONTINUATION_SECONDS = 120
 _WAVE_MAX_CONCURRENCY = 4
 _MAX_APPLICATION_ATTEMPTS = 3
 _TRANSIENT_FAILURE_MARKERS = (
@@ -82,6 +85,16 @@ def _pending_ids(state):
     ]
 
 
+def _update_task_progress(task, state):
+    # One review is one task operation. Application counts belong to the
+    # checkpoint, not the scheduler's 1..50 step budget (including empty scopes).
+    total = len(state.get("ids", []))
+    remaining = len(_pending_ids(state))
+    task.max_steps = 1
+    task.step_count = int(remaining == 0)
+    task.current_step = f"{total - remaining}/{total}"
+
+
 def _response(run_id, state, started, *, busy=False):
     ids = list(dict.fromkeys(str(item) for item in state.get("ids", [])))
     scope_ids = set(ids)
@@ -106,28 +119,51 @@ def _response(run_id, state, started, *, busy=False):
         and _attempt_count(state, item) >= _MAX_APPLICATION_ATTEMPTS
     )
     completed_count = total - remaining
+    run_status = state.get("run_status") or (("stopped" if state.get("wave_error") else "awaiting_continuation") if remaining else "completed")
+    continuation_required = bool(
+        remaining and not busy and run_status == "awaiting_continuation"
+        and not state.get("control_request")
+        and state.get("wave_error") in {None, "review_wave_timeout"}
+    )
+    if not remaining:
+        next_action = "范围处理完毕不代表核验成功；按更新、登录、证据不足和失败分类报告。"
+    elif state.get("control_request") == "cancel" or run_status in {"cancelled", "cancelling"}:
+        next_action = "任务已取消或正在安全结束当前页面；不得续跑这轮任务，若用户需要重新执行须明确新建。"
+    elif state.get("control_request") == "pause" or run_status in {"paused", "pausing"}:
+        next_action = "用户已请求暂停；等待在途页面保存后停止，不得自动续跑，只有用户明确恢复才调用恢复操作。"
+    elif busy:
+        next_action = "复核正在执行，本次不是完成结果；不得重复新建或抢占，等待当前调用返回真实结果。"
+    elif continuation_required:
+        next_action = (
+            "保持当前助理回合，用同一个 run_id 继续调用本工具，直到范围结束；不要只返回已启动，也不需要再次询问用户。"
+            "进度使用 completed_count/total；processed_count 包含仍在 remaining_count 中的可重试记录，不得将二者相加。"
+        )
+    else:
+        next_action = "任务意外中断；如实说明已保存进度和中断原因，不得宣称安全暂停或完成，需显式恢复才可继续。"
     summary = {
         "run_id": run_id,
-        "run_status": ("stopped" if state.get("wave_error") else "running") if remaining else "completed",
+        "run_status": run_status,
         "selection": "all_non_terminal", "scope_total": total, "total": total,
         "database_total": state["database_total"],
         "excluded_terminal": state["excluded_terminal"],
         "unique_record_count": total,
         "processed_count": len(rows), "completed_count": completed_count,
         "remaining_count": remaining, "retryable_count": len(retryable),
+        "pending_unattempted_count": total - len(rows),
+        "continuation_required": continuation_required,
+        "background": False,
         "retry_exhausted_count": retry_exhausted,
         "scope_complete": remaining == 0, "in_progress": busy,
+        "control_request": state.get("control_request"),
         "wave_error": state.get("wave_error"),
+        "interruption_reason": state.get("interruption_reason"),
         "pages_total": state["pages_total"],
         "write_count": sum(row.wrote for row in rows),
         "completion_rate": round(completed_count / total, 4) if total else 1.0,
         "verification_success_count": verified,
         "verification_rate": round(verified / total, 4) if total else 1.0,
         **{key: len(value) for key, value in buckets.items()},
-        "next_action": (
-            "用同一个 run_id 继续调用本工具；暂时失败仅在预算内重试，累计统计无需相加。"
-            if remaining else "范围处理完毕不代表核验成功；按更新、登录、证据不足和失败分类报告。"
-        ),
+        "next_action": next_action,
     }
     status = (
         ToolStatus.SUCCESS
@@ -139,15 +175,20 @@ def _response(run_id, state, started, *, busy=False):
         success=status == ToolStatus.SUCCESS, total=total, pages_total=state["pages_total"],
         data=summary, summary=summary, **buckets,
         error_code=ToolErrorCode.AMBIGUOUS_MATCH if status != ToolStatus.SUCCESS else None,
-        error_message=("复核范围尚有待处理记录，按 run_id 继续。" if remaining else
-                       "范围已处理，但部分记录未能核验成功。") if status != ToolStatus.SUCCESS else None,
+        error_message=next_action if status != ToolStatus.SUCCESS else None,
         evidence=[EvidenceSource(source="agent.application_snapshot"),
                   EvidenceSource(source="agent.application_review_checkpoint", source_ref=run_id)],
         timeout_ms=110_000, elapsed_ms=int((perf_counter() - started) * 1000),
     )
 
 
-async def continue_application_review(request, bridge, repository):
+async def continue_application_review(request, bridge, repository, *, resume_control=False):
+    # Old clients may still send background=True. Keep the input compatible,
+    # but never detach browser work from the assistant call that reports it.
+    return await _continue_review_wave(request, bridge, repository, resume_control=resume_control)
+
+
+async def _continue_review_wave(request, bridge, repository, *, resume_control=False):
     started = perf_counter()
     if bridge is None:
         return _error_response(request, started=started, reason="Browser bridge unavailable; scope was not consumed.",
@@ -168,19 +209,30 @@ async def continue_application_review(request, bridge, repository):
     run_id = request.run_id
     claim = uuid4().hex
     with storage.write_transaction() as session:
-        # Serializes creation across MCP sessions on PostgreSQL without a schema migration.
-        if session.bind.dialect.name == "postgresql":
-            from sqlalchemy import text
-            session.execute(text("SELECT pg_advisory_xact_lock(718202609)"))
+        lock_review_scope(session)
+        active = session.scalars(select(ToolCall).join(TaskRun, ToolCall.task_id == TaskRun.id)
+                                 .where(ToolCall.tool_name == _STATE_TOOL,
+                                        TaskRun.status.in_(["accepted", "running", "awaiting_continuation", "stopped", "pausing", "cancelling"]))
+                                 .with_for_update()).all()
+        conflicting = next((item for item in active if lease_active(dict(item.arguments or {}))), None)
+        if conflicting is not None:
+            result = _response(conflicting.task_id, dict(conflicting.arguments or {}), started, busy=True)
+            summary = review_summary(conflicting.task_id, dict(conflicting.arguments or {}),
+                                     session.get(TaskRun, conflicting.task_id).status)
+            result.summary.update(summary, active_run_id=conflicting.task_id)
+            result.summary["actions"] = ["status", *summary["actions"]]
+            result.data = dict(result.summary)
+            result.error_code = ToolErrorCode.SOURCE_UNAVAILABLE
+            result.error_message = "Review already in progress; inspect or control the returned active_run_id."
+            result.status = ToolStatus.FAILURE
+            result.success = False
+            return result
         if run_id:
             row = session.scalar(select(ToolCall).where(
                 ToolCall.task_id == run_id, ToolCall.tool_name == _STATE_TOOL,
             ).with_for_update())
         else:
-            row = session.scalar(select(ToolCall).join(TaskRun, ToolCall.task_id == TaskRun.id)
-                                 .where(ToolCall.tool_name == _STATE_TOOL,
-                                        TaskRun.status.in_(["running", "stopped"]))
-                                 .order_by(ToolCall.created_at.desc()).with_for_update())
+            row = None
         if row is None and run_id:
             return _error_response(request, started=started, reason="Review checkpoint not found; scope was not restarted.",
                                    error_code=ToolErrorCode.NOT_FOUND)
@@ -191,9 +243,11 @@ async def continue_application_review(request, bridge, repository):
                 if _value(app.stage) not in {"rejected", "withdrawn"}
             ))
             state = {"ids": ids, "results": {}, "attempts": {}, "database_total": len(applications),
-                     "excluded_terminal": len(applications) - len(ids), "pages_total": 0}
+                     "excluded_terminal": len(applications) - len(ids), "pages_total": 0,
+                     "metadata": {"task_kind": "application_review", "thread_id": request.thread_id,
+                                  "turn_id": request.turn_id}}
             session.add(TaskRun(id=run_id, task_type="application_status_review",
-                                status="running", user_request="复核全部未挂投递", source="application_review"))
+                                status="running", max_steps=1, user_request="复核全部未挂投递", source="application_review"))
             session.flush()
             row = ToolCall(id=run_id, task_id=run_id, tool_name=_STATE_TOOL,
                            arguments=state, source="application_review")
@@ -201,6 +255,14 @@ async def continue_application_review(request, bridge, repository):
         else:
             run_id = row.task_id
             state = dict(row.arguments or {})
+            task = session.get(TaskRun, run_id)
+            if task.status in {"cancelled", "cancelling"}:
+                result = _response(run_id, {**state, "run_status": task.status}, started)
+                result.status, result.success = ToolStatus.FAILURE, False
+                result.error_code, result.error_message = ToolErrorCode.INVALID_INPUT, "已取消的任务不能续跑，请明确新建任务。"
+                return result
+            if not resume_control and (state.get("control_request") or task.status in {"paused", "pausing"}):
+                return _response(run_id, {**state, "run_status": task.status}, started)
             state["ids"] = list(dict.fromkeys(str(item) for item in state.get("ids", [])))
             state["results"] = dict(state.get("results") or {})
             attempts = dict(state.get("attempts") or {})
@@ -210,21 +272,49 @@ async def continue_application_review(request, bridge, repository):
             state.setdefault("database_total", len(applications))
             state.setdefault("excluded_terminal", max(0, len(applications) - len(state["ids"])))
             state.setdefault("pages_total", 0)
-        if state.get("lease_until", 0) > time():
-            return _response(run_id, state, started, busy=True)
-        state.update(lease_until=time() + _LEASE_SECONDS, claim=claim, wave_error=None)
+        metadata = dict(state.get("metadata") or {})
+        metadata.update(task_kind="application_review")
+        if request.thread_id:
+            metadata["thread_id"] = request.thread_id
+        if request.turn_id:
+            metadata["turn_id"] = request.turn_id
+        state.update(lease_until=time() + _LEASE_SECONDS, claim=claim, wave_error=None,
+                     continuation_until=0, interruption_reason=None,
+                     control_request=None, run_status="running", metadata=metadata,
+                     owner={"pid": os.getpid(), "desktop_run_id": os.environ.get("RECRUITOPS_DESKTOP_RUN_ID", "")})
         row.arguments = state
         task = session.get(TaskRun, run_id)
+        _update_task_progress(task, state)
         if _pending_ids(state):
             task.status = "running"
             task.error_code = None
+
+    owner_context = REVIEW_CONTEXT.set((storage, run_id, claim))
+
+    def can_dispatch():
+        with storage.session() as session:
+            row = session.get(ToolCall, run_id)
+            current = dict(row.arguments or {}) if row else {}
+            return current.get("claim") == claim and lease_active(current) and not current.get("control_request")
+
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(min(10, _LEASE_SECONDS / 3))
+            with storage.write_transaction() as session:
+                row = session.scalar(select(ToolCall).where(ToolCall.id == run_id).with_for_update())
+                current = dict(row.arguments or {}) if row else {}
+                if current.get("claim") != claim or not lease_active(current):
+                    return
+                current["lease_until"] = time() + _LEASE_SECONDS
+                row.arguments = current
+                row.updated_at = utc_now()
 
     async def save_result(result_rows, page_count, expected_ids):
         with storage.write_transaction() as session:
             row = session.scalar(select(ToolCall).where(ToolCall.id == run_id).with_for_update())
             current = dict(row.arguments)
             if current.get("claim") != claim:
-                return
+                return set()
             results = dict(current["results"])
             attempts = dict(current.get("attempts") or {})
             saved_ids = set()
@@ -241,13 +331,17 @@ async def continue_application_review(request, bridge, repository):
                 attempts[application_id] = _attempt_count(current, application_id) + 1
             current.update(results=results, attempts=attempts,
                            pages_total=current["pages_total"] + page_count)
+            task = session.get(TaskRun, run_id)
+            _update_task_progress(task, current)
             row.arguments = current
+            row.updated_at = task.updated_at = utc_now()
             return saved_ids
 
     page_tasks = []
     inflight_ids = set()
     checkpointed_this_wave = set()
     wave_error = None
+    heartbeat_task = asyncio.create_task(heartbeat())
     try:
         lookup = {str(app.id): app for app in applications}
         groups = defaultdict(list)
@@ -269,6 +363,8 @@ async def continue_application_review(request, bridge, repository):
             for offset in range(0, len(ids), 50):
                 page_ids = ids[offset:offset + 50]
                 async with wave_semaphore:
+                    if not can_dispatch():
+                        return
                     inflight_ids.update(page_ids)
                     try:
                         part = await batch_observe_application_status(
@@ -351,6 +447,9 @@ async def continue_application_review(request, bridge, repository):
             if not page_task.done():
                 page_task.cancel()
         await asyncio.gather(*page_tasks, return_exceptions=True)
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        REVIEW_CONTEXT.reset(owner_context)
         with storage.write_transaction() as session:
             row = session.scalar(select(ToolCall).where(ToolCall.id == run_id).with_for_update())
             state = dict(row.arguments)
@@ -385,13 +484,18 @@ async def continue_application_review(request, bridge, repository):
                         ) + 1
                     state.update(results=results, attempts=attempts)
                 state.update(lease_until=0, wave_error=wave_error)
-                row.arguments = state
                 task = session.get(TaskRun, run_id)
                 remaining = len(_pending_ids(state))
-                task.step_count = len(state["ids"]) - remaining
-                task.max_steps = len(state["ids"])
-                task.current_step = f"{task.step_count}/{task.max_steps}"
+                _update_task_progress(task, state)
                 task.error_code = wave_error
-                task.status = ("completed" if remaining == 0 else
-                               "stopped" if wave_error else "running")
+                control = state.get("control_request")
+                task.status = ("cancelled" if control == "cancel" else
+                               "completed" if remaining == 0 else "paused" if control == "pause" else
+                               "stopped" if wave_error not in {None, "review_wave_timeout"} else "awaiting_continuation")
+                state["run_status"] = task.status
+                # This is an assistant continuation window, not a browser lease.
+                # Expiry is projected as interrupted rather than permanently active.
+                state["continuation_until"] = time() + _CONTINUATION_SECONDS if task.status == "awaiting_continuation" else 0
+                row.arguments = state
+                row.updated_at = task.updated_at = utc_now()
     return _response(run_id, state, started)

@@ -41,6 +41,10 @@ def parsed_model_evidence(record, payload: dict) -> ParsedRecruitmentEmail:
 
 def model_application_matches(record, payload, application):
     parsed = parsed_model_evidence(record, payload)
+    from .binding import confirmed_binding_matches
+    confirmed = confirmed_binding_matches(record, application)
+    if confirmed is not None:
+        return confirmed
     if mail_matches_application(parsed, application):
         return True
     proposal = MailAnalysisProposal.model_validate(payload)

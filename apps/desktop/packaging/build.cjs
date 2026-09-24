@@ -40,7 +40,9 @@ async function main() {
   if(!relativeRuntime || relativeRuntime.startsWith('..') || path.isAbsolute(relativeRuntime)) throw new Error('package_runtime_outside_checkout');
   // Embedded Python and native tools still encounter MAX_PATH on some hosts.
   const build = `n-${randomUUID().slice(0,8)}`;
-  const output = path.join(repo,'artifacts','desktop-builds',build);
+  const outputRoot = process.env.RECRUITOPS_DESKTOP_PACKAGE_OUTPUT_ROOT;
+  if(outputRoot && !path.isAbsolute(outputRoot)) throw new Error('package_output_root_must_be_absolute');
+  const output = path.join(outputRoot || path.join(repo,'artifacts','desktop-builds'),build);
   console.log('New candidate output:',output);
   const packageName=JSON.parse(fs.readFileSync(path.join(app,'package.json'),'utf8')).name;
   const stageRoot = path.join(app,'.package-staging');

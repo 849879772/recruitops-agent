@@ -9,10 +9,12 @@ import os
 from pathlib import Path
 from secrets import compare_digest
 from typing import Any, Literal, Mapping
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from apps.api.local_ui import is_local_ui, local_ui_request, router as local_ui_router
+from apps.api.daily_progress import latest_daily_progress, task_progress
 from apps.api.schedule_items import router as schedule_items_router
 from apps.api.company_sources import router as company_sources_router, set_start_retry_callback
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +38,7 @@ from packages.config import get_settings
 from packages.domain.models import (
     Application,
     ApplicationPage,
+    ApplicationStage,
     Company,
     JobBrowsePage,
     JobDetail,
@@ -76,6 +79,10 @@ from packages.tools.recruitment_mail import (
     RecruitmentMailReviewInput,
     RecruitmentMailSearchData,
     RecruitmentMailSearchInput,
+    RecruitmentMailBindingCandidatesInput,
+    RecruitmentMailBindingProposeInput,
+    recruitment_mail_binding_candidates,
+    recruitment_mail_binding_propose,
     get_recruitment_mail,
     review_recruitment_mail,
     search_recruitment_mail,
@@ -378,9 +385,22 @@ def _start_company_source_retry(record_id: str):
 set_start_retry_callback(_start_company_source_retry)
 
 
+def _is_same_origin_progress_get(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    return (request.method == "GET"
+            and request.url.path in {"/api/local-ui/daily-recruitment/progress", "/api/local-ui/tasks/progress"}
+            and request.headers.get("x-recruitops-local-ui") == "1"
+            and request.url.hostname in {"localhost", "127.0.0.1", "::1"}
+            and request.headers.get("sec-fetch-site") == "same-origin"
+            and (origin is None or (
+                urlsplit(origin).scheme == request.url.scheme
+                and urlsplit(origin).netloc == request.url.netloc
+            )))
+
+
 @app.middleware("http")
 async def local_ui_boundary(request, call_next):
-    trusted = is_local_ui(request)
+    trusted = is_local_ui(request) or _is_same_origin_progress_get(request)
     if request.headers.get("x-recruitops-local-ui") and not trusted:
         return JSONResponse({"detail": "Local same-origin UI request required"}, status_code=403)
     token = local_ui_request.set(trusted)
@@ -678,6 +698,54 @@ def get_storage_engine():
     return create_storage_engine(get_settings().database_url)
 
 
+@app.get("/api/local-ui/daily-recruitment/progress", tags=["local-ui"])
+def daily_recruitment_progress(request: Request) -> dict[str, object]:
+    # Same-origin GET normally has no Origin header, unlike local UI writes.
+    if not _is_same_origin_progress_get(request):
+        raise HTTPException(403, "Local same-origin UI request required")
+    return latest_daily_progress(Storage(get_storage_engine()))
+
+
+@app.get("/api/local-ui/tasks/progress", tags=["local-ui"])
+def current_task_progress(request: Request) -> dict[str, object]:
+    if not _is_same_origin_progress_get(request):
+        raise HTTPException(403, "Local same-origin UI request required")
+    # No history fallback: a new conversation never resurrects a finished card.
+    return task_progress(Storage(get_storage_engine()))
+
+
+class TaskControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    task_kind: Literal["daily", "application_review", "recruitment_mail"]
+    action: Literal["pause", "cancel"]
+
+
+@app.post("/api/local-ui/tasks/{run_id}/control", tags=["local-ui"])
+async def control_current_task(run_id: str, payload: TaskControlRequest,
+                               authorization: str | None = Header(default=None)):
+    _require_local_api_token(authorization, require_configured=True)
+    if not get_settings().write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    try:
+        if payload.task_kind == "application_review":
+            from packages.tools.application_review_tasks import ApplicationReviewControlInput, control_application_review
+            return await control_application_review(
+                ApplicationReviewControlInput(run_id=run_id, action=payload.action), browser_bridge_store, repository())
+        if payload.task_kind == "recruitment_mail":
+            return mail_processing_run_service().control(run_id, payload.action)
+        from packages.tools.task_runtime_control import request_daily_control
+        return request_daily_control(Storage(get_storage_engine()), run_id, payload.action)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@lru_cache
+def mail_processing_run_service():
+    from packages.recruitment_mail.run_service import MailProcessingRunService
+    return MailProcessingRunService(recruitment_mail_store(), repository(), get_settings(),
+                                    sync_mail=_run_recruitment_mail_sync)
+
+
 @lru_cache
 def get_recruitment_mail_store() -> RecruitmentMailStore:
     return RecruitmentMailStore(Storage.from_url(get_settings().database_url))
@@ -774,6 +842,7 @@ def browse_jobs(
     sort: Literal["score", "newest", "company"] = "score",
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    include_summary: bool = True,
     repo: RecruitmentRepository = Depends(repository),
 ) -> JobBrowsePage:
     """Browse confirmed 2027 campus jobs without transferring full JD text."""
@@ -793,6 +862,7 @@ def browse_jobs(
             sort=sort,
             limit=limit,
             offset=offset,
+            **({"include_summary": False} if not include_summary else {}),
         )
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -832,20 +902,45 @@ def list_applications(repo: RecruitmentRepository = Depends(repository)) -> list
 def search_applications(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    query: str | None = Query(default=None, max_length=200),
+    stage: ApplicationStage | None = None,
+    stages: list[ApplicationStage] | None = Query(default=None),
     repo: RecruitmentRepository = Depends(repository),
 ) -> ApplicationPage:
     """Return a bounded application page without changing the legacy list endpoint."""
 
     try:
+        if stage is not None and stages:
+            raise HTTPException(status_code=422, detail="stage 与 stages 不能同时使用")
+        filters = {}
+        if query and query.strip():
+            filters["query"] = query.strip()
+        if stage is not None:
+            filters["stage"] = stage.value
+        if stages:
+            filters["stages"] = tuple(value.value for value in stages)
         paged = getattr(repo, "search_applications", None)
         if callable(paged):
-            return paged(limit=limit, offset=offset)
+            return paged(limit=limit, offset=offset, **filters)
         items = repo.list_applications()
+        unfiltered_total = len(items)
+        if filters.get("query"):
+            keyword = " ".join(filters["query"].split()).casefold()
+            items = [item for item in items if keyword in " ".join(
+                f"{item.company_name} {item.job_title}".split()).casefold()]
+        stage_counts = {}
+        for item in items:
+            stage_counts[item.stage.value] = stage_counts.get(item.stage.value, 0) + 1
+        allowed = filters.get("stages") or ((filters["stage"],) if "stage" in filters else ())
+        if allowed:
+            items = [item for item in items if item.stage.value in allowed]
         return ApplicationPage(
             items=items[offset : offset + limit],
             total=len(items),
             limit=limit,
             offset=offset,
+            unfiltered_total=unfiltered_total,
+            stage_counts=stage_counts,
         )
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1057,6 +1152,7 @@ def _mail_data_or_error(result: Any, *, not_found_status: int = 503) -> Any:
     tags=["recruitment-mail"],
 )
 def list_recruitment_mails(
+    refresh: bool = True,
     on_date: date | None = None,
     category: RecruitmentMessageCategory | None = None,
     processing_status: RecruitmentMailProcessingStatus | None = None,
@@ -1066,7 +1162,7 @@ def list_recruitment_mails(
 ) -> RecruitmentMailSearchData:
     from packages.recruitment_mail.freshness import ensure_mail_fresh
 
-    freshness = ensure_mail_fresh(get_settings(), store)
+    freshness = ensure_mail_fresh(get_settings(), store) if refresh else {"status": "cached", "synced_at": None}
     result = search_recruitment_mail(
         RecruitmentMailSearchInput(
             on_date=on_date,
@@ -1103,16 +1199,42 @@ def sync_recruitment_mails(
 )
 def get_recruitment_mail_detail(
     record_id: str,
+    refresh: bool = True,
     store: RecruitmentMailStore = Depends(recruitment_mail_store),
 ) -> RecruitmentMailDetailData:
     from packages.recruitment_mail.freshness import ensure_mail_fresh
 
-    freshness = ensure_mail_fresh(get_settings(), store)
+    freshness = ensure_mail_fresh(get_settings(), store) if refresh else {"status": "cached", "synced_at": None}
     result = get_recruitment_mail(
         RecruitmentMailDetailInput(record_id=record_id),
         store,
     )
     return _mail_data_or_error(result, not_found_status=404).model_copy(update={"freshness": freshness})
+
+
+@app.get("/api/recruitment-mails/{record_id}/binding-candidates", tags=["recruitment-mail"])
+def mail_binding_candidates(record_id: str, query: str = Query(default="", max_length=500),
+                            store: RecruitmentMailStore = Depends(recruitment_mail_store)):
+    try:
+        return recruitment_mail_binding_candidates(
+            RecruitmentMailBindingCandidatesInput(record_id=record_id, query=query), store).data
+    except KeyError as exc:
+        raise HTTPException(404, "邮件不存在") from exc
+
+
+@app.post("/api/recruitment-mails/{record_id}/binding-proposals", tags=["recruitment-mail"])
+def propose_mail_binding(record_id: str, payload: RecruitmentMailBindingProposeInput,
+                          authorization: str | None = Header(default=None),
+                          store: RecruitmentMailStore = Depends(recruitment_mail_store)):
+    _require_local_api_token(authorization, require_configured=True)
+    if not get_settings().write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    if record_id != payload.record_id:
+        raise HTTPException(422, "邮件范围不一致")
+    try:
+        return recruitment_mail_binding_propose(payload, store, approval_registry)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(409, "邮件或投递记录已变化，请刷新后重新确认") from exc
 
 
 @app.post(

@@ -34,6 +34,14 @@ from packages.tools.application_review import (
     ApplicationStatusReviewResponse,
     application_status_review,
 )
+from packages.tools.application_review_tasks import (
+    ApplicationReviewStatusInput,
+    ApplicationReviewStatusResponse,
+    ApplicationReviewControlInput,
+    ApplicationReviewControlResponse,
+    application_review_status,
+    control_application_review,
+)
 from packages.tools.browser import (
     BrowserObservationInput,
     BrowserObservationResponse,
@@ -165,6 +173,10 @@ from packages.tools.typed import (
     today_schedule,
 )
 from packages.tools.recruitment_mail import (
+    RecruitmentMailBindingCandidatesInput,
+    RecruitmentMailBindingCandidatesResponse,
+    RecruitmentMailBindingProposeInput,
+    RecruitmentMailBindingProposeResponse,
     RecruitmentMailDetailInput,
     RecruitmentMailDetailResponse,
     RecruitmentMailReviewInput,
@@ -184,6 +196,22 @@ from packages.tools.mail_processing import (
     RecruitmentMailProcessingStatusResponse,
     recruitment_mail_process,
     recruitment_mail_processing_status,
+)
+from .task_tools import (
+    BackgroundTaskStatusInput,
+    BackgroundTaskResponse,
+    BackgroundTaskActionResponse,
+    DailyRecruitmentControlInput,
+    RecruitmentMailRunStartInput,
+    RecruitmentMailRunStatusInput,
+    RecruitmentMailRunControlInput,
+    background_task_status,
+    daily_recruitment_sync_control,
+    recruitment_mail_run_start,
+    recruitment_mail_run_status,
+    recruitment_mail_run_control,
+    recruitment_mail_binding_candidates_operation,
+    recruitment_mail_binding_propose_operation,
 )
 
 
@@ -247,7 +275,7 @@ class MCPToolDefinition:
     open_world: bool = False
 
 
-MCP_TOOL_PROTOCOL_VERSION = "24"
+MCP_TOOL_PROTOCOL_VERSION = "25"
 
 
 MCP_READ_ONLY_TOOL_NAMES: tuple[str, ...] = (
@@ -275,6 +303,10 @@ MCP_READ_ONLY_TOOL_NAMES: tuple[str, ...] = (
     "automation_schedule_list",
     "application_capture",
     "daily_recruitment_sync_status",
+    "background_task_status",
+    "application_review_status",
+    "recruitment_mail_run_status",
+    "recruitment_mail_binding_candidates",
 )
 
 MCP_ACTION_TOOL_NAMES: tuple[str, ...] = (
@@ -292,6 +324,11 @@ MCP_ACTION_TOOL_NAMES: tuple[str, ...] = (
     "offerbiu_source_refresh",
     "automation_schedule",
     "automation_schedule_disable",
+    "daily_recruitment_sync_control",
+    "application_review_control",
+    "recruitment_mail_run_start",
+    "recruitment_mail_run_control",
+    "recruitment_mail_binding_propose",
 )
 
 MCP_TOOL_NAMES: tuple[str, ...] = (
@@ -333,6 +370,15 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "daily_recruitment_sync",
     "offerbiu_source_refresh",
     "daily_recruitment_sync_status",
+    "background_task_status",
+    "daily_recruitment_sync_control",
+    "application_review_status",
+    "application_review_control",
+    "recruitment_mail_run_start",
+    "recruitment_mail_run_status",
+    "recruitment_mail_run_control",
+    "recruitment_mail_binding_candidates",
+    "recruitment_mail_binding_propose",
 )
 
 # The Codex App Server uses this deliberately smaller surface. Low-level audit,
@@ -370,6 +416,15 @@ MCP_AGENT_TOOL_NAMES: tuple[str, ...] = (
     "daily_recruitment_sync",
     "offerbiu_source_refresh",
     "daily_recruitment_sync_status",
+    "background_task_status",
+    "daily_recruitment_sync_control",
+    "application_review_status",
+    "application_review_control",
+    "recruitment_mail_run_start",
+    "recruitment_mail_run_status",
+    "recruitment_mail_run_control",
+    "recruitment_mail_binding_candidates",
+    "recruitment_mail_binding_propose",
 )
 
 
@@ -402,6 +457,10 @@ def _mail_review_operation(
         )
 
     return bound
+
+
+async def _application_review_control_operation(request, dependencies):
+    return await control_application_review(request, dependencies.browser_bridge, dependencies.repository)
 
 
 def _sync_mail_before_read(
@@ -1063,8 +1122,10 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
             "all_non_terminal=true and omit application_ids; do not call application_query "
             "with list_all=true just to collect IDs. "
             "The all-mode processes a bounded wave and persists its frozen scope. "
+            "Use background=false for assistant requests. Keep this assistant turn open and "
+            "continue eligible waves until a terminal result; do not ask the user to query later. "
             "Omit timeout_ms or use 120000 at most; never submit a larger timeout. "
-            "While remaining_count > 0, call again with ONLY run_id from the result until "
+            "While continuation_required=true, call again with ONLY run_id from the result until "
             "scope_complete=true. Counts are cumulative, not per-call. Never subtract "
             "excluded_terminal from scope_total again. Do not restart all-mode on timeout. "
             "No separate bridge or capabilities call is required. "
@@ -1252,6 +1313,100 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         input_model=DailyRecruitmentSyncStatusInput,
         response_model=DailyRecruitmentSyncStatusResponse,
         operation=_daily_recruitment_sync_status_operation,
+    ),
+    MCPToolDefinition(
+        name="background_task_status",
+        description=("Read persisted active and recoverable daily crawl, application review and mail tasks without "
+                     "starting work. Use this when the user asks to continue but has no run ID. If multiple candidates "
+                     "are returned, ask which task using type and time; never silently select an old completed task."),
+        input_model=BackgroundTaskStatusInput,
+        response_model=BackgroundTaskResponse,
+        operation=background_task_status,
+    ),
+    MCPToolDefinition(
+        name="daily_recruitment_sync_control",
+        description=("Request a cooperative pause or cancel of the selected daily background task. Accepted control "
+                     "is not proof it has stopped; query status until drained. Cancel also retires stopped/interrupted "
+                     "historical runs without deleting saved results or checkpoints, including legacy runs. Cancelled "
+                     "runs cannot resume. To resume an eligible frozen scope, call "
+                     "daily_recruitment_sync with mode=resume and the located run ID."),
+        input_model=DailyRecruitmentControlInput,
+        response_model=BackgroundTaskActionResponse,
+        operation=daily_recruitment_sync_control,
+        read_only=False,
+    ),
+    MCPToolDefinition(
+        name="application_review_status",
+        description=("Read persisted current or recoverable official application-status review runs. No browser "
+                     "work is started. Omit run_id to discover candidates; use thread_id to narrow selection."),
+        input_model=ApplicationReviewStatusInput,
+        response_model=ApplicationReviewStatusResponse,
+        operation=_repository_operation(application_review_status),
+    ),
+    MCPToolDefinition(
+        name="application_review_control",
+        description=("Explicitly pause, cancel or resume a selected application-status review. Resume retains the "
+                     "frozen scope and completed checkpoints and executes a foreground bounded wave. Continue "
+                     "eligible waves with batch_observe_application_status in this turn. Pause/cancel are cooperative; confirm terminal status."),
+        input_model=ApplicationReviewControlInput,
+        response_model=ApplicationReviewControlResponse,
+        operation=_application_review_control_operation,
+        read_only=False,
+        open_world=True,
+    ),
+    MCPToolDefinition(
+        name="recruitment_mail_run_start",
+        description=("Explicitly process recruitment mail and await its result in this assistant turn. The tool "
+                     "waits up to wait_ms (default/max 20000), safely below the transport deadline. If "
+                     "continuation_required=true, keep calling recruitment_mail_run_status with this run_id and "
+                     "wait_ms=20000 until terminal; do not finish the reply with a background receipt or ask the user "
+                     "to check later. Pass current thread_id/turn_id. "
+                     "Optional record_ids freeze a selected scope; absent IDs process pending mail after refresh."),
+        input_model=RecruitmentMailRunStartInput,
+        response_model=BackgroundTaskActionResponse,
+        operation=recruitment_mail_run_start,
+        read_only=False,
+        idempotent=False,
+        open_world=True,
+    ),
+    MCPToolDefinition(
+        name="recruitment_mail_run_status",
+        description=("Read/wait for durable mail-processing results; never syncs mail, invokes a model, or starts a worker. "
+                     "For a processing request use wait_ms=20000 repeatedly in the same assistant turn until terminal. "
+                     "For a user asking only for current progress use wait_ms=0. Never resume a paused task by polling."),
+        input_model=RecruitmentMailRunStatusInput,
+        response_model=BackgroundTaskResponse,
+        operation=recruitment_mail_run_status,
+    ),
+    MCPToolDefinition(
+        name="recruitment_mail_run_control",
+        description=("Explicitly pause, cancel or resume a mail-processing task. Resume uses the saved scope and "
+                     "completed results rather than starting all mail again. Resume awaits up to wait_ms; if "
+                     "continuation_required=true keep waiting via status in this assistant turn, then report the final result."),
+        input_model=RecruitmentMailRunControlInput,
+        response_model=BackgroundTaskActionResponse,
+        operation=recruitment_mail_run_control,
+        read_only=False,
+        open_world=True,
+    ),
+    MCPToolDefinition(
+        name="recruitment_mail_binding_candidates",
+        description=("Read a mail's candidate application identities and current binding revision without changing "
+                     "it or synchronizing mail. Candidates are suggestions, never authorization to bind."),
+        input_model=RecruitmentMailBindingCandidatesInput,
+        response_model=RecruitmentMailBindingCandidatesResponse,
+        operation=recruitment_mail_binding_candidates_operation,
+    ),
+    MCPToolDefinition(
+        name="recruitment_mail_binding_propose",
+        description=("Prepare a pending human-approval preview to bind, unbind or correct one mail's application. "
+                     "Use the current content_digest and binding_revision from candidates. This does not approve "
+                     "or execute the change; direct the user to the approval center to confirm."),
+        input_model=RecruitmentMailBindingProposeInput,
+        response_model=RecruitmentMailBindingProposeResponse,
+        operation=recruitment_mail_binding_propose_operation,
+        read_only=False,
+        idempotent=False,
     ),
 )
 

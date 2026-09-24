@@ -357,6 +357,12 @@ def _merge_existing_transport(
     merged = dict(incoming_raw_metadata)
     if not isinstance(existing_raw_metadata, Mapping):
         return merged
+    # A transport refresh cannot grant or revoke a human-confirmed identity.
+    # Keep even old-digest confirmations: they become stale rather than silently
+    # falling back to a guessed company/title association after synchronization.
+    for key in ("confirmed_application_binding", "binding_recent_history"):
+        if key in existing_raw_metadata:
+            merged[key] = existing_raw_metadata[key]
     existing_transport = existing_raw_metadata.get("transport")
     if not isinstance(existing_transport, Mapping):
         return merged

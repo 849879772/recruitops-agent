@@ -2999,6 +2999,21 @@
 
   function currentRepeaterCount(root, sectionKey) {
     if (!root) return 0;
+    if (root.matches?.("[class*='applyFormModuleWrapper']")) {
+      return root.querySelectorAll("[class*='apply-form-array-card__']").length;
+    }
+    if (root.matches?.(".edit-resume-form-item")) {
+      const title = textOf(root.querySelector(".edit-resume-form-item-title"));
+      return indexedRecordCount(root, title) || root.querySelectorAll(".edit-resume-form-item-container").length;
+    }
+    if (root.matches?.("[id^='page-resume-sections']")) {
+      const records = root.querySelectorAll(".experience_box > .info_list").length;
+      if (records) return records;
+    }
+    if (root.matches?.("[data-nav-id]") && detectPlatform() === "moka-sd") {
+      const title = getSection(root.querySelector("input, textarea, select") || root);
+      return detectedRecordCount(root, title) || (root.querySelector(formItemSelector) ? 1 : 0);
+    }
     const controls = collectCandidates(root);
     const knownTitle = {
       education: "教育经历", career: "工作经历", internship: "实习经历", project: "项目经历",
@@ -3017,6 +3032,16 @@
   }
 
   function semanticAncestor(control) {
+    const platformRoot = control.closest?.("[class*='applyFormModuleWrapper'], .edit-resume-form-item, [id^='page-resume-sections'], [data-nav-id]");
+    if (platformRoot) {
+      const platform = detectPlatform();
+      const valid = platformRoot.matches("[class*='applyFormModuleWrapper'], .edit-resume-form-item")
+        || platform === "tencent-element" && platformRoot.matches("[id^='page-resume-sections']")
+        || platform === "moka-sd" && platformRoot.matches("[data-nav-id]");
+      const heading = getSection(control);
+      const inferred = globalThis.ResumeRepeaterEngine.inferSection(heading);
+      if (valid && inferred.score >= 78) return { root: platformRoot, inferred, heading, knownPlatformRoot: true };
+    }
     const localRoot = control.closest("[data-nav-id], .createFormSection-mutiple");
     if (localRoot) {
       const heading = getSection(control);
@@ -3061,6 +3086,9 @@
       if (!semantic) continue;
       const sectionKey = semantic.inferred.key;
       const controlMeta = repeaterControlMeta(control, sectionKey);
+      if (semantic.knownPlatformRoot && controlMeta.score > 0) {
+        controlMeta.score = Math.max(controlMeta.score, 82);
+      }
       if (!controlMeta.score && !controlMeta.disabled) continue;
       // A button and its nested icon/label represent one action, not two ambiguous entrances.
       const actionParent = control.parentElement?.closest("button, [role='button'], a");

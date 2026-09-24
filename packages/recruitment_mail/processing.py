@@ -77,16 +77,21 @@ def _attempt_current(record):
 
 def _input_digest(record, applications):
     from .identity import normalize_company_name, _CONTROLLED_COMPANY_ALIAS_GROUPS
+    from .binding import application_identity
+    confirmed = (record.raw_metadata or {}).get("confirmed_application_binding") or {}
     body = normalize_company_name(f"{record.sender}\n{record.subject}\n{record.body_text}")
     # Invalidation depends on source/candidates, never on the proposal produced by this attempt.
     relevant = [a for a in applications if (
-        normalize_company_name(a.company_name) in body or any(
+        a.id == confirmed.get("application_id") or normalize_company_name(a.company_name) in body or any(
             normalize_company_name(a.company_name) in group and any(alias in body for alias in group)
             for group in _CONTROLLED_COMPANY_ALIAS_GROUPS)
     )]
     values = {"applications": sorted(
         [(a.id, a.company_name, a.job_title, a.stage.value, str(a.source_status_synced_at)) for a in relevant]),
-        "transport": (record.raw_metadata or {}).get("transport", {})}
+        "transport": (record.raw_metadata or {}).get("transport", {}),
+        "confirmed_binding": confirmed,
+        "confirmed_application": next((application_identity(a) for a in relevant
+                                       if a.id == confirmed.get("application_id")), None)}
     return sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -206,7 +211,8 @@ def _batch_outcome(summary, store, repository, record_ids):
     return summary
 
 
-def process_pending_mail(store, repository, settings, *, limit=20, record_ids=None, client=None):
+def process_pending_mail(store, repository, settings, *, limit=20, record_ids=None, client=None,
+                         progress=None, should_stop=None, expected_digests=None):
     summary = {"status": "completed", "processed": 0, "updated": 0, "unchanged": 0,
                "irrelevant": 0, "unresolved": 0, "failed": 0, "notifications": 0, "reminders": 0, "results": []}
     if not settings.write_enabled:
@@ -221,8 +227,23 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
     limit = max(1, min(limit, 50))
     applications = repository.list_applications()
     records = _remaining_mail(store, applications, record_ids)[:limit]
+    if expected_digests is not None:
+        unchanged = []
+        for record in records:
+            if expected_digests.get(record.id) != record.content_digest:
+                result = {"record_id": record.id, "state": "source_changed", "reason": "mail_changed_since_run_start"}
+                summary["results"].append(result)
+                summary["processed"] += 1
+                summary["unresolved"] += 1
+                if progress:
+                    progress({"phase": "analysis", "result": result})
+            else:
+                unchanged.append(record)
+        records = unchanged
     if not records:
         return _batch_outcome(summary, store, repository, record_ids)
+    if should_stop and should_stop():
+        return _batch_outcome(dict(summary, status="partial", reason="stop_requested"), store, repository, record_ids)
     started, owner = monotonic(), uuid4().hex
     summary["has_more"] = len(records) > 10
     if summary["has_more"]:
@@ -232,6 +253,8 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
     if not records:
         return _batch_outcome(summary, store, repository, record_ids)
     bundle = build_batch_triage_prompt([_mail_input(r) for r in records])
+    if progress:
+        progress({"phase": "triage", "record_ids": [r.id for r in records]})
     try:
         raw = _model_call(client, bundle, TRIAGE_OUTPUT_SCHEMA)
         proposals = [MailTriageProposal.model_validate(x) for x in _decode_model_json(raw.content)]
@@ -244,11 +267,14 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
         diagnostic = _failure_diagnostic(exc)
         for record in records:
             _finish(store, record, owner, "failed_terminal", "triage_" + type(exc).__name__, diagnostic=diagnostic)
+            if progress:
+                progress({"phase": "analysis", "result": {"record_id": record.id, "state": "failed_terminal",
+                          "reason": "triage_failed", "diagnostic": diagnostic}})
         return _batch_outcome(dict(summary, status="partial", failed=len(records),
                                    processed=len(records), reason="triage_failed"),
                               store, repository, record_ids)
     for record in records:
-        if monotonic() - started > 90:
+        if monotonic() - started > 90 or (should_stop and should_stop()):
             _finish(store, record, owner, "pending", None)
             # Pending time-budget results should be eligible on the next bounded call.
             with store.storage.write_transaction() as session:
@@ -282,6 +308,8 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
             summary["results"].append({"record_id": record.id, "state": "failed_terminal",
                                        "reason": reason, "diagnostic": diagnostic})
         summary["processed"] += 1
+        if progress:
+            progress({"phase": "analysis", "result": summary["results"][-1]})
     if summary["failed"] or summary["unresolved"]:
         summary["status"] = "partial"
     return _batch_outcome(summary, store, repository, record_ids)
@@ -345,9 +373,11 @@ def _analyze_one(store, repository, settings, client, record, applications, owne
     sync_analysis_labels(store, record.id)
     event = proposal.event_type.value
     from .scheduling import ensure_mail_schedule
+    from .binding import confirmed_binding_matches
     matches = [a for a in applications if model_application_matches(record, proposal.model_dump(mode="json"), a)]
+    confirmed = len(matches) == 1 and confirmed_binding_matches(record, matches[0]) is True
     schedule_application = matches[0] if len(matches) == 1 and (proposal.job_title or proposal.job_code) and (
-        not proposal.candidate_application_id or proposal.candidate_application_id == matches[0].id) else None
+        confirmed or not proposal.candidate_application_id or proposal.candidate_application_id == matches[0].id) else None
     schedule_item = ensure_mail_schedule(store, record, proposal, owner, schedule_application)
     if event in {"information", "action_required", "application_confirmation"}:
         _finish(store, record, owner, "processed")
@@ -364,9 +394,9 @@ def _analyze_one(store, repository, settings, client, record, applications, owne
                 "action_summary": proposal.action_summary or "查看邮件并完成测评",
                 "deadline": proposal.deadline, "schedule_item": schedule_item}
     stale = find_stale_company_only_match(parsed, applications)
-    if not matches and stale:
+    if not matches and stale and "confirmed_application_binding" not in (record.raw_metadata or {}):
         matches = [stale]
-    if len(matches) != 1 or (proposal.candidate_application_id and proposal.candidate_application_id != matches[0].id):
+    if len(matches) != 1 or (not confirmed and proposal.candidate_application_id and proposal.candidate_application_id != matches[0].id):
         reason = "multiple_candidates" if len(matches) > 1 else "no_verified_match"
         _finish(store, record, owner, "ambiguous_application", reason)
         return {"record_id": record.id, "state": "ambiguous_application", "reason": reason,

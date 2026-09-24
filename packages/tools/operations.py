@@ -33,6 +33,9 @@ class OperationalTaskRunInput(ToolInput):
     source_record_ids: list[str] = Field(default_factory=list, max_length=10)
     mode: Literal["full", "crawl_only", "score_only", "resume"] = "full"
     resume_run_id: str | None = Field(default=None, min_length=8, max_length=128)
+    company_batch_limit: int | None = Field(default=None, ge=1, le=5000)
+    thread_id: str | None = Field(default=None, min_length=1, max_length=255)
+    turn_id: str | None = Field(default=None, min_length=1, max_length=255)
 
     @field_validator("task_id")
     @classmethod
@@ -55,8 +58,10 @@ class OperationalTaskRunInput(ToolInput):
     @model_validator(mode="after")
     def scope_only_daily_sync(self) -> "OperationalTaskRunInput":
         is_daily = self.task_id == TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value
-        if (self.company_ids or self.source_record_ids or self.mode != "full" or self.resume_run_id) and not is_daily:
+        if (self.company_ids or self.source_record_ids or self.mode != "full" or self.resume_run_id or self.company_batch_limit) and not is_daily:
             raise ValueError("daily mode options are only valid for the daily recruitment task")
+        if self.company_batch_limit and self.mode == "score_only":
+            raise ValueError("company_batch_limit is only valid for crawl modes")
         if self.company_ids and self.source_record_ids:
             raise ValueError("company_ids and source_record_ids cannot be combined")
         if self.mode == "resume" and not self.resume_run_id:
@@ -77,6 +82,7 @@ class OperationalTaskRunData(ToolModel):
     source_record_ids: list[str] = Field(default_factory=list)
     mode: Literal["full", "crawl_only", "score_only", "resume"] = "full"
     resume_run_id: str | None = None
+    company_batch_limit: int | None = None
     result: Any = None
     error: str | None = None
 
@@ -105,6 +111,13 @@ class OperationalTaskRunner:
 
         definition = self.scheduler.task_definition(request.task_id)
         run_id = uuid4().hex
+        storage = getattr(self.state_store, "storage", None)
+        controlled = storage is not None and request.task_id == TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value
+        stop_requested = threading.Event()
+        if controlled:
+            from .task_runtime_control import register_daily_task
+            register_daily_task(storage, run_id, request.task_id,
+                                thread_id=request.thread_id, turn_id=request.turn_id)
         initial = {
             "task_id": request.task_id,
             "run_id": run_id,
@@ -116,6 +129,7 @@ class OperationalTaskRunner:
             "source_record_ids": request.source_record_ids,
             "mode": request.mode,
             "resume_run_id": request.resume_run_id,
+            "company_batch_limit": request.company_batch_limit,
             "result": None,
             "error": None,
         }
@@ -129,8 +143,18 @@ class OperationalTaskRunner:
 
             def heartbeat() -> None:
                 callback = getattr(self.state_store, "heartbeat_task_run", None)
-                while not heartbeat_stop.wait(15.0):
-                    if callable(callback):
+                ticks = 0
+                while not heartbeat_stop.wait(1.0):
+                    ticks += 1
+                    if controlled:
+                        from .task_runtime_control import daily_control_request
+                        try:
+                            if daily_control_request(storage, run_id):
+                                stop_requested.set()
+                        except Exception:
+                            # A failed read is not proof that a stop was requested.
+                            pass
+                    if ticks % 15 == 0 and callable(callback):
                         try:
                             callback(run_id)
                         except Exception:
@@ -148,11 +172,15 @@ class OperationalTaskRunner:
                     self.handlers.get(request.task_id),
                     dry_run=request.dry_run,
                     run_id=run_id,
+                    stop_requested=stop_requested,
                     metadata={
                         "company_ids": request.company_ids,
                         "source_record_ids": request.source_record_ids,
                         "mode": request.mode,
                         "resume_run_id": request.resume_run_id,
+                        "company_batch_limit": request.company_batch_limit,
+                        "task_kind": "daily", "thread_id": request.thread_id,
+                        "turn_id": request.turn_id,
                     },
                 )
                 payload = {
@@ -166,6 +194,7 @@ class OperationalTaskRunner:
                     "source_record_ids": request.source_record_ids,
                     "mode": request.mode,
                     "resume_run_id": request.resume_run_id,
+                    "company_batch_limit": request.company_batch_limit,
                     "result": result.value,
                     "error": result.error,
                 }
@@ -177,6 +206,10 @@ class OperationalTaskRunner:
                 }
             finally:
                 heartbeat_stop.set()
+                heartbeat_thread.join()
+            if controlled:
+                from .task_runtime_control import finish_daily_task
+                payload["run_status"] = finish_daily_task(storage, run_id, payload["run_status"])
             with self._background_lock:
                 self._background_runs[run_id] = payload
 
@@ -200,6 +233,14 @@ class OperationalTaskRunner:
             elapsed_ms=0,
         )
 
+    def control_background(self, run_id: str, action: str) -> dict:
+        """Request a safe stop; the owning worker confirms only after draining."""
+        from .task_runtime_control import request_daily_control
+        storage = getattr(self.state_store, "storage", None)
+        if storage is None:
+            return {"success": False, "reason": "storage_unavailable", "run_id": run_id}
+        return request_daily_control(storage, run_id, action)
+
     def background_status(self, run_id: str) -> Mapping[str, Any] | None:
         with self._background_lock:
             value = self._background_runs.get(run_id)
@@ -214,11 +255,16 @@ class OperationalTaskRunner:
                 return None
             state = persisted.get("state")
             value = state.get("result") if isinstance(state, Mapping) else None
+            metadata = persisted.get("metadata") or {}
             business_error = _business_failure(value)
             return {
                 "task_id": persisted.get("task_id"),
                 "run_id": persisted.get("run_id", run_id),
-                "run_status": "failed" if business_error else persisted.get("run_status", "unknown"),
+                "run_status": (
+                    "failed" if business_error else
+                    "paused" if isinstance(value, Mapping) and value.get("status") == "paused"
+                    else persisted.get("run_status", "unknown")
+                ),
                 "dry_run": False,
                 "attempts": 0,
                 "agent_write_enabled": True,
@@ -226,10 +272,18 @@ class OperationalTaskRunner:
                 "error": business_error or persisted.get("error"),
                 "current_step": persisted.get("current_step"),
                 "step_count": persisted.get("step_count", 0),
+                "mode": "resume" if metadata.get("resumed_from") else metadata.get("requested_mode", "full"),
+                "resume_run_id": metadata.get("resumed_from"),
+                "company_batch_limit": metadata.get("company_batch_limit"),
+                "company_ids": metadata.get("company_ids") or [],
+                "source_record_ids": metadata.get("source_record_ids") or [],
+                "progress": state.get("progress") if isinstance(state, Mapping) else None,
             }
         if persisted:
             result["current_step"] = persisted.get("current_step")
             result["step_count"] = persisted.get("step_count", 0)
+            state = persisted.get("state")
+            result["progress"] = state.get("progress") if isinstance(state, Mapping) else None
             if result.get("run_status") in {"accepted", "running"}:
                 result["run_status"] = persisted.get("run_status") or result["run_status"]
         return result
@@ -256,6 +310,7 @@ class OperationalTaskRunner:
                         else {}
                     ),
                     "mode": request.mode,
+                    **({"company_batch_limit": request.company_batch_limit} if request.company_batch_limit else {}),
                     **({"resume_run_id": request.resume_run_id} if request.resume_run_id else {}),
                 } or None,
             )
@@ -276,6 +331,7 @@ class OperationalTaskRunner:
                     source_record_ids=request.source_record_ids,
                     mode=request.mode,
                     resume_run_id=request.resume_run_id,
+                    company_batch_limit=request.company_batch_limit,
                     result=result.value,
                     error=result.error,
                 ),

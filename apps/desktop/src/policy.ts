@@ -61,10 +61,11 @@ export type Command = { action: 'home' | 'back' | 'forward' | 'reload' | 'hide' 
   { action: 'filler-custom-delete'; answerId: string } |
   { action: 'filler-application-save'; company: string; title: string; recordUrl: string; city?: string } |
   { action: 'filler-application-save-batch'; records: {company: string; title: string; recordUrl: string; city?: string}[] } |
+  { action: 'filler-application-sync-page'; company: string; candidateIds: string[] } |
   { action: 'filler-application-retry'; queueId: string } |
   { action: 'filler-application-correct'; queueId: string; recordUrl: string; city?: string } |
   { action: 'filler-application-cancel'; queueId: string } |
-  { action: 'filler-attachment-upload'; scanId: string; fieldId: string } |
+  { action: 'filler-attachment-upload'; scanId: string; fieldId: string; confirmed?: boolean } |
   { action: 'open'; url: string } | { action: 'select' | 'close'; id: number };
 
 function exactKeys(record: Record<string, unknown>, allowed: string[]) {
@@ -114,7 +115,7 @@ export function parseCommand(raw: unknown): Command {
   if (action === 'filler-custom-delete' && exactKeys(r,['action','answerId']) && boundedText(r.answerId,64)) return {action,answerId:r.answerId};
   if (action === 'filler-application-save' && exactKeys(r, ['action','company','title','recordUrl','city']) &&
       boundedText(r.company,255) && boundedText(r.title,512) &&
-      boundedText(r.recordUrl,2048) && (r.city === undefined || boundedText(r.city,255,false)))
+      boundedText(r.recordUrl,2048,false) && (r.city === undefined || boundedText(r.city,255,false)))
     return {action,...r} as Command;
   if (action === 'filler-application-save-batch' && exactKeys(r,['action','records']) &&
       Array.isArray(r.records) && r.records.length > 0 && r.records.length <= 50) {
@@ -128,12 +129,20 @@ export function parseCommand(raw: unknown): Command {
     });
     return {action,records};
   }
+  if (action === 'filler-application-sync-page' && exactKeys(r,['action','company','candidateIds']) &&
+      boundedText(r.company,255) && Array.isArray(r.candidateIds) && r.candidateIds.length > 0 &&
+      r.candidateIds.length <= 50 && r.candidateIds.every(id => typeof id === 'string' && /^candidate-\d{1,2}$/.test(id)) &&
+      new Set(r.candidateIds).size === r.candidateIds.length)
+    return {action,company:r.company.trim(),candidateIds:r.candidateIds as string[]};
   if (action === 'filler-application-cancel' && exactKeys(r,['action','queueId']) && boundedText(r.queueId,255)) return {action,queueId:r.queueId};
   if (action === 'filler-application-retry' && exactKeys(r,['action','queueId']) && boundedText(r.queueId,255)) return {action,queueId:r.queueId};
   if (action === 'filler-application-correct' && exactKeys(r,['action','queueId','recordUrl','city']) && boundedText(r.queueId,255) &&
       boundedText(r.recordUrl,2048) && (r.city === undefined || boundedText(r.city,255,false)))
     return {action,queueId:r.queueId,recordUrl:r.recordUrl,...(r.city===undefined?{}:{city:r.city})};
-  if (action === 'filler-attachment-upload' && exactKeys(r,['action','scanId','fieldId']) && boundedText(r.scanId,128) && boundedText(r.fieldId,512)) return {action,scanId:r.scanId,fieldId:r.fieldId};
+  if (action === 'filler-attachment-upload' &&
+      (exactKeys(r,['action','scanId','fieldId']) || exactKeys(r,['action','scanId','fieldId','confirmed']) && r.confirmed === true) &&
+      boundedText(r.scanId,128) && boundedText(r.fieldId,512))
+    return {action,scanId:r.scanId,fieldId:r.fieldId,...(r.confirmed === true ? {confirmed:true} : {})};
   if (['filler-open','filler-close','filler-plugin','filler-profile','filler-profile-import','filler-profile-export',
       'filler-attachment-select','filler-attachment-clear','filler-demo-enable','filler-demo-restore','filler-scan','filler-prepare',
       'filler-undo','filler-frame-allow','filler-application-detect',

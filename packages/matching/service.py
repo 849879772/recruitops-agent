@@ -38,8 +38,9 @@ from .rules import (
 
 
 ANALYSIS_VERSION = "matching-v1"
-PROMPT_VERSION = "matching-prompt-v1"
+PROMPT_VERSION = "matching-prompt-v3"
 DEFAULT_MAX_TOKENS = 1_000
+MAX_OUTPUT_ATTEMPTS = 3
 
 _EVIDENCE_CAPS = {
     EvidenceLevel.DIRECT: 100,
@@ -206,14 +207,6 @@ def _safe_list(value: Any, limit: int | None = None) -> list[str]:
     return result[:limit] if limit is not None else result
 
 
-def _safe_int(value: Any, maximum: int) -> int:
-    try:
-        number = int(round(float(value)))
-    except (TypeError, ValueError):
-        number = 0
-    return max(0, min(maximum, number))
-
-
 def _prompt_profile(profile: Any) -> str:
     return json.dumps(profile_content_payload(profile), ensure_ascii=False, sort_keys=True)
 
@@ -230,7 +223,30 @@ def _prompt_system() -> str:
         "当前阶段只负责评分：匹配较弱时给出低分，不得再次排除、跳过或延后岗位。"
         "只返回 JSON，不要 markdown。字段为 matched_directions、primary_match_direction、"
         "score_breakdown、evidence_level、evidence、missing_core_requirements、advantages、gaps、summary。"
+        "score_breakdown 必须且只能有四个整数键：core_direction(0-30)、required_skills(0-30)、"
+        "project_evidence(0-25)、engineering_stack(0-15)；不要使用别名、total或其他评分维度。"
+        "分项标准：core_direction比较岗位实际职责与目标方向，直接一致24-30、相邻可迁移12-23、"
+        "弱相关1-11、无相关证据0；标题命中只代表通过筛选，不自动满分。"
+        "required_skills逐项对照JD明确要求与已证实技能，主要要求有直接证据24-30、"
+        "部分满足12-23、仅少量满足1-11、均无证据0；不要把学历或城市算入此项。"
+        "project_evidence只按真实相关项目给分：直接相关且有具体实践20-25、"
+        "部分相关10-19、少量可迁移1-9、无证据0。"
+        "engineering_stack按已证实工具与工程实践：大部分匹配12-15、部分6-11、少量1-5、无证据0。"
+        "每项先检查证据再按覆盖程度选分，不得为凑总分补分；总分与推荐结论由程序计算。"
+        "evidence 的每项必须有 jd_requirement、profile_evidence、relation、requirement_type；"
+        "直接或相邻证据的 profile_evidence 必须写候选人资料中的具体事实，缺失证据可为空字符串。"
+        "jd_requirement必须明确引用或概括真实岗位要求，profile_evidence不得捏造经历。"
+        "evidence_level 只能是 direct、partial、adjacent、insufficient。"
         "evidence 中 relation 只能是 direct、adjacent、missing，requirement_type只能是 core、supporting、basic。"
+        "direct级别必须至少有一条direct证据；adjacent级别只能包含相邻或缺失证据。"
+        "必备技能为0时不能同时声称有直接满足的核心要求；方向为0时不能说方向高度匹配。"
+        "证据为空时只能使用insufficient，技能、项目和工程栈不得给正分。"
+        '完整格式示例（数值仅示意，不是预设评分）：{"matched_directions":[],"primary_match_direction":null,'
+        '"score_breakdown":{"core_direction":12,"required_skills":10,"project_evidence":8,"engineering_stack":5},'
+        '"evidence_level":"adjacent","evidence":[{"jd_requirement":"JD中的要求",'
+        '"profile_evidence":"资料中可迁移的事实","relation":"adjacent","requirement_type":"core"}],'
+        '"missing_core_requirements":["尚无证据的核心要求"],"advantages":["可迁移能力"],'
+        '"gaps":["待补足能力"],"summary":"方向相邻，技能和项目证据有限。"}。'
         "保持输出紧凑：evidence最多6项，missing_core_requirements、advantages、gaps各最多4项，"
         "每个字符串不超过80个汉字，summary不超过160个汉字，不要复述完整JD或候选人资料。"
     )
@@ -299,17 +315,25 @@ def _parse_json_object(content: str) -> dict[str, Any]:
 
 def _normalize_evidence(value: Any) -> list[MatchEvidence]:
     if not isinstance(value, list):
-        return []
+        raise ValueError("evidence must be a list")
+    if len(value) > 6:
+        raise ValueError("evidence must contain at most 6 items")
     result: list[MatchEvidence] = []
-    for item in value[:6]:
-        if not isinstance(item, Mapping):
-            continue
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping) or not {"jd_requirement", "profile_evidence", "relation", "requirement_type"} <= item.keys():
+            raise ValueError(f"evidence[{index}] requires jd_requirement, profile_evidence, relation, requirement_type")
+        if not isinstance(item["jd_requirement"], str) or not item["jd_requirement"].strip():
+            raise ValueError(f"evidence[{index}].jd_requirement must be nonempty text")
+        if not isinstance(item["profile_evidence"], str):
+            raise ValueError(f"evidence[{index}].profile_evidence must be text")
         relation = str(item.get("relation") or "").casefold()
         if relation not in {item.value for item in EvidenceRelation}:
-            relation = EvidenceRelation.MISSING.value
+            raise ValueError(f"evidence[{index}].relation must be direct, adjacent or missing")
         requirement_type = str(item.get("requirement_type") or "").casefold()
         if requirement_type not in {item.value for item in RequirementType}:
-            requirement_type = RequirementType.SUPPORTING.value
+            raise ValueError(f"evidence[{index}].requirement_type must be core, supporting or basic")
+        if relation != EvidenceRelation.MISSING.value and not str(item["profile_evidence"] or "").strip():
+            raise ValueError(f"evidence[{index}].profile_evidence must cite candidate facts for direct/adjacent evidence")
         raw_direction = item.get("direction")
         direction = canonical_direction(raw_direction) if raw_direction else None
         result.append(
@@ -334,6 +358,16 @@ def _normalize_payload(
     if raw.get("refused") is True or raw_status in {"refused", "rejected", "declined"}:
         return None, str(raw.get("refusal_reason") or raw.get("reason") or "model_refused")[:500]
 
+    required = set(DeepSeekMatchPayload.model_fields)
+    missing_fields = sorted(required - raw.keys())
+    if missing_fields:
+        raise ValueError("missing fields: " + ", ".join(missing_fields))
+    for key in ("missing_core_requirements", "advantages", "gaps"):
+        if not isinstance(raw[key], list) or any(not isinstance(value, str) for value in raw[key]):
+            raise ValueError(f"{key} must be a list of text values")
+    if not isinstance(raw["summary"], str) or not raw["summary"].strip():
+        raise ValueError("summary must be nonempty text")
+
     allowed = list(allowed_directions)
     directions: list[Any] = []
     raw_directions = raw.get("matched_directions")
@@ -348,22 +382,24 @@ def _normalize_payload(
     if primary not in directions:
         primary = directions[0] if directions else None
 
-    raw_breakdown = raw.get("score_breakdown") or {}
-    if not isinstance(raw_breakdown, Mapping):
-        raw_breakdown = {}
-    breakdown = {
-        "core_direction": _safe_int(raw_breakdown.get("core_direction"), 30),
-        "required_skills": _safe_int(raw_breakdown.get("required_skills"), 30),
-        "project_evidence": _safe_int(raw_breakdown.get("project_evidence"), 25),
-        "engineering_stack": _safe_int(raw_breakdown.get("engineering_stack"), 15),
-    }
-    evidence_level = str(raw.get("evidence_level") or "insufficient").casefold()
+    raw_breakdown = raw.get("score_breakdown")
+    if not isinstance(raw_breakdown, Mapping) or set(raw_breakdown) != set(ScoreBreakdown.model_fields):
+        missing = sorted(set(ScoreBreakdown.model_fields) - raw_breakdown.keys()) if isinstance(raw_breakdown, Mapping) else list(ScoreBreakdown.model_fields)
+        raise ValueError("score_breakdown requires exactly core_direction(0-30), required_skills(0-30), "
+                         "project_evidence(0-25), engineering_stack(0-15); missing: " + ", ".join(missing))
+    try:
+        breakdown = ScoreBreakdown.model_validate(raw_breakdown, strict=True)
+    except ValidationError as exc:
+        # Report paths/types only; never echo model text or resume data into diagnostics.
+        paths = ", ".join(str(error["loc"][0]) for error in exc.errors(include_input=False))
+        raise ValueError("score_breakdown requires bounded integers, invalid: " + paths) from None
+    evidence_level = str(raw.get("evidence_level") or "").casefold()
     if evidence_level not in {item.value for item in EvidenceLevel}:
-        evidence_level = EvidenceLevel.INSUFFICIENT.value
+        raise ValueError("evidence_level must be direct, partial, adjacent or insufficient")
     payload = DeepSeekMatchPayload(
         matched_directions=directions,
         primary_match_direction=primary,
-        score_breakdown=ScoreBreakdown(**breakdown),
+        score_breakdown=breakdown,
         evidence_level=evidence_level,
         evidence=_normalize_evidence(raw.get("evidence")),
         missing_core_requirements=_safe_list(raw.get("missing_core_requirements")),
@@ -371,7 +407,31 @@ def _normalize_payload(
         gaps=_safe_list(raw.get("gaps"), 4),
         summary=" ".join(str(raw.get("summary") or "").split())[:200],
     )
+    _validate_consistency(payload)
     return payload, None
+
+
+def _validate_consistency(payload: DeepSeekMatchPayload) -> None:
+    """Reject explicit contradictions, not legitimate low scores or paraphrases."""
+    supported = [item for item in payload.evidence if item.relation is not EvidenceRelation.MISSING]
+    direct = [item for item in supported if item.relation is EvidenceRelation.DIRECT]
+    if not supported and (payload.evidence_level is not EvidenceLevel.INSUFFICIENT
+                          or payload.score_breakdown.required_skills > 0
+                          or payload.score_breakdown.project_evidence > 0
+                          or payload.score_breakdown.engineering_stack > 0):
+        raise ValueError("evidence has no candidate support; use insufficient and zero skill/project/stack scores")
+    if payload.evidence_level is EvidenceLevel.DIRECT and not direct:
+        raise ValueError("evidence_level=direct requires a direct evidence item")
+    if payload.evidence_level is EvidenceLevel.ADJACENT and direct:
+        raise ValueError("evidence_level=adjacent conflicts with direct evidence")
+    if payload.score_breakdown.required_skills == 0 and any(item.requirement_type is RequirementType.CORE for item in direct):
+        raise ValueError("required_skills=0 conflicts with direct evidence for a core requirement")
+    if payload.score_breakdown.core_direction == 0:
+        for clause in re.split(r"[，。；！？\n]|[.!?;]", payload.summary):
+            # Do not interpret '不高度匹配' or '无法确认高度匹配' as a positive claim.
+            if (not re.search(r"不|未|无|难|否|not|no |cannot", clause, re.I)
+                    and re.search(r"(?:方向|岗位).*(?:高度匹配|高度一致|完全匹配|非常契合)", clause)):
+                raise ValueError("core_direction=0 conflicts with the summary's strong direction match claim")
 
 
 def _score(payload: DeepSeekMatchPayload) -> tuple[int, str]:
@@ -477,6 +537,50 @@ class MatchingService:
         self.prompt_version = prompt_version
         self.max_tokens = max(128, min(int(max_tokens), 4_000))
 
+    def _complete_validated(self, job: Any, profile: Any, screening: ScreeningResult):
+        """One initial attempt plus two corrections using the same configured model."""
+        system_prompt = _prompt_system()
+        user_prompt = _prompt_user(job, profile)
+        correction = ""
+        input_tokens = output_tokens = 0
+        for attempt in range(MAX_OUTPUT_ATTEMPTS):
+            try:
+                response = self.client.complete(
+                    system_prompt=system_prompt + correction,
+                    user_prompt=user_prompt,
+                    max_tokens=self.max_tokens,
+                )
+                if isinstance(response, DeepSeekResponse):
+                    input_tokens += response.input_tokens or 0
+                    output_tokens += response.output_tokens or 0
+                raw = _parse_json_object(_response_content(response))
+                payload, refusal = _normalize_payload(raw, screening.matched_directions)
+                if isinstance(response, DeepSeekResponse):
+                    response = response.model_copy(update={
+                        "input_tokens": input_tokens if response.input_tokens is not None else None,
+                        "output_tokens": output_tokens if response.output_tokens is not None else None,
+                    })
+                return response, payload, refusal
+            except DeepSeekClientError as exc:
+                if exc.code not in {"response_empty", "response_truncated"}:
+                    raise
+                issue = "response must contain one complete JSON object within the output budget"
+            except (json.JSONDecodeError, TypeError):
+                issue = "response must contain one complete JSON object"
+            except ValidationError:
+                issue = "response contains invalid field types; follow the supplied JSON format"
+            except ValueError as exc:
+                issue = str(exc)
+            if attempt + 1 == MAX_OUTPUT_ATTEMPTS:
+                raise DeepSeekClientError("model_output_invalid")
+            correction = (
+                "\n上次输出未通过校验，需重新根据同一岗位和候选人资料评分。具体问题："
+                + issue
+                + "。请返回完整JSON；严格使用规定字段与分值范围，补充真实证据并核对评语与分数。"
+                "不要把未知或缺失字段填0来绕过校验，不要把其他权重体系的分数直接改名。"
+            )
+        raise DeepSeekClientError("model_output_invalid")
+
     def analyze(
         self,
         job: Any,
@@ -525,26 +629,7 @@ class MatchingService:
             return AnalysisOutcome(decision=decision, result=result)
 
         try:
-            response = self.client.complete(
-                system_prompt=_prompt_system(),
-                user_prompt=_prompt_user(job, profile),
-                max_tokens=self.max_tokens,
-            )
-            try:
-                raw = _parse_json_object(_response_content(response))
-            except (TypeError, ValueError):
-                thinking_retry = getattr(self.client, "complete_with_thinking", None)
-                if not callable(thinking_retry) or not bool(
-                    getattr(self.client, "thinking_enabled", False)
-                ):
-                    raise
-                response = thinking_retry(
-                    system_prompt=_prompt_system(),
-                    user_prompt=_prompt_user(job, profile),
-                    max_tokens=self.max_tokens,
-                )
-                raw = _parse_json_object(_response_content(response))
-            payload, refusal_reason = _normalize_payload(raw, screening.matched_directions)
+            response, payload, refusal_reason = self._complete_validated(job, profile, screening)
             if refusal_reason is not None:
                 result = _base_record(
                     job,
@@ -749,7 +834,8 @@ class MatchingService:
             prompt_version=self.prompt_version,
             model=model,
             screening_evidence=screening.evidence,
-            summary="分析失败，待重试",
+            summary=("评分格式或证据核验未通过，已自动重试，待重新评分"
+                     if error_code == "model_output_invalid" else "分析失败，待重试"),
             recommendation="未评估",
             error_code=error_code,
             error_message=f"DeepSeek matching failed: {error_code}",

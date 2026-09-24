@@ -3,7 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const os=require('node:os');
 const path=require('node:path');
-const {FillerApplicationService,companyNameFromPageTitle}=require('../dist/filler-application-service');
+const {FillerApplicationService,companyNameFromPageTitle,recruitCompanyCacheKey}=require('../dist/filler-application-service');
 const instanceId='a'.repeat(32);
 const input={company:'Synthetic Robotics',title:'Platform Engineer',record_url:'https://ats.example/applications'};
 
@@ -28,6 +28,10 @@ test('page title company draft only strips a recognized recruitment suffix',()=>
   assert.equal(companyNameFromPageTitle('应届生招聘'),'');
   assert.equal(companyNameFromPageTitle('我的投递'),'');
   assert.equal(companyNameFromPageTitle(undefined),'');
+  assert.equal(recruitCompanyCacheKey('https://careers.example.test/applications'),'careers.example.test');
+  assert.equal(recruitCompanyCacheKey('https://app.mokahr.com/campus-recruitment/openloong/164448/applications'),
+    'app.mokahr.com/campus-recruitment/openloong/164448');
+  assert.equal(recruitCompanyCacheKey('file:///tmp/a'),'');
 });
 
 test('explicit foreground confirmation, detail URL rejection and unknown URL confirmation',async()=>{
@@ -44,6 +48,14 @@ test('explicit foreground confirmation, detail URL rejection and unknown URL con
   assert.equal(f.calls.length,1);
   assert.equal(f.calls[0].init.headers['X-RecruitOps-Instance-Id'],instanceId);
   assert.deepEqual(f.refresh,[{applications:true,counts:true,preservePosition:true}]);
+});
+
+test('registration may wait for a real progress URL without accepting a job listing as one',async()=>{
+  const f=fixture();
+  const result=await f.service.register(f.current,{...input,record_url:'',progress_url_confirmed:true},true);
+  assert.equal(result.queued,false);
+  assert.equal(JSON.parse(f.calls[0].init.body).record_url,'');
+  await assert.rejects(f.service.register(f.current,{...input,record_url:'https://ats.example/campus/jobs',progress_url_confirmed:true},true),/job_detail_not_progress/);
 });
 
 test('registration posts distinct same-page jobs directly and replays stable job identity',async()=>{

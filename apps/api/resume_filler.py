@@ -54,6 +54,8 @@ class Registration(BaseModel):
     @classmethod
     def valid_url(cls, value):
         value = value.strip()
+        if not value:
+            return ""
         parsed = urlsplit(value)
         if normalize_http_page_url(value) is None or re.search(r"[\s\\\x00-\x1f]", value):
             raise ValueError("A recruitment page URL is required")
@@ -65,6 +67,8 @@ class Registration(BaseModel):
 
     @model_validator(mode="after")
     def require_progress_confirmation(self):
+        if not self.record_url:
+            return self
         parsed = urlsplit(self.record_url)
         route = unquote(parsed.path + "/" + parsed.fragment).lower()
         if not self.progress_url_confirmed and not re.search(
@@ -143,7 +147,7 @@ def register(body: Registration, authorization: str | None = Header(default=None
         if created:
             now = datetime.now(timezone.utc).isoformat()
             row = ApplicationSnapshot(id="resume-" + identity[:24], company_name=body.company,
-                job_title=body.title, job_id=body.job_id, record_url=body.record_url, stage="applied",
+                job_title=body.title, job_id=body.job_id, record_url=body.record_url or None, stage="applied",
                 idempotency_key="resume-filler:" + identity, source="resume_filler", source_ref=identity,
                 note=body.city, stage_history=[{"stage": "applied", "source": "resume_filler", "at": now}])
             try:
@@ -159,7 +163,7 @@ def register(body: Registration, authorization: str | None = Header(default=None
                         or row.job_id != body.job_id):
                     raise HTTPException(409, "Registration identity changed during concurrent save")
                 created = False
-        elif (body.application_id or not row.record_url) and row.record_url != body.record_url:
+        elif body.record_url and (body.application_id or not row.record_url) and row.record_url != body.record_url:
             row.record_url = body.record_url
             row.updated_at = datetime.now(timezone.utc)
         return {"ok": True, "application_id": row.id, "created": created, "current_stage": row.stage,

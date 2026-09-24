@@ -69,7 +69,7 @@ dt { flex-shrink: 0; }
 .filler-check span { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.6; }
 .filler-primary { background: #19745b; color: white; border-color: #19745b; }
 .filler-primary:hover { background: #135d48; }
-#filler-one-click { width: 100%; min-height: 42px; margin-bottom: 12px; font-weight: 600; }
+#filler-one-click { width: 100%; min-height: 36px; margin: 8px 0 12px; }
 #filler-one-click-feedback,#filler-remaining { overflow-wrap: anywhere; }
 .filler-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .filler-actions button { padding: 7px 9px; }

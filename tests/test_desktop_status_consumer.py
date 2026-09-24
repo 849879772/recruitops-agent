@@ -204,7 +204,8 @@ def test_wave_deadline_cancels_operation_and_resumes_frozen_checkpoint(tmp_path,
     async def run():
         connection = await server.register(DEVICE, Socket())
         first = await handler("batch_observe_application_status", repo, store)({"all_non_terminal": True})
-        assert first.summary["run_status"] == "stopped"
+        assert first.summary["run_status"] == "awaiting_continuation"
+        assert first.summary["continuation_required"] is True
         assert first.summary["wave_error"] == "review_wave_timeout"
         assert first.summary["remaining_count"] == 2
         assert store.get_by_idempotency_key(attempts[0]).status == "CANCELLED"

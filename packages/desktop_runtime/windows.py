@@ -28,6 +28,10 @@ class PROCESSINFO(c.Structure):
     _fields_ = [("process", w.HANDLE), ("thread", w.HANDLE), ("pid", w.DWORD), ("tid", w.DWORD)]
 
 
+class SID_AND_ATTRIBUTES(c.Structure):
+    _fields_ = [("sid", c.c_void_p), ("attributes", w.DWORD)]
+
+
 class BASICLIMIT(c.Structure):
     _fields_ = [("process_time", c.c_int64), ("job_time", c.c_int64),
                 ("flags", w.DWORD), ("minimum", c.c_size_t), ("maximum", c.c_size_t),
@@ -70,6 +74,7 @@ def security():
         "CreateWellKnownSid": ([c.c_int, c.c_void_p, c.c_void_p, c.POINTER(w.DWORD)], w.BOOL),
         "CheckTokenMembership": ([w.HANDLE, c.c_void_p, c.POINTER(w.BOOL)], w.BOOL),
         "OpenProcessToken": ([w.HANDLE, w.DWORD, c.POINTER(w.HANDLE)], w.BOOL),
+        "DuplicateToken": ([w.HANDLE, c.c_int, c.POINTER(w.HANDLE)], w.BOOL),
         "CreateRestrictedToken": ([w.HANDLE, w.DWORD, w.DWORD, c.c_void_p, w.DWORD,
                                    c.c_void_p, w.DWORD, c.c_void_p, c.POINTER(w.HANDLE)], w.BOOL),
         "CreateProcessAsUserW": ([w.HANDLE, w.LPCWSTR, w.LPWSTR, c.c_void_p, c.c_void_p,
@@ -85,32 +90,69 @@ def security():
     return dll
 
 
+def privileged_sids(security_dll):
+    sids = []
+    for kind in (26, 29):  # WinBuiltinAdministratorsSid, WinBuiltinPowerUsersSid
+        sid = c.create_string_buffer(68)  # SECURITY_MAX_SID_SIZE
+        size = w.DWORD(len(sid))
+        if not security_dll.CreateWellKnownSid(kind, None, sid, c.byref(size)):
+            raise RuntimeFailure("process_token_failed", os_error=c.get_last_error())
+        sids.append(sid)
+    return sids
+
+
+def privileged_membership(kernel_dll, security_dll, token, sids):
+    impersonation = w.HANDLE()
+    if token:
+        # CheckTokenMembership requires an impersonation token, while the
+        # restricted token used to launch child processes is a primary token.
+        if not security_dll.DuplicateToken(token, 2, c.byref(impersonation)):  # SecurityImpersonation
+            raise RuntimeFailure("process_token_failed", os_error=c.get_last_error())
+        token = impersonation
+    try:
+        for sid in sids:
+            member = w.BOOL()
+            if not security_dll.CheckTokenMembership(token, sid, c.byref(member)):
+                raise RuntimeFailure("process_token_failed", os_error=c.get_last_error())
+            if member.value:
+                return True
+        return False
+    finally:
+        if impersonation:
+            kernel_dll.CloseHandle(impersonation)
+
+
 def create_restricted_token(kernel_dll, security_dll):
     source, restricted = w.HANDLE(), w.HANDLE()
     # TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY
     if not security_dll.OpenProcessToken(kernel_dll.GetCurrentProcess(), 0x000B, c.byref(source)):
         raise RuntimeFailure("process_token_failed", os_error=c.get_last_error())
     try:
-        # DISABLE_MAX_PRIVILEGE | LUA_TOKEN. The user SID and DPAPI identity are
-        # preserved while enabled administrative membership is removed.
-        if not security_dll.CreateRestrictedToken(source, 0x0005, 0, None, 0, None, 0, None,
+        sids = privileged_sids(security_dll)
+        disabled = (SID_AND_ATTRIBUTES * len(sids))(
+            *(SID_AND_ATTRIBUTES(c.cast(sid, c.c_void_p), 0) for sid in sids)
+        )
+        # Keep the user's identity and DPAPI access, but explicitly disable both
+        # groups PostgreSQL rejects, including on built-in Administrator accounts.
+        if not security_dll.CreateRestrictedToken(source, 0x0005, len(sids), c.byref(disabled),
+                                                  0, None, 0, None,
                                                   c.byref(restricted)):
             raise RuntimeFailure("process_token_failed", os_error=c.get_last_error())
+        if privileged_membership(kernel_dll, security_dll, restricted, sids):
+            raise RuntimeFailure("process_token_failed")
         return restricted
+    except BaseException:
+        if restricted:
+            kernel_dll.CloseHandle(restricted)
+        raise
     finally:
         kernel_dll.CloseHandle(source)
 
 
 def elevated_restricted_token(kernel_dll, security_dll):
-    """Return a same-user LUA token only when the current token is elevated."""
-    sid = c.create_string_buffer(68)  # SECURITY_MAX_SID_SIZE
-    size = w.DWORD(len(sid))
-    if not security_dll.CreateWellKnownSid(26, None, sid, c.byref(size)):  # WinBuiltinAdministratorsSid
-        raise RuntimeFailure("process_token_failed", os_error=c.get_last_error())
-    member = w.BOOL()
-    if not security_dll.CheckTokenMembership(None, sid, c.byref(member)):
-        raise RuntimeFailure("process_token_failed", os_error=c.get_last_error())
-    return create_restricted_token(kernel_dll, security_dll) if member.value else None
+    """Return a same-user LUA token when PostgreSQL would reject this token."""
+    return (create_restricted_token(kernel_dll, security_dll)
+            if privileged_membership(kernel_dll, security_dll, None, privileged_sids(security_dll)) else None)
 
 
 class OwnedProcess:

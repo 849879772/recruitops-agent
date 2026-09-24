@@ -25,6 +25,12 @@ from packages.storage.sync import (
 UTC = timezone.utc
 
 
+@pytest.mark.parametrize("status", ["cancelled", "cancelling"])
+def test_cancelled_daily_scope_cannot_be_resumed_even_with_old_checkpoint(status):
+    with pytest.raises(ValueError, match="cancelled daily task cannot be resumed"):
+        scheduler_runtime._load_frozen_resume(Settings(), {"run_status": status})
+
+
 def _settings(tmp_path: Path, *, discovery_enabled: bool = True) -> Settings:
     config = tmp_path / "config"
     config.mkdir(exist_ok=True)
@@ -48,6 +54,26 @@ def _context(run_id: str, details: dict[str, object]) -> TaskContext:
         write_enabled=True,
         metadata={"details": details},
     )
+
+
+def test_checkpoint_progress_separates_attempts_from_confirmed_completion(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({
+        "company_ids": [str(index) for index in range(30)],
+        "companies": {
+            str(index): {"status": "complete" if index < 19 else "partial"}
+            for index in range(25)
+        },
+    }), encoding="utf-8")
+
+    assert scheduler_runtime._company_checkpoint_progress(checkpoint) == {
+        "scope_total": 30,
+        "attempted_unique": 25,
+        "confirmed_complete": 19,
+        "retry_pending": 6,
+        "not_started": 5,
+        "remaining": 11,
+    }
 
 
 def _pipeline_spy(monkeypatch, observed: list[dict[str, object]]):

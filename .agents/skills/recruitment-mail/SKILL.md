@@ -5,6 +5,24 @@ description: Search, inspect, and explicitly process persisted recruitment mail 
 
 # Recruitment Mail
 
+## Current-turn processing
+
+For a request to process mail, use `recruitment_mail_run_start` and keep the assistant
+turn open. It waits for up to 20 seconds; if `continuation_required=true`, call
+`recruitment_mail_run_status(run_id=the_returned_id,wait_ms=20000)` until the saved run
+reaches a terminal state, then report its actual outcomes. A bounded wait returning
+active is not a failure or a reason to ask the user whether to continue. Never end
+with only “后台已启动，请稍后询问”. Progress cards remain visible during the wait.
+Only the full recruitment crawl uses that fire-and-forget interaction.
+
+If interrupted, discover saved runs without asking the user for an internal ID;
+resume only on their instruction via `recruitment_mail_run_control(action=resume)`
+and keep waiting in this turn. Pause/cancel is explicit and cannot be undone by a
+status poll. For a progress-only query, read once with `wait_ms=0`; do not start work.
+The durable run freezes and processes batches internally through the same guarded
+`recruitment_mail_process` pipeline. The legacy per-batch limits below apply only
+when that lower-level tool is used directly, not to the durable run's read-only waits.
+
 Assessment invitations (`assessment`) remain classified as assessment mail but map to
 `applied`, not a written-test stage. Explicit written-test notices (`written_test`) map
 to `written`. Use the mail content to distinguish them; neither case may roll back a

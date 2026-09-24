@@ -118,3 +118,38 @@ def test_startup_recovery_marks_running_task_as_recoverable() -> None:
     assert recovered["run_status"] == "stopped"
     assert recovered["current_step"] == "recoverable:matching:12/40"
     assert recovered["error"] == "process_interrupted"
+
+
+def test_restarted_status_preserves_resume_lineage_and_durable_progress() -> None:
+    storage = Storage.from_url("sqlite+pysqlite:///:memory:", initialize=True)
+    store = AgentStateStore(storage)
+    store.save_task_run(TaskRun(
+        id="paused-resume-run",
+        task_type=TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value,
+        status=TaskStatus.STOPPED,
+        user_request="daily sync",
+        current_step="paused",
+        source="test",
+    ))
+    store.save_task_state("paused-resume-run", {
+        "metadata": {
+            "requested_mode": "full",
+            "resumed_from": "original-run",
+            "company_ids": ["a", "b"],
+        },
+        "progress": {
+            "stage": "companies", "scope_total": 2,
+            "attempted_unique": 1, "confirmed_complete": 1,
+            "retry_pending": 0, "remaining": 1,
+        },
+        "result": {"status": "paused"},
+    })
+    runner = OperationalTaskRunner(LocalTaskScheduler(), {}, state_store=store)
+
+    observed = runner.background_status("paused-resume-run")
+
+    assert observed is not None
+    assert observed["run_status"] == "paused"
+    assert observed["mode"] == "resume"
+    assert observed["resume_run_id"] == "original-run"
+    assert observed["progress"]["confirmed_complete"] == 1

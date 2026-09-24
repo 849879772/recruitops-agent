@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -110,6 +110,14 @@ _CAPTURE_REFRESH_REASONS = frozenset(
 
 class PipelineError(RuntimeError):
     """Base error for invalid pipeline setup or Agent-owned persistence."""
+
+
+class PipelineInterrupted(PipelineError):
+    """A time or batch boundary stopped work after durable in-flight drain."""
+
+    def __init__(self, message: str, *, reason_code: str = "time_budget_reached") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class CompanyConfigError(PipelineError, ValueError):
@@ -1684,6 +1692,8 @@ class DailyRecruitmentPipeline:
         checkpoint_path: Path | str | None = None,
         resume_from_checkpoint: bool = False,
         progress_callback: Callable[[str, int, int], None] | None = None,
+        stop_requested: Event | None = None,
+        company_batch_limit: int | None = None,
         clock: Callable[[], datetime] = _now,
     ):
         if max_concurrency < 1:
@@ -1694,6 +1704,8 @@ class DailyRecruitmentPipeline:
             raise ValueError("match_max_concurrency must be positive")
         if checkpoint_batch_size < 1:
             raise ValueError("checkpoint_batch_size must be positive")
+        if company_batch_limit is not None and company_batch_limit < 1:
+            raise ValueError("company_batch_limit must be positive")
         try:
             detail_reuse_ttl_hours = float(detail_reuse_ttl_hours)
         except (TypeError, ValueError) as exc:
@@ -1723,7 +1735,35 @@ class DailyRecruitmentPipeline:
         self._checkpoint_company_ids: tuple[str, ...] = ()
         self._hydration_checkpoint_id = uuid4().hex
         self.progress_callback = progress_callback
+        self.stop_requested = stop_requested
+        self.company_batch_limit = company_batch_limit
         self.clock = clock
+
+    def _check_stop(self) -> None:
+        if self.stop_requested is not None and self.stop_requested.is_set():
+            raise PipelineInterrupted("time budget reached; saved work can be resumed")
+
+    def _bounded_futures(self, executor, items, submit, limit: int):
+        """Keep only a small in-flight window; drain it before a pause."""
+
+        remaining = iter(items)
+        futures = {}
+
+        def fill() -> None:
+            while len(futures) < limit and not (
+                self.stop_requested is not None and self.stop_requested.is_set()
+            ):
+                item = next(remaining, None)
+                if item is None:
+                    break
+                futures[submit(executor, item)] = item
+
+        fill()
+        while futures:
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                yield future, futures.pop(future)
+            fill()
 
     def _load_company_checkpoint(
         self,
@@ -2280,6 +2320,7 @@ class DailyRecruitmentPipeline:
     def _run_title_first(self, *, dry_run: bool) -> DailyPipelineResult:
         """Run the shared title-first capture policy for one daily pass."""
 
+        self._check_stop()
         if not dry_run and self.storage is None:
             raise PipelineError("storage is required unless dry_run=True")
 
@@ -2343,6 +2384,11 @@ class DailyRecruitmentPipeline:
         else:
             retry_companies = list(selected)
 
+        if self.company_batch_limit is not None and self.resume_from_checkpoint:
+            # A repeatedly partial first batch must not starve companies that
+            # have never been attempted in the frozen scope.
+            retry_companies.sort(key=lambda company: company.id in checkpoint_entries)
+
         def checkpoint_company(work: _CompanyWork) -> None:
             previous = checkpoint_works.get(work.company.id)
             if previous is not None:
@@ -2365,16 +2411,26 @@ class DailyRecruitmentPipeline:
         def checkpoint_details(work: _CompanyWork) -> None:
             self._write_hydration_checkpoint(work, dry_run=dry_run)
 
+        batch_companies = (
+            retry_companies[:self.company_batch_limit]
+            if self.company_batch_limit is not None else retry_companies
+        )
         works.extend(
             self._crawl_companies(
-                retry_companies,
+                batch_companies,
                 progress_offset=len(works) if self.resume_from_checkpoint else 0,
-                progress_total=len(selected) if self.resume_from_checkpoint else None,
+                progress_total=len(selected),
                 checkpoint_callback=checkpoint_company
                 if self.checkpoint_path is not None
                 else None,
             )
         )
+        self._check_stop()
+        if len(batch_companies) < len(retry_companies):
+            raise PipelineInterrupted(
+                "company batch saved; resume the remaining frozen scope",
+                reason_code="company_batch_limit_reached",
+            )
         works = sorted(works, key=lambda item: item.company.id)
         existing_by_company = self._read_existing_for_companies(item.id for item in selected)
         existing_by_title: dict[tuple[str, str], list[_ExistingSnapshot]] = {}
@@ -2659,19 +2715,18 @@ class DailyRecruitmentPipeline:
             matching_abort_code: str | None = None
             completed = 0
             if score_candidates:
+                self._check_stop()
                 with ThreadPoolExecutor(
                     max_workers=min(self.match_max_concurrency, len(score_candidates))
                 ) as executor:
-                    futures = {
-                        executor.submit(
-                            self._score_title_first_candidate,
-                            candidate,
-                            matching_abort,
-                        ): candidate
-                        for candidate in score_candidates
-                    }
-                    for future in as_completed(futures):
-                        candidate = futures[future]
+                    for future, candidate in self._bounded_futures(
+                        executor,
+                        score_candidates,
+                        lambda pool, item: pool.submit(
+                            self._score_title_first_candidate, item, matching_abort
+                        ),
+                        self.match_max_concurrency,
+                    ):
                         try:
                             analysis = future.result()
                         except Exception as exc:
@@ -2727,6 +2782,7 @@ class DailyRecruitmentPipeline:
                     inactive_ids=(),
                     dry_run=dry_run,
                 ) or written
+            self._check_stop()
             if matching_abort_code is not None:
                 raise PipelineError(
                     "matching aborted after provider authorization failure: "
@@ -3027,12 +3083,14 @@ class DailyRecruitmentPipeline:
             self.progress_callback("jd", 0, total)
         completed = 0
         with ThreadPoolExecutor(max_workers=min(self.max_concurrency, total)) as executor:
-            futures = {
-                executor.submit(self._hydrate_title_first, candidate, inputs[id(candidate)][1]): candidate
-                for candidate in candidates
-            }
-            for future in as_completed(futures):
-                candidate = futures[future]
+            for future, candidate in self._bounded_futures(
+                executor,
+                candidates,
+                lambda pool, item: pool.submit(
+                    self._hydrate_title_first, item, inputs[id(item)][1]
+                ),
+                self.max_concurrency,
+            ):
                 try:
                     diagnostic = future.result()
                 except Exception as exc:
@@ -3081,6 +3139,10 @@ class DailyRecruitmentPipeline:
                     )
                 ):
                     self.progress_callback("jd", completed, total)
+        if dirty and checkpoint_callback is not None:
+            for work in dirty.values():
+                checkpoint_callback(work)
+        self._check_stop()
 
     def _pending_title_first_analysis(
         self,
@@ -3262,6 +3324,7 @@ class DailyRecruitmentPipeline:
         capture_failure_reason: str,
         availability_status: str,
         title_key: str,
+        preserve_existing_score: bool = False,
     ) -> None:
         upsert_job_snapshot(
             session,
@@ -3270,6 +3333,7 @@ class DailyRecruitmentPipeline:
             capture_failure_reason=capture_failure_reason,
             availability_status=availability_status,
             title_key=title_key,
+            preserve_existing_score=preserve_existing_score,
         )
 
     def _persist_title_first(
@@ -3338,6 +3402,10 @@ class DailyRecruitmentPipeline:
                     ),
                     availability_status=_stored_availability_status(candidate.job),
                     title_key=candidate.title_key,
+                    preserve_existing_score=(
+                        candidate.analysis is not None
+                        and candidate.analysis.analysis_status in {"failed", "refused"}
+                    ),
                 )
                 if candidate.analysis is not None:
                     upsert_job_analysis_snapshot(session, model, candidate.analysis)
@@ -3904,38 +3972,55 @@ class DailyRecruitmentPipeline:
         progress_total: int | None = None,
         checkpoint_callback: Callable[[_CompanyWork], None] | None = None,
     ) -> list[_CompanyWork]:
+        self._check_stop()
         if not companies:
             return []
         works: list[_CompanyWork] = []
         completed = 0
+        confirmed = progress_offset
         total = progress_total if progress_total is not None else len(companies)
         if self.progress_callback is not None:
-            self.progress_callback("companies", progress_offset, total)
+            self.progress_callback("companies", confirmed, total)
         with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(companies))) as executor:
-            futures = {executor.submit(self._crawl_one, company): company for company in companies}
-            for future in as_completed(futures):
-                company = futures[future]
-                try:
-                    works.append(future.result())
-                except Exception as exc:  # defensive isolation around injected crawlers
-                    LOGGER.warning("[%s] crawler failed: %s", company.name, exc)
-                    works.append(
-                        _CompanyWork(
-                            company=company,
-                            failure_reason="crawler_failed",
-                        )
-                    )
-                if checkpoint_callback is not None:
-                    checkpoint_callback(works[-1])
-                completed += 1
-                if (
-                    self.progress_callback is not None
-                    and (
+            pending = iter(companies)
+            futures = {}
+
+            def submit_next() -> bool:
+                if self.stop_requested is not None and self.stop_requested.is_set():
+                    return False
+                company = next(pending, None)
+                if company is None:
+                    return False
+                futures[executor.submit(self._crawl_one, company)] = company
+                return True
+
+            for _ in range(min(self.max_concurrency, len(companies))):
+                submit_next()
+            while futures:
+                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    company = futures.pop(future)
+                    try:
+                        work = future.result()
+                    except Exception as exc:  # defensive isolation around injected crawlers
+                        LOGGER.warning("[%s] crawler failed: %s", company.name, exc)
+                        work = _CompanyWork(company=company, failure_reason="crawler_failed")
+                    works.append(work)
+                    if checkpoint_callback is not None:
+                        checkpoint_callback(work)
+                    completed += 1
+                    if not work.failure_reason and work.list_complete:
+                        confirmed += 1
+                    if self.progress_callback is not None and (
                         completed % self.checkpoint_batch_size == 0
                         or completed == len(companies)
-                    )
-                ):
-                    self.progress_callback("companies", progress_offset + completed, total)
+                        or (self.stop_requested is not None and self.stop_requested.is_set())
+                    ):
+                        self.progress_callback("companies", confirmed, total)
+                    submit_next()
+        self._check_stop()
+        if self.progress_callback is not None:
+            self.progress_callback("companies", confirmed, total)
         return works
 
     def _crawl_one(self, company: PipelineCompany) -> _CompanyWork:
@@ -4307,7 +4392,13 @@ class DailyRecruitmentPipeline:
             for company in company_models:
                 upsert_company_snapshot(session, company)
             for job, analysis in job_models:
-                upsert_job_snapshot(session, job)
+                upsert_job_snapshot(
+                    session, job,
+                    preserve_existing_score=(
+                        analysis is not None
+                        and analysis.analysis_status in {"failed", "refused"}
+                    ),
+                )
                 if analysis is not None:
                     upsert_job_analysis_snapshot(session, job, analysis)
         return True
@@ -4330,6 +4421,8 @@ def run_daily_pipeline(
     checkpoint_path: Path | str | None = None,
     resume_from_checkpoint: bool = False,
     progress_callback: Callable[[str, int, int], None] | None = None,
+    stop_requested: Event | None = None,
+    company_batch_limit: int | None = None,
     dry_run: bool = False,
     legacy: bool = False,
     clock: Callable[[], datetime] = _now,
@@ -4352,6 +4445,8 @@ def run_daily_pipeline(
         checkpoint_path=checkpoint_path,
         resume_from_checkpoint=resume_from_checkpoint,
         progress_callback=progress_callback,
+        stop_requested=stop_requested,
+        company_batch_limit=company_batch_limit,
         clock=clock,
     ).run(dry_run=dry_run, legacy=legacy)
 
@@ -4371,6 +4466,7 @@ __all__ = [
     "MatchingServiceAdapter",
     "PipelineCompany",
     "PipelineError",
+    "PipelineInterrupted",
     "job_content_fingerprint",
     "load_companies",
     "run_daily_pipeline",

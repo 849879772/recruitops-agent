@@ -198,6 +198,12 @@ function loadApp(fetch, options = {}) {
     "assistant-live-run",
     "assistant-live-label",
     "assistant-live-detail",
+    "assistant-task-progress",
+    "assistant-task-progress-title",
+    "assistant-task-progress-state",
+    "assistant-task-progress-detail",
+    "assistant-task-progress-bar",
+    "assistant-task-progress-stages",
     "assistant-message-status",
     "assistant-intent",
     "assistant-messages",
@@ -247,6 +253,7 @@ function loadApp(fetch, options = {}) {
     TextDecoder,
     TextEncoder,
     URL,
+    URLSearchParams,
     AbortController,
     Date: options.Date || Date,
     Uint8Array,
@@ -302,6 +309,35 @@ function jsonResponse(payload, status = 200) {
     json: async () => payload,
   };
 }
+
+test("assistant company progress counts all persisted outcomes without showing retry or failure counts", async () => {
+  const calls = [];
+  const { document, hooks } = loadApp(async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse({ run: {
+      status: "running", phase: "companies",
+      stages: { discovery: "succeeded", crawl: "running" },
+      progress: { stage: "companies", scope_total: 3321, attempted_unique: 1400,
+        confirmed_complete: 1283, retry_pending: 117 },
+    } });
+  });
+  await hooks.refreshDailyProgress();
+  assert.equal(calls[0].url, "/api/local-ui/tasks/progress");
+  assert.equal(calls[0].options.headers["X-RecruitOps-Local-UI"], "1");
+  assert.equal(document.getElementById("assistant-task-progress").hidden, false);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /已处理 1400 \/ 总计 3321 家/);
+  assert.doesNotMatch(document.getElementById("assistant-task-progress-detail").textContent, /待重试|失败|已确认完成/);
+  assert.equal(document.getElementById("assistant-task-progress-bar").hidden, false);
+  assert.equal(document.getElementById("assistant-task-progress-bar").value, 1400 / 3321 * 100);
+  hooks.renderDailyProgress({ run: { status: "stopped", phase: "discovery", stages: {}, progress: null } });
+  assert.equal(document.getElementById("assistant-task-progress-bar").hidden, true);
+  assert.equal(document.getElementById("assistant-task-progress").hidden, true);
+  hooks.renderDailyProgress({ run: { status: "running", mode: "score_only", phase: "matching", stages: {},
+    progress: { stage: "matching", confirmed_complete: 300, scope_total: 500,
+      run_attempted: 20, run_total: 200 } } });
+  assert.match(document.getElementById("assistant-task-progress-title").textContent, /后台岗位评分/);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /已确认完成 300 \/ 500/);
+});
 
 function turnEvent() {
   return frame("turn", { id: "turn-1", thread_id: "thread-1" });
@@ -377,7 +413,8 @@ test("assistant diagnoses missing model, restart, deliberate disable and runtime
 test("assistant presents business stages without raw runtime metadata", () => {
   const { document, hooks } = loadApp(async () => { throw new Error("no fetch"); });
   assert.equal(hooks.friendlyRuntimeProgress("discovery:running"), "公司发现");
-  assert.equal(hooks.friendlyRuntimeProgress("matching:12/48"), "岗位评分 12/48");
+  assert.equal(hooks.friendlyRuntimeProgress("matching:12/48"), "岗位评分 本轮 12/48");
+  assert.equal(hooks.friendlyRuntimeProgress("companies:19/30"), "公司岗位列表抓取 已处理 19/30");
   assert.equal(hooks.friendlyRuntimeProgress("reporting:succeeded"), "生成结果");
 
   hooks.state.codexThreadId = "thread-secret-id";
@@ -806,7 +843,7 @@ test("reports a successful mail sync without invoking association or application
   assert.match(document.getElementById("mail-sync-status-detail").textContent, /新增 2 封/);
   assert.deepEqual(calls.map((call) => call.url), [
     "/api/recruitment-mails/sync?limit=100",
-    "/api/recruitment-mails?limit=50",
+    "/api/recruitment-mails?limit=50&refresh=false",
   ]);
   assert.equal(calls[0].options.method, "POST");
   assert.ok(calls.every((call) => !call.url.includes("/review") && !call.url.includes("/applications")));
@@ -1070,7 +1107,7 @@ test("manual schedule payload permits an empty job title and no application", ()
 
 test("schedule mail sources reuse the existing detail dialog", async () => {
   const { document, hooks } = loadApp(async (url) => {
-    assert.equal(url, "/api/recruitment-mails/mail-1");
+    assert.equal(url, "/api/recruitment-mails/mail-1?refresh=false");
     return jsonResponse({
       record_id: "mail-1",
       processing_status: "processed_unchanged",
@@ -1089,4 +1126,186 @@ test("schedule mail sources reuse the existing detail dialog", async () => {
   assert.equal(document.getElementById("job-detail-company").textContent, "招聘邮件 · mail-1");
   assert.equal(document.getElementById("job-detail-title").textContent, "星河科技测评通知");
   assert.match(document.getElementById("job-detail-content").textContent, /请完成测评/);
+});
+
+test("active progress supports review and mail, never includes old finished cards or IDs", () => {
+  const { document, hooks } = loadApp(async () => jsonResponse([]));
+  hooks.renderDailyProgress({ runs: [
+    { run_id: "private-review-id", task_kind: "application_review", status: "running", phase: "application_review", completed: 12, total: 88, failed: 2, blocked: 1, actions: ["pause", "cancel"] },
+    { run_id: "private-mail-id", task_kind: "recruitment_mail", status: "running", phase: "processing", completed: 3, total: 10, unit: "封" },
+    { task_kind: "daily", status: "failed", phase: "discovery", mode: "full" },
+  ] });
+  assert.match(document.getElementById("assistant-task-progress-title").textContent, /官网投递状态复核/);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /12 \/ 88/);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /失败 2/);
+  assert.match(document.getElementById("assistant-more-task-progress").textContent, /处理招聘邮件/);
+  assert.doesNotMatch(document.body.textContent, /private-review-id|private-mail-id|后台全量爬取/);
+  hooks.renderDailyProgress({ runs: [{ status: "paused" }, { status: "succeeded" }, { status: "failed" }] });
+  assert.equal(document.getElementById("assistant-task-progress").hidden, true);
+  assert.equal(document.getElementById("assistant-more-task-progress").children.length, 0);
+});
+
+test("application board searches every column independently and loads more without hiding other stages", async () => {
+  const calls = [];
+  const records = Array.from({ length: 86 }, (_, index) => ({ id: `a-${index}`, company_name: "示例公司",
+    job_title: `岗位${index}`, stage: index < 82 ? "applied" : index < 85 ? "written" : "interview1" }));
+  const { document, hooks } = loadApp(async url => {
+    calls.push(url);
+    const params = new URL(url, "http://localhost").searchParams;
+    const rows = records.filter(row => params.getAll("stages").includes(row.stage));
+    const offset = Number(params.get("offset"));
+    return jsonResponse({ items: rows.slice(offset, offset + 50), total: rows.length, unfiltered_total: 888,
+      stage_counts: { interview1: 1, applied: 82, written: 3 } });
+  });
+  document.getElementById("application-search").value = "  示例公司  ";
+  await hooks.loadApplications();
+  assert.equal(calls.length, 5);
+  assert.ok(calls.every(url => new URL(url, "http://localhost").searchParams.get("query") === "示例公司"));
+  assert.ok(calls.every(url => new URL(url, "http://localhost").searchParams.get("offset") === "0"));
+  assert.equal(hooks.state.applications.length, 54);
+  assert.equal(hooks.state.applicationBrowse.columns.interview.items.length, 1);
+  assert.equal(hooks.state.applicationBrowse.columns.written.items.length, 3);
+  assert.equal(document.getElementById("nav-application-count").textContent, "888");
+  assert.match(document.getElementById("application-page-description").textContent, /匹配 86 条 · 已显示 54 条/);
+  await hooks.loadApplications({ moreColumn: "applied" });
+  assert.equal(calls.length, 6);
+  assert.equal(new URL(calls[5], "http://localhost").searchParams.get("offset"), "50");
+  assert.equal(hooks.state.applications.length, 86);
+  assert.equal(hooks.state.applicationBrowse.columns.interview.items.length, 1);
+  assert.equal(hooks.state.applicationBrowse.columns.written.items.length, 3);
+});
+
+test("application refresh resets each column offset and preserves search", async () => {
+  const calls = [];
+  const { document, hooks } = loadApp(async url => {
+    calls.push(url); return jsonResponse({ items: [], total: 0, unfiltered_total: 70, stage_counts: {} });
+  });
+  document.getElementById("application-search").value = "测试岗";
+  hooks.state.applicationBrowse.columns.applied = { items: [{ id: "old" }], total: 120, offset: 100 };
+  await hooks.loadApplications();
+  assert.equal(calls.length, 5);
+  assert.ok(calls.every(url => new URL(url, "http://localhost").searchParams.get("offset") === "0"));
+  assert.equal(hooks.state.applicationBrowse.columns.applied.offset, 0);
+  assert.equal(hooks.state.applications.length, 0);
+  assert.equal(document.getElementById("application-search").value, "测试岗");
+});
+
+test("failed load-more retains visible application columns and retry offset", async () => {
+  let failMore = false;
+  const { document, hooks } = loadApp(async url => {
+    const params = new URL(url, "http://localhost").searchParams;
+    if (failMore) throw new Error("synthetic load-more failure");
+    const applied = params.getAll("stages").includes("applied");
+    return jsonResponse({ items: applied ? [{ id: "keep-applied", stage: "applied", job_title: "保留岗位" }] : [],
+      total: applied ? 2 : 0, stage_counts: { applied: 2 }, unfiltered_total: 2 });
+  });
+  await hooks.loadApplications();
+  failMore = true;
+  assert.equal(await hooks.loadApplications({ moreColumn: "applied" }), false);
+  assert.equal(hooks.state.applicationBrowse.columns.applied.offset, 1);
+  assert.match(document.getElementById("application-kanban").textContent, /保留岗位/);
+  assert.doesNotMatch(document.getElementById("application-kanban").textContent, /投递记录加载失败/);
+});
+
+test("warm job pages omit heavy summaries without clearing featured jobs", async () => {
+  let requested;
+  const { document, hooks } = loadApp(async url => {
+    requested = new URL(url, "http://localhost");
+    return jsonResponse({ items: [], total: 400, stats: null, facets: null, featured: [], summary_included: false });
+  });
+  hooks.state.jobSummaryMode = hooks.state.jobBrowse.mode;
+  hooks.state.jobSummaryAt = Date.now();
+  hooks.state.featuredJobs = [{ id: "keep-featured" }];
+  await hooks.loadJobBrowser();
+  assert.equal(requested.searchParams.get("include_summary"), "false");
+  assert.equal(hooks.state.featuredJobs[0].id, "keep-featured");
+  assert.match(document.getElementById("jobs-result-count").textContent, /400/);
+});
+
+test("mail semantic labels do not portray legacy zero confidence as a probability", () => {
+  const { document, hooks } = loadApp(async () => jsonResponse([]));
+  hooks.renderMails([
+    mailFixture({ id: "one", confidence: 0, binding_state: "not_required", association_required: false, processing_label: "已处理" }),
+    mailFixture({ id: "two", confidence: null, binding_state: "confirmed", application_id: "a" }),
+  ]);
+  const label = document.getElementById("mail-list").textContent;
+  assert.doesNotMatch(label, /置信度|0%/);
+  assert.match(label, /无需关联/);
+  assert.match(label, /用户已确认/);
+});
+
+test("binding candidate dialog reads only and does not auto propose or bind", async () => {
+  const calls = [];
+  const { document, hooks } = loadApp(async url => {
+    calls.push(url); return jsonResponse({ candidates: [{ application_id: "a", company_name: "示例科技", job_title: "测试工程师" }], content_digest: "a".repeat(64), binding_revision: 0 });
+  });
+  await hooks.openMailBinding("mail-1");
+  assert.deepEqual(calls, ["/api/recruitment-mails/mail-1/binding-candidates?query="]);
+  assert.match(document.getElementById("job-detail-content").textContent, /示例科技 · 测试工程师/);
+});
+
+test("human binding approval must succeed before exact proposal execution", async () => {
+  const calls = [];
+  const { hooks } = loadApp(async (url, options) => {
+    calls.push({ url, options });
+    if (url.endsWith("/approve")) return jsonResponse({ allowed: false, status: "expired" });
+    throw new Error("must not execute after rejected approval");
+  });
+  await hooks.confirmMailBinding({ token_id: "token", status: "pending" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "/api/approvals/token/approve");
+});
+
+test("binding approval card shows business targets instead of internal IDs", () => {
+  const { document, hooks } = loadApp(async () => jsonResponse([]));
+  hooks.state.approvals = [{ token_id: "secret-token", status: "pending", operation: "recruitment_mail_binding",
+    preview: { before: { subject: "笔试通知", sender: "hr@example.test" },
+      after: { action: "bind", company_name: "示例科技", job_title: "研发工程师" } } }];
+  hooks.renderMailBindingApprovals();
+  const label = document.getElementById("assistant-mail-binding-approvals").textContent;
+  assert.match(label, /笔试通知/); assert.match(label, /示例科技 · 研发工程师/);
+  assert.doesNotMatch(label, /secret-token/);
+});
+
+test("review wave waits in current turn with settled and retry counts kept separate", () => {
+  const { hooks, document } = loadApp(async () => jsonResponse([]));
+  hooks.renderDailyProgress({ runs: [{ task_kind: "application_review", status: "awaiting_continuation",
+    phase: "application_review", completed: 14, total: 86, processed: 16, remaining: 72,
+    retry_pending: 2, failed: 2, unit: "条记录" }] });
+  assert.equal(document.getElementById("assistant-task-progress").hidden, false);
+  assert.equal(document.getElementById("assistant-task-progress-state").textContent, "等待助理继续下一批");
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /14 \/ 86/);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /待完成 72/);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /含待重试 2/);
+  hooks.renderDailyProgress({ runs: [{ task_kind: "application_review", status: "stopped" }] });
+  assert.equal(document.getElementById("assistant-task-progress").hidden, true);
+});
+
+test("late task progress cannot resurrect an already finished card", async () => {
+  let completeOld;
+  let progressReads = 0;
+  const { document, hooks } = loadApp(async url => {
+    if (url === "/api/approvals") return jsonResponse([]);
+    if (++progressReads === 1) return new Promise(resolve => { completeOld = resolve; });
+    return jsonResponse({ runs: [], run: null });
+  });
+  const old = hooks.refreshDailyProgress();
+  await hooks.refreshDailyProgress();
+  completeOld(jsonResponse({ runs: [{ status: "running", task_kind: "recruitment_mail", phase: "analysis", completed: 1, total: 2 }] }));
+  await old;
+  assert.equal(document.getElementById("assistant-task-progress").hidden, true);
+});
+
+test("cancel needs confirmation and sends only the exact displayed run", async () => {
+  const calls = [];
+  const denied = loadApp(async url => { calls.push(url); return jsonResponse({}); }, { confirm: () => false });
+  await denied.hooks.controlBackgroundTask({ run_id: "mail-fixture", task_kind: "recruitment_mail" }, "cancel");
+  assert.equal(calls.length, 0);
+  const { hooks } = loadApp(async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse(url === "/api/approvals" ? [] : url.endsWith("/progress") ? { runs: [] } : { status: "cancelling" });
+  });
+  await hooks.controlBackgroundTask({ run_id: "mail-fixture", task_kind: "recruitment_mail" }, "cancel");
+  assert.equal(calls[0].url, "/api/local-ui/tasks/mail-fixture/control");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { task_kind: "recruitment_mail", action: "cancel" });
 });

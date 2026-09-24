@@ -45,6 +45,46 @@ def test_local_edit_without_token_and_stale_conflict(case):
     assert client.patch("/api/local-ui/applications/fixture", headers=headers, json=body).status_code == 409
 
 
+def test_local_edit_corrects_application_identity_and_linked_schedule(case):
+    client, headers, stamp, storage, _ = case
+    created = client.post("/api/local-ui/applications/fixture/events", headers=headers,
+                          json={"event_type": "面试", "event_date": "2026-10-01"})
+    assert created.status_code == 200, created.text
+    response = client.patch("/api/local-ui/applications/fixture", headers=headers, json={
+        "stage": "applied", "company_name": " 新公司 ", "job_title": " 新岗位 ",
+        "expected_updated_at": stamp,
+    })
+    assert response.status_code == 200, response.text
+    with storage.session() as session:
+        row = session.get(ApplicationSnapshot, "fixture")
+        event = session.scalar(select(ScheduleEventSnapshot))
+        assert (row.company_name, row.job_title, row.id) == ("新公司", "新岗位", "fixture")
+        assert row.stage_history[-1]["previous_company_name"] == "Test"
+        assert row.stage_history[-1]["previous_job_title"] == "Engineer"
+        assert (event.company_name, event.job_title, event.title) == ("新公司", "新岗位", "新公司 · 面试")
+    assert client.patch("/api/local-ui/applications/fixture", headers=headers, json={
+        "stage": "applied", "company_name": "过期修改", "job_title": "岗位",
+        "expected_updated_at": stamp,
+    }).status_code == 409
+
+
+def test_local_edit_rejects_empty_or_duplicate_identity(case):
+    client, headers, stamp, storage, _ = case
+    with storage.write_transaction() as session:
+        session.add(ApplicationSnapshot(id="other", company_name="Other", job_title="Designer",
+            stage="applied", stage_history=[], source="fixture", source_ref="other",
+            idempotency_key="other"))
+    base = {"stage": "applied", "expected_updated_at": stamp}
+    path = "/api/local-ui/applications/fixture"
+    assert client.patch(path, headers=headers, json={**base,
+        "company_name": "  ", "job_title": "Developer"}).status_code == 422
+    assert client.patch(path, headers=headers, json={**base,
+        "company_name": "Other", "job_title": "Designer"}).status_code == 409
+    with storage.session() as session:
+        row = session.get(ApplicationSnapshot, "fixture")
+        assert (row.company_name, row.job_title) == ("Test", "Engineer")
+
+
 @pytest.mark.parametrize("origin", ["http://evil.example", "null", "http://localhost:18010", "http://127.0.0.1:9999"])
 def test_external_origin_is_blocked(case, origin):
     client, headers, stamp, *_ = case

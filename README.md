@@ -35,19 +35,21 @@
 
 ### 1. 下载桌面版
 
-当前可用版本为 RecruitOps v0.1.4，请下载 `RecruitOps-v0.1.4.zip`：
+当前可用版本为 RecruitOps v0.1.5，请下载 `RecruitOps-v0.1.5.zip`：
 
-- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.4)
-- [Gitee Releases](https://gitee.com/zs-k/recruitops-agent/releases/tag/v0.1.4)（完整安装包请从 GitHub 或 123 云盘下载）
-- [123 云盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-UX5nd)（永久有效、无提取码，含 SHA-256 校验文件）
+- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.5)
+- [Gitee v0.1.5 更新说明](https://gitee.com/zs-k/recruitops-agent/blob/main/docs/RELEASE_v0.1.5.md)（完整安装包请从 GitHub 或 123 云盘下载）
+- [123 云盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-R4bXd)
 
 安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
 
 ```text
-F05D9DB4BBF6C49F7C309FBE5245C49178F4CB8C53250F16F6F4D6EB5D9EDA41
+D9030D35B30F67497EBB6AB9115AA7A587BB2DA52CA2E50A1D233424F7D8C47E
 ```
 
 如果旧版已经爬取到岗位，或已有投递记录、招聘邮件，请先阅读[已有数据的桌面版升级步骤](docs/UPGRADE_EXISTING_DATA.md)。不要直接把旧版 `.data` 复制到不同安装路径。
+
+本版重点修复简历结构化解析、评分缺维度、管理员权限启动、全量任务超时接续和批量投递复核，并完善任务进度、邮件关联及投递搜索。完整范围与限制见 [v0.1.5 更新说明](docs/RELEASE_v0.1.5.md)。
 
 ### 2. 完整解压
 

@@ -906,6 +906,7 @@ function buildApplicationContextScript(bundle, context) {
 const result=await state.dispatch({type:'RECRUIT_GET_PAGE_CONTEXT',allowHostFallback:false});
 if(!live())throw new Error('filler_navigation_changed');
 if(result?.ok!==true)throw new Error('filler_application_context_failed');
+if(globalThis.top!==globalThis.self){let current=globalThis;while(current!==globalThis.top){const owner=current.frameElement;if(owner){if(!owner.getClientRects().length)throw new Error('filler_frame_not_visible');for(let node=owner;node;node=node.parentElement){const style=getComputedStyle(node);if(node.hidden||node.inert||node.getAttribute('aria-hidden')==='true'||style.display==='none'||style.visibility!=='visible'||Number(style.opacity)===0)throw new Error('filler_frame_not_visible');}}current=current.parent;}}
 const text=(value,max)=>typeof value==='string'?value.trim().slice(0,max):'';
 const seen=new Set();
 const titleCandidates=(Array.isArray(result.titleCandidates)?result.titleCandidates:[])
@@ -914,6 +915,35 @@ const titleCandidates=(Array.isArray(result.titleCandidates)?result.titleCandida
  }).slice(0,50);
 return {company:text(result.companyGuess,255),titles:titleCandidates.map(item=>item.title),records:titleCandidates,url:location.href};
 })()`;
+}
+
+function mergeApplicationContexts(samples, pageUrl, allowedFrameOrigins = []) {
+  const expected = new URL(pageUrl);
+  const allowed = new Set([expected.origin, ...allowedFrameOrigins]);
+  const valid = (Array.isArray(samples) ? samples : []).filter(sample => {
+    try {
+      const url = new URL(sample.frameUrl);
+      return Number.isSafeInteger(sample.frameId) && sample.frameId >= 0 && allowed.has(url.origin) &&
+        sample.result?.url === sample.frameUrl && Array.isArray(sample.result.titles) && Array.isArray(sample.result.records);
+    } catch { return false; }
+  }).sort((a,b) => Number(a.frameId !== 0) - Number(b.frameId !== 0) || a.frameId - b.frameId);
+  const company = valid.find(sample => sample.frameId === 0 && sample.result.company)?.result.company
+    || valid.find(sample => sample.result.company)?.result.company || '';
+  const records = new Map();
+  for (const sample of valid) for (const row of sample.result.records.slice(0,50)) {
+    if (records.size >= 50) break;
+    if (!row || typeof row.title !== 'string' || !row.title.trim() || row.title.length > 512 ||
+        typeof row.date !== 'string' || row.date.length > 40 || typeof row.sourceStatus !== 'string' || row.sourceStatus.length > 100) continue;
+    const title = row.title.trim();
+    const key = title.normalize('NFKC').replace(/\s+/g,' ').toLocaleLowerCase();
+    const prior = records.get(key);
+    const candidate = {title, date:row.date.trim(), sourceStatus:row.sourceStatus.trim()};
+    if (!prior) records.set(key,candidate);
+    else records.set(key,{title:prior.title,date:prior.date||candidate.date,sourceStatus:prior.sourceStatus||candidate.sourceStatus});
+    if (records.size >= 50) break;
+  }
+  const merged = [...records.values()];
+  return {company, titles:merged.map(row=>row.title), records:merged, url:expected.href};
 }
 
 function buildScanScript(bundle, profile, context) {
@@ -932,7 +962,12 @@ const result=await state.dispatch({type:'RESUME_SCAN',resume});
 if(!result || result.ok!==true) throw new Error('filler_scan_failed');
 if(${browserEngines.has(bundle)}){
  result.candidates=(result.missingFields||[]).map(m=>({...m,label:m.label||m.ariaLabel||m.placeholder||m.name||'',reason:'filler_answer_missing',customAnswerSupported:true}));
- result.attachments=(result.manualFields||[]).filter(m=>/简历|resume|curriculum/i.test(m.label||'')&&!/证件|照片|photo|certificate/i.test(m.label||''))
+ result.attachments=(result.manualFields||[]).filter(m=>{
+  const identity=[m.label,m.ariaLabel,m.placeholder].filter(Boolean).join(' ');
+  if(/其他附件|获奖|证明|证书|成绩单|作品集|作品|材料|照片|图片|视频|音频|证件|photo|certificate/i.test(identity))return false;
+  if(/导入|一键|智能解析|自动解析|自动填充|识别解析/.test(identity))return false;
+  return /简历|resume|curriculum|\\bcv\\b/i.test([identity,m.section,m.context].filter(Boolean).join(' '));
+ })
   .filter(m=>safeCandidate(m,find(m))).map(m=>({...m,accept:find(m).accept||'',multiple:Boolean(find(m).multiple)}));
  result.candidates.push(...(result.manualFields||[]).filter(m=>!result.attachments.some(a=>a.fieldId===m.fieldId))
   .map(m=>({...m,label:m.label||m.ariaLabel||m.placeholder||m.name||'',reason:'filler_attachment_unsupported',customAnswerSupported:false})));
@@ -1016,9 +1051,23 @@ const rebaseCascade=async entry=>{
  status=optionState(refreshed);
  return status==='ready'?{entry:refreshed}:{reason:status};
 };
+const rebaseReplaced=entry=>{
+ if(entry.element.isConnected)return null;
+ const replacements=Array.from(document.querySelectorAll('[data-local-resume-field-id]'))
+  .filter(element=>element.getAttribute('data-local-resume-field-id')===entry.assignment.fieldId);
+ if(replacements.length!==1)return null;
+ const element=replacements[0];
+ if(!safe(entry.assignment,element)||identity(element)!==entry.identity||current(element)!==entry.value
+  ||semantics(element)!==entry.semantics)return null;
+ return snapshot(entry.assignment,element);
+};
 for(let index=0;index<entries.length;index++){
  await new Promise(resolve=>setTimeout(resolve,0));
  let entry=entries[index];
+ if(!validate(entry)&&results.some(item=>item.ok)){
+  const replaced=rebaseReplaced(entry);
+  if(replaced)entries[index]=entry=replaced;
+ }
  if(${builtins.has(bundle)}&&results.some(item=>item.ok)&&entry.element.tagName==='SELECT'
   &&(!validate(entry)||optionState(entry)==='filler_option_missing')){
   const refreshed=await rebaseCascade(entry);
@@ -1054,7 +1103,13 @@ for(let index=0;index<entries.length;index++){
   break;
  }
  const ok=Boolean(result&&result.ok===true&&result.filled===1);
- results.push({fieldId:entry.assignment.fieldId,ok,reason:ok?'filled':result?.reason||'filler_field_failed',status:ok?'filled':'failed'});
+ const detail=Array.isArray(result?.results)?result.results.find(item=>item.fieldId===entry.assignment.fieldId):null;
+ const detailReason=String(detail?.reason||'');
+ const reason=/没有对应选项|找不到对应.*选项|没有可选|没有找到|无法选择/.test(detailReason)?'filler_option_missing':
+  /未保持|未更新|未接受|没有保存|未检测到选中/.test(detailReason)?'filler_field_not_accepted':
+  /结构已经变化|重新扫描/.test(detailReason)?'filler_field_changed_rescan':
+  /不支持|没有可用.*输入/.test(detailReason)?'filler_custom_control_unsupported':'filler_field_failed';
+ results.push({fieldId:entry.assignment.fieldId,ok,reason:ok?'filled':result?.reason||reason,status:ok?'filled':'failed'});
 }
 return {ok:!cancelled&&(${builtins.has(bundle)}?results.every(r=>r.ok):true),filled:results.filter(r=>r.ok).length,failed:results.filter(r=>!r.ok&&r.status!=='skipped').map(r=>r.fieldId),skipped:results.filter(r=>r.status==='skipped').map(r=>r.fieldId),code:cancelled?'filler_fill_cancelled':results.every(r=>r.ok)?'filler_fill_complete':'filler_fill_partial',results};
 }finally{
@@ -1271,5 +1326,5 @@ return el;
 })()`;
 }
 
-module.exports = { SOURCE_FILES, loadLocalFiller, loadBundledFiller, loadDesktopFiller, parseProfileJson, parseLegacyProfile, buildApplicationContextScript,
+module.exports = { SOURCE_FILES, loadLocalFiller, loadBundledFiller, loadDesktopFiller, parseProfileJson, parseLegacyProfile, buildApplicationContextScript, mergeApplicationContexts,
   buildScanScript, buildFillScript, buildUndoScript, buildCancelScript, buildPrepareScript, buildUploadScript, buildUploadStatusScript, buildUploadTargetScript, aggregateFrameScans };

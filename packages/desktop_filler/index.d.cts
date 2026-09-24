@@ -104,6 +104,8 @@ export interface ApplicationContext { company: string; titles: string[]; url: st
   records: {title: string; date: string; sourceStatus: string}[]; }
 /** Read-only original-plugin discovery; no profile, saved applications or status writes. */
 export function buildApplicationContextScript(bundle: LocalFillerBundle, context?: FrameContext): string;
+/** Deduplicates trusted per-frame discovery results; only top/same-origin or explicitly allowed origins contribute. */
+export function mergeApplicationContexts(samples: {frameId:number; frameUrl:string; result:ApplicationContext}[], pageUrl:string, allowedFrameOrigins?:string[]): ApplicationContext;
 /** Raw resume object JSON, not the matching CandidateProfile projection. */
 export function parseProfileJson(text: string): ResumeProfile;
 /** Data-literal export only: globalThis.DEFAULT_RESUME or globalThis.LOCAL_RESUME_DATA. */

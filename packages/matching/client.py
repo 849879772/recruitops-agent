@@ -137,7 +137,7 @@ class DeepSeekClient:
         self.api_style = api_style
         self.endpoint = _validated_endpoint(endpoint)
         self.timeout = max(1.0, min(float(timeout), 180.0))
-        self.max_tokens = max(128, min(int(max_tokens), 4_000))
+        self.max_tokens = max(128, min(int(max_tokens), 8_000))
         if reasoning_effort not in {"low", "medium", "high", "max"}:
             raise ValueError("reasoning_effort must be low, medium, high, or max")
         self.thinking_enabled = bool(thinking_enabled)
@@ -216,16 +216,33 @@ class DeepSeekClient:
             "x-api-key": self.api_key,
         }
         if self.api_style == "openai":
+            structured_prompt = system_prompt
+            if output_schema is not None:
+                structured_prompt += (
+                    "\nReturn one JSON object matching this complete schema. "
+                    "Include every required field and every value/evidence pair; use null or empty arrays "
+                    "only where the schema permits. Do not omit fields to save tokens. Schema: "
+                    + json.dumps(output_schema, ensure_ascii=False, separators=(",", ":"))
+                )
             payload = {
                 "model": self.model,
                 "max_tokens": payload["max_tokens"],
                 "messages": [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": structured_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 "response_format": {"type": "json_object"},
                 "stream": False,
             }
+            # Chat Completions uses DeepSeek's thinking toggle, not the
+            # Responses/Anthropic reasoning object. Also support named
+            # DeepSeek models behind compatible gateways without adding
+            # provider-specific fields to unrelated OpenAI-compatible models.
+            if (urlparse(self.endpoint).hostname == "api.deepseek.com"
+                    or self.model.casefold().split("/")[-1].startswith("deepseek-")):
+                payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
+                if thinking_enabled:
+                    payload["reasoning_effort"] = "max" if self.reasoning_effort == "max" else "high"
             headers = {"Authorization": f"Bearer {self.api_key}",
                        "content-type": "application/json"}
         for attempt in range(1, self.max_attempts + 1):

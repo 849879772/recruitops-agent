@@ -267,8 +267,9 @@ class JobBrowsePage(StrictModel):
     total: int = Field(ge=0)
     limit: int = Field(ge=1)
     offset: int = Field(ge=0)
-    stats: JobBrowseStats
-    facets: JobBrowseFacets
+    stats: JobBrowseStats | None
+    facets: JobBrowseFacets | None
+    summary_included: bool = True
 
 
 class ApplicationPage(StrictModel):
@@ -276,3 +277,5 @@ class ApplicationPage(StrictModel):
     total: int = Field(ge=0)
     limit: int = Field(ge=1)
     offset: int = Field(ge=0)
+    stage_counts: dict[str, int] = Field(default_factory=dict)
+    unfiltered_total: int = Field(default=0, ge=0)

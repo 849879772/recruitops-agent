@@ -66,6 +66,8 @@ class ApprovedWriteAdapter(Protocol):
 
     def create_schedule(self, payload: dict[str, Any]) -> WriteEffect: ...
 
+    def bind_recruitment_mail(self, payload: dict[str, Any]) -> WriteEffect: ...
+
 
 class ApprovedWriteExecutor:
     """Claim, execute, and consume one approved token with an audited write."""
@@ -245,6 +247,7 @@ class ApprovedWriteExecutor:
             OperationName.APPLICATION_CREATE: "create_application",
             OperationName.APPLICATION_STAGE_UPDATE: "update_application_stage",
             OperationName.SCHEDULE_CREATE: "create_schedule",
+            OperationName.RECRUITMENT_MAIL_BINDING: "bind_recruitment_mail",
         }
         handler = getattr(self.adapter, handler_names[operation])
         return handler(payload)

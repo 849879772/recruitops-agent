@@ -116,11 +116,34 @@ export class FillerService {
     return this.executor.execute(wc, frame, code);
   }
 
-  async readApplicationContext(wc: WebContents, instanceId: string): Promise<Adapter.ApplicationContext> {
+  async readApplicationContext(wc: WebContents, instanceId: string, allowedFrameOrigins: string[] = []): Promise<Adapter.ApplicationContext> {
     const operation = this.begin(wc, 'reading');
-    const route = this.route(wc, wc.mainFrame, instanceId);
-    const result = await this.bounded(operation, this.execute(wc, wc.mainFrame,
-      this.adapter.buildApplicationContextScript(this.bundle, route))) as Adapter.ApplicationContext;
+    const top = wc.mainFrame;
+    const topUrl = new URL(operation.binding.url);
+    const allowed = new Set([topUrl.origin]);
+    for (const origin of allowedFrameOrigins.slice(0, 32)) {
+      try { const parsed = new URL(origin); if (parsed.origin === origin && ['http:', 'https:'].includes(parsed.protocol)) allowed.add(origin); } catch { /* ignore malformed grants */ }
+    }
+    const frames = top.framesInSubtree.slice(0, 32);
+    const task = Promise.all(frames.map(async frame => {
+      if (frame.detached) return null;
+      let frameUrl: URL;
+      try { frameUrl = new URL(frame.url); } catch { return null; }
+      if (frame !== top && !allowed.has(frameUrl.origin)) return null;
+      const route = this.route(wc, frame, instanceId);
+      try {
+        const result = await this.execute(wc, frame, this.adapter.buildApplicationContextScript(this.bundle, route)) as Adapter.ApplicationContext;
+        if (!result || result.url !== frame.url || typeof result.company !== 'string' || result.company.length > 255 ||
+            !Array.isArray(result.titles) || result.titles.length > 50 ||
+            result.titles.some(title => typeof title !== 'string' || !title.trim() || title.length > 512) ||
+            !Array.isArray(result.records) || result.records.length !== result.titles.length ||
+            result.records.some((row,index) => !row || row.title !== result.titles[index] ||
+              typeof row.date !== 'string' || row.date.length > 40 || typeof row.sourceStatus !== 'string' || row.sourceStatus.length > 100)) return null;
+        return {frameId: frame === top ? 0 : frame.routingId, frameUrl: frame.url, result};
+      } catch { return null; }
+    }));
+    const samples = await this.bounded(operation, task) as ({frameId:number;frameUrl:string;result:Adapter.ApplicationContext}|null)[];
+    const result = this.adapter.mergeApplicationContexts(samples.filter((sample): sample is NonNullable<typeof sample> => !!sample), operation.binding.url, [...allowed]);
     if (!result || result.url !== operation.binding.url || typeof result.company !== 'string' || result.company.length > 255 ||
         !Array.isArray(result.titles) || result.titles.length > 50 ||
         result.titles.some(title => typeof title !== 'string' || !title.trim() || title.length > 512) ||

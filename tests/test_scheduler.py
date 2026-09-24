@@ -84,6 +84,24 @@ def test_daily_task_allows_only_agent_owned_writes(tmp_path: Path) -> None:
     assert received[0].write_enabled is True
 
 
+def test_cooperative_timeout_waits_for_checkpoint_drain_before_terminal_result(tmp_path: Path) -> None:
+    task = _demo_task(timeout_seconds=0.01, cooperative_timeout=True)
+    scheduler = _scheduler(tmp_path, task)
+    drained = Event()
+
+    def handler(context: TaskContext) -> dict[str, str]:
+        assert context.stop_requested.wait(1)
+        time_module.sleep(0.02)
+        drained.set()
+        return {"status": "paused"}
+
+    result = scheduler.run("demo", handler, now=NOW, scheduled_for=NOW)
+
+    assert result.status is RunStatus.PAUSED
+    assert drained.is_set()
+    assert scheduler.run("demo", lambda _: {"status": "completed"}, now=NOW, scheduled_for=NOW).status is RunStatus.SUCCESS
+
+
 def test_injected_handler_receives_read_only_context_and_no_store(tmp_path: Path) -> None:
     received: list[TaskContext] = []
 

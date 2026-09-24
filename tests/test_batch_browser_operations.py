@@ -283,7 +283,7 @@ def test_full_review_checkpoints_exact_scope_without_reopening_completed_pages(
             from packages.storage import AgentStateStore
             AgentStateStore(repository.storage).recover_interrupted_task_runs()
             recovered = await batch_observe_application_status(
-                BatchObserveApplicationStatusInput(all_non_terminal=True), object(), resumed_repository,
+                BatchObserveApplicationStatusInput(run_id=run_id), object(), resumed_repository,
             )
             assert recovered.summary["run_id"] == run_id
         for _ in range(active_count):
@@ -365,9 +365,9 @@ def test_full_review_retains_completed_pages_when_wave_times_out(tmp_path, monke
         assert result.summary["retryable_count"] == 1
         assert result.summary["remaining_count"] == 1
         run_id = result.summary["run_id"]
-        # An accidental all-mode retry reuses the incomplete scope.
+        # Only an explicit run_id resumes the incomplete scope.
         resumed = await batch_observe_application_status(
-            BatchObserveApplicationStatusInput(all_non_terminal=True), object(), repository,
+            BatchObserveApplicationStatusInput(run_id=run_id), object(), repository,
         )
         assert resumed.summary["run_id"] == run_id
         assert resumed.summary["scope_complete"] is True
@@ -402,11 +402,10 @@ def test_full_review_does_not_duplicate_an_in_flight_wave(tmp_path, monkeypatch)
         busy = await batch_observe_application_status(
             BatchObserveApplicationStatusInput(all_non_terminal=True), object(), repository,
         )
-        assert busy.summary["in_progress"] is True
-        assert busy.summary["scope_complete"] is False
+        assert busy.success is False
+        assert "already in progress" in busy.error_message
         release.set()
         finished = await first
-        assert finished.summary["run_id"] == busy.summary["run_id"]
         assert finished.summary["scope_complete"] is True
 
     asyncio.run(run())

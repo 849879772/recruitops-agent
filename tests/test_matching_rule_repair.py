@@ -451,6 +451,9 @@ class _FakeMatchingClient:
                         }
                     ],
                     "summary": "提前批岗位通过确定性规则并进入分析。",
+                    "missing_core_requirements": [],
+                    "advantages": [],
+                    "gaps": [],
                 },
                 ensure_ascii=False,
             ),

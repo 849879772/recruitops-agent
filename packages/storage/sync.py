@@ -7,7 +7,7 @@ import hashlib
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import and_, insert, select, update
+from sqlalchemy import and_, case, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -49,6 +49,8 @@ def _upsert(
     values: dict[str, Any],
     *,
     conflict_columns: tuple[str, ...],
+    update_where: Any = None,
+    update_overrides: Mapping[str, Any] | None = None,
 ) -> None:
     """Use a native PostgreSQL/SQLite upsert, with a portable fallback."""
 
@@ -63,7 +65,11 @@ def _upsert(
         if update_values:
             statement = statement.on_conflict_do_update(
                 index_elements=list(conflict_columns),
-                set_={key: getattr(statement.excluded, key) for key in update_values},
+                set_={
+                    **{key: getattr(statement.excluded, key) for key in update_values},
+                    **(update_overrides or {}),
+                },
+                where=update_where,
             )
         else:
             statement = statement.on_conflict_do_nothing(
@@ -76,7 +82,11 @@ def _upsert(
         if update_values:
             statement = statement.on_conflict_do_update(
                 index_elements=list(conflict_columns),
-                set_={key: getattr(statement.excluded, key) for key in update_values},
+                set_={
+                    **{key: getattr(statement.excluded, key) for key in update_values},
+                    **(update_overrides or {}),
+                },
+                where=update_where,
             )
         else:
             statement = statement.on_conflict_do_nothing(
@@ -90,7 +100,10 @@ def _upsert(
     exists = session.execute(select(identity_column).where(and_(*predicates))).first()
     if exists:
         if update_values:
-            session.execute(update(table).where(and_(*predicates)).values(**update_values))
+            statement = update(table).where(and_(*predicates))
+            if update_where is not None:
+                statement = statement.where(update_where)
+            session.execute(statement.values(**{**update_values, **(update_overrides or {})}))
     else:
         session.execute(insert(table).values(**values))
 
@@ -205,6 +218,7 @@ def upsert_job_snapshot(
     capture_failure_reason: str | None = None,
     availability_status: str | None = None,
     title_key: str | None = None,
+    preserve_existing_score: bool = False,
 ) -> None:
     values = {
         **_audit_values(job),
@@ -217,7 +231,7 @@ def upsert_job_snapshot(
         "cohort": job.cohort,
         "cohort_status": job.cohort_status,
         "batch": job.batch.value,
-        "match_score": job.match_score,
+        "match_score": None if preserve_existing_score else job.match_score,
         "first_seen_at": job.first_seen_at,
         "last_seen_at": job.last_seen_at,
         "organization_id": job.organization_id,
@@ -249,7 +263,17 @@ def upsert_job_snapshot(
     if stored_title_key is not None:
         normalized_title_key = str(stored_title_key).strip()
         values["title_key"] = normalized_title_key or None
-    _upsert(session, JobSnapshot.__table__, values, conflict_columns=("id",))
+    table = JobSnapshot.__table__
+    # Failed rescoring must use the current stored score, not a stale caller's
+    # snapshot. The CASE is evaluated atomically by the conflict update.
+    overrides = None
+    if preserve_existing_score:
+        overrides = {
+            "match_score": case(
+                (table.c.match_score.between(0, 100), table.c.match_score), else_=None
+            )
+        }
+    _upsert(session, table, values, conflict_columns=("id",), update_overrides=overrides)
 
 
 def upsert_job_analysis_snapshot(
@@ -257,10 +281,11 @@ def upsert_job_analysis_snapshot(
     job: Job,
     analysis: JobAnalysis,
 ) -> None:
+    scoring_failed = analysis.analysis_status in {"failed", "refused"}
     values = {
         **_audit_values(job, source_ref=f"{job.source_ref or job.id}:analysis"),
         "job_id": job.id,
-        "match_score": analysis.match_score,
+        "match_score": None if scoring_failed else analysis.match_score,
         "advantages": json.dumps(analysis.advantages, ensure_ascii=False),
         "gaps": json.dumps(analysis.gaps, ensure_ascii=False),
         "summary": analysis.summary,
@@ -283,7 +308,19 @@ def upsert_job_analysis_snapshot(
         "error_code": analysis.error_code,
         "analyzed_at": analysis.analyzed_at,
     }
-    _upsert(session, JobAnalysisSnapshot.__table__, values, conflict_columns=("job_id",))
+    table = JobAnalysisSnapshot.__table__
+    # A stale scoring plan can finish after another run has saved a valid score.
+    # Keep that completed analysis rather than replacing it with a failed attempt.
+    update_where = None
+    if scoring_failed:
+        update_where = or_(
+            table.c.analysis_status.is_(None),
+            table.c.analysis_status != "complete",
+            table.c.match_score.is_(None),
+            table.c.match_score < 0,
+            table.c.match_score > 100,
+        )
+    _upsert(session, table, values, conflict_columns=("job_id",), update_where=update_where)
 
 
 def upsert_application_snapshot(session: Session, application: Application) -> None:
@@ -366,6 +403,10 @@ def upsert_job_detail_snapshot(
         capture_failure_reason=capture_failure_reason,
         availability_status=availability_status,
         title_key=title_key,
+        preserve_existing_score=(
+            detail.analysis is not None
+            and detail.analysis.analysis_status in {"failed", "refused"}
+        ),
     )
     if detail.analysis is not None:
         upsert_job_analysis_snapshot(session, detail.job, detail.analysis)

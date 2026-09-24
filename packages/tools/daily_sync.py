@@ -13,11 +13,17 @@ from .typed import EvidenceSource, ToolErrorCode, ToolInput, ToolModel, ToolResp
 
 
 class DailyRecruitmentSyncInput(ToolInput):
+    thread_id: str | None = Field(default=None, min_length=1, max_length=255)
+    turn_id: str | None = Field(default=None, min_length=1, max_length=255)
     dry_run: bool = False
     company_ids: list[str] = Field(default_factory=list, max_length=10)
     source_record_ids: list[str] = Field(default_factory=list, max_length=10)
     mode: Literal["full", "crawl_only", "score_only", "resume"] = "full"
     resume_run_id: str | None = Field(default=None, min_length=8, max_length=128)
+    company_batch_limit: int | None = Field(
+        default=None, ge=1, le=5000,
+        description="本轮最多尝试的公司数；达到上限后保存断点并暂停，后续用 resume 继续原范围。",
+    )
 
     @field_validator("company_ids", "source_record_ids")
     @classmethod
@@ -42,6 +48,8 @@ class DailyRecruitmentSyncInput(ToolInput):
             raise ValueError("resume_run_id is only valid for resume mode")
         if self.company_ids and self.source_record_ids:
             raise ValueError("company_ids and source_record_ids cannot be combined")
+        if self.company_batch_limit and self.mode == "score_only":
+            raise ValueError("company_batch_limit is only valid for crawl modes")
         return self
 
 
@@ -54,10 +62,12 @@ class DailyRecruitmentSyncData(ToolModel):
     source_record_ids: list[str] = Field(default_factory=list)
     mode: Literal["full", "crawl_only", "score_only", "resume"] = "full"
     resume_run_id: str | None = None
+    company_batch_limit: int | None = None
     result: Any = None
     error: str | None = None
     current_step: str | None = None
     step_count: int = Field(default=0, ge=0)
+    progress: dict[str, Any] | None = None
 
 
 class DailyRecruitmentSyncResponse(ToolResponse[DailyRecruitmentSyncData]):
@@ -122,12 +132,15 @@ def run_daily_recruitment_sync(
     runner: OperationalTaskRunner,
 ) -> DailyRecruitmentSyncResponse:
     operation_request = OperationalTaskRunInput(
+        thread_id=request.thread_id,
+        turn_id=request.turn_id,
         task_id=TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value,
         dry_run=request.dry_run,
         company_ids=request.company_ids,
         source_record_ids=request.source_record_ids,
         mode=request.mode,
         resume_run_id=request.resume_run_id,
+        company_batch_limit=request.company_batch_limit,
         timeout_ms=request.timeout_ms,
     )
     result = (
@@ -161,6 +174,7 @@ def run_daily_recruitment_sync(
             source_record_ids=result.data.source_record_ids,
             mode=result.data.mode,
             resume_run_id=result.data.resume_run_id,
+            company_batch_limit=result.data.company_batch_limit,
             result=result.data.result,
             error=result.data.error,
             current_step=None,
@@ -209,10 +223,12 @@ def get_daily_recruitment_sync_status(
             source_record_ids=list(payload.get("source_record_ids") or []),
             mode=payload.get("mode") or "full",
             resume_run_id=payload.get("resume_run_id"),
+            company_batch_limit=payload.get("company_batch_limit"),
             result=_compact_status_result(payload.get("result")),
             error=payload.get("error"),
             current_step=payload.get("current_step"),
             step_count=int(payload.get("step_count") or 0),
+            progress=payload.get("progress"),
         ),
         evidence=[
             EvidenceSource(source="agent_daily_sync", source_ref=f"run:{request.run_id}")

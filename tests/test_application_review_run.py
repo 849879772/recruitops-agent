@@ -74,6 +74,36 @@ def _review_input(run_id: str | None = None):
             else BatchObserveApplicationStatusInput(run_id=run_id))
 
 
+@pytest.mark.parametrize("count", [0, 51, 86, 120])
+def test_full_review_scope_is_not_the_database_task_step_budget(tmp_path, monkeypatch, count):
+    repository = _repository(tmp_path, count)
+    visited = []
+
+    async def observe(request, *_):
+        visited.extend(request.application_ids)
+        return _part(request, {item: ("unchanged", None) for item in request.application_ids})
+
+    monkeypatch.setattr(review, "batch_observe_application_status", observe)
+
+    async def run():
+        result = await review.continue_application_review(_review_input(), object(), repository)
+        while result.summary["continuation_required"]:
+            assert result.summary["scope_total"] == count
+            result = await review.continue_application_review(
+                _review_input(result.summary["run_id"]), object(), repository,
+            )
+        assert result.summary["completed_count"] == count
+        assert result.summary["remaining_count"] == 0
+        assert result.success
+        with repository.storage.session() as session:
+            task = session.get(TaskRun, result.summary["run_id"])
+            assert task.max_steps == 1 and task.step_count == 1
+            assert task.current_step == f"{count}/{count}"
+
+    asyncio.run(run())
+    assert len(visited) == len(set(visited)) == count
+
+
 def test_review_wave_caps_global_concurrency_and_serializes_child_batches(tmp_path, monkeypatch):
     repository = _repository(tmp_path, 10)
     active = peak = 0
@@ -115,7 +145,13 @@ def test_review_resumes_across_ten_page_waves_with_unique_counts(tmp_path, monke
         assert first.summary["completed_count"] == 10
         assert first.summary["remaining_count"] == 2
         assert first.summary["scope_complete"] is False
+        assert first.summary["run_status"] == "awaiting_continuation"
+        assert first.summary["continuation_required"] is True
         run_id = first.summary["run_id"]
+        with repository.storage.session() as session:
+            task = session.get(TaskRun, run_id)
+            assert task.step_count == 0 and task.max_steps == 1
+            assert task.current_step == "10/12"
 
         second = await review.continue_application_review(
             _review_input(run_id), object(), repository,
@@ -124,12 +160,61 @@ def test_review_resumes_across_ten_page_waves_with_unique_counts(tmp_path, monke
         assert second.summary["processed_count"] == 12
         assert second.summary["completed_count"] == 12
         assert second.summary["scope_complete"] is True
+        assert second.summary["continuation_required"] is False
         assert second.summary["verification_success_count"] == 12
         assert second.success is True
 
     asyncio.run(run())
     assert len(visited) == 12
     assert len(set(visited)) == 12
+
+
+def test_new_review_uses_current_snapshot_instead_of_stopped_checkpoint(tmp_path, monkeypatch):
+    repository = _repository(tmp_path, 1)
+    visited = []
+
+    async def observe(request, *_):
+        visited.extend(request.application_ids)
+        return _part(request, {item: ("unchanged", None) for item in request.application_ids})
+
+    monkeypatch.setattr(review, "batch_observe_application_status", observe)
+    first = asyncio.run(review.continue_application_review(_review_input(), object(), repository))
+    with repository.storage.write_transaction() as session:
+        session.get(TaskRun, first.summary["run_id"]).status = "stopped"
+        session.add(ApplicationSnapshot(
+            id="new", company_name="新公司", job_title="新岗位",
+            record_url="https://new.example/applications", stage="applied",
+            idempotency_key="application:new", stage_history=[], source="test", source_ref="new",
+        ))
+
+    second = asyncio.run(review.continue_application_review(_review_input(), object(), repository))
+    assert second.summary["run_id"] != first.summary["run_id"]
+    assert second.summary["database_total"] == 2
+    assert second.summary["scope_total"] == 2
+    assert second.summary["verification_success_count"] == 2
+    assert visited.count("0") == 2
+    assert visited.count("new") == 1
+
+
+def test_new_review_does_not_replay_active_lease(tmp_path, monkeypatch):
+    repository = _repository(tmp_path, 1)
+
+    async def observe(request, *_):
+        return _part(request, {item: ("unchanged", None) for item in request.application_ids})
+
+    monkeypatch.setattr(review, "batch_observe_application_status", observe)
+    first = asyncio.run(review.continue_application_review(_review_input(), object(), repository))
+    with repository.storage.write_transaction() as session:
+        checkpoint = session.get(ToolCall, first.summary["run_id"])
+        checkpoint.arguments = {**checkpoint.arguments, "lease_until": review.time() + 60}
+        session.get(TaskRun, first.summary["run_id"]).status = "stopped"
+
+    second = asyncio.run(review.continue_application_review(_review_input(), object(), repository))
+    assert second.success is False
+    assert second.total == 1
+    assert second.summary["active_run_id"] == first.summary["run_id"]
+    with repository.storage.session() as session:
+        assert len(session.scalars(select(ToolCall)).all()) == 1
 
 
 def test_review_retries_transient_failure_for_same_run_id(tmp_path, monkeypatch):
@@ -150,6 +235,7 @@ def test_review_retries_transient_failure_for_same_run_id(tmp_path, monkeypatch)
         assert first.summary["completed_count"] == 0
         assert first.summary["remaining_count"] == 1
         assert first.summary["retryable_count"] == 1
+        assert first.summary["pending_unattempted_count"] == 0
         assert first.summary["scope_complete"] is False
         assert first.success is False
 
@@ -305,3 +391,80 @@ def test_review_cancel_drains_children_before_releasing_checkpoint(tmp_path, mon
                 assert task.error_code == "review_wave_cancelled"
 
     asyncio.run(run())
+
+
+def test_review_attempts_and_remaining_do_not_double_count_progress():
+    state = {
+        "ids": [str(i) for i in range(86)], "database_total": 88,
+        "excluded_terminal": 2, "pages_total": 10, "run_status": "awaiting_continuation",
+        "results": {str(i): {"state": "unchanged" if i < 12 else "unresolved" if i < 14 else "failed",
+                             "reason": None if i < 14 else "observation_timeout", "elapsed_ms": 0}
+                    for i in range(16)},
+        "attempts": {str(i): 1 for i in range(16)},
+    }
+    summary = review._response("status-review-" + "a" * 32, state, review.perf_counter()).summary
+    assert summary["processed_count"] == 16
+    assert summary["completed_count"] == 14
+    assert summary["remaining_count"] == 72
+    assert summary["pending_unattempted_count"] == 70
+    assert summary["retryable_count"] == 2
+    assert summary["completed_count"] + summary["remaining_count"] == summary["scope_total"]
+    assert summary["continuation_required"] is True
+
+
+def test_legacy_background_flag_waits_for_actual_wave_result(tmp_path, monkeypatch):
+    repository = _repository(tmp_path, 1)
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def observe(request, *_):
+            entered.set()
+            await release.wait()
+            return _part(request, {item: ("unchanged", None) for item in request.application_ids})
+        monkeypatch.setattr(review, "batch_observe_application_status", observe)
+        pending = asyncio.create_task(review.continue_application_review(
+            BatchObserveApplicationStatusInput(all_non_terminal=True, background=True), object(), repository))
+        await entered.wait()
+        assert not pending.done()
+        release.set()
+        result = await pending
+        assert result.summary["run_status"] == "completed"
+        assert result.summary["background"] is False
+        assert not result.summary["continuation_required"]
+        assert result.summary["completed_count"] == 1
+    asyncio.run(run())
+
+
+def test_wave_timeout_requests_foreground_continuation_but_real_error_does_not(tmp_path, monkeypatch):
+    repository = _repository(tmp_path, 1)
+    monkeypatch.setattr(review, "_WAVE_TIMEOUT_SECONDS", 0.02)
+    async def slow(*_):
+        await asyncio.Event().wait()
+    monkeypatch.setattr(review, "batch_observe_application_status", slow)
+    first = asyncio.run(review.continue_application_review(_review_input(), object(), repository))
+    assert first.summary["wave_error"] == "review_wave_timeout"
+    assert first.summary["run_status"] == "awaiting_continuation"
+    assert first.summary["continuation_required"] is True
+    async def broken(*_):
+        raise RuntimeError("fixture error")
+    monkeypatch.setattr(review, "batch_observe_application_status", broken)
+    second = asyncio.run(review.continue_application_review(_review_input(first.summary["run_id"]), object(), repository))
+    assert second.summary["wave_error"] == "review_wave_failed"
+    assert second.summary["run_status"] == "stopped"
+    assert second.summary["continuation_required"] is False
+
+
+@pytest.mark.parametrize("status,control,busy,expected,forbidden", [
+    ("running", None, True, "正在执行", "意外中断"),
+    ("paused", "pause", False, "用户已请求暂停", "同一个 run_id 继续"),
+    ("cancelled", "cancel", False, "不得续跑", "同一个 run_id 继续"),
+    ("stopped", None, False, "意外中断", "同一个 run_id 继续"),
+    ("awaiting_continuation", None, False, "同一个 run_id 继续", "意外中断"),
+])
+def test_response_directs_only_safe_continuation(status, control, busy, expected, forbidden):
+    state = {"ids": ["0"], "results": {}, "database_total": 1, "excluded_terminal": 0,
+             "pages_total": 0, "run_status": status, "control_request": control}
+    response = review._response("status-review-" + "a" * 32, state, review.perf_counter(), busy=busy)
+    assert expected in response.summary["next_action"]
+    assert forbidden not in response.summary["next_action"]
+    assert response.error_message == response.summary["next_action"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from enum import Enum
+from threading import Event
 from typing import Any, Callable, Mapping, TypeAlias
 
 
@@ -17,6 +18,7 @@ class RunStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
+    PAUSED = "paused"
     SKIPPED_LOCKED = "skipped_locked"
     DRY_RUN = "dry_run"
 
@@ -66,6 +68,8 @@ class TaskDefinition:
     misfire_grace_seconds: float = 900.0
     read_only: bool = True
     agent_write_enabled: bool = False
+    cooperative_timeout: bool = False
+    auto_continue_on_timeout: bool = False
 
     def __post_init__(self) -> None:
         if not self.task_id or self.task_id.strip() != self.task_id:
@@ -82,6 +86,8 @@ class TaskDefinition:
             raise ValueError("misfire_grace_seconds cannot be negative")
         if not self.read_only:
             raise ValueError("legacy recruitment source must remain read-only")
+        if self.auto_continue_on_timeout and not self.cooperative_timeout:
+            raise ValueError("automatic continuation requires cooperative timeout")
 
 
 @dataclass(frozen=True)
@@ -96,6 +102,9 @@ class TaskContext:
     read_only: bool = True
     write_enabled: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    stop_requested: Event = field(default_factory=Event, repr=False, compare=False)
+    budget_expired: Event = field(default_factory=Event, repr=False, compare=False)
+    segment: int = 1
 
 
 @dataclass(frozen=True)

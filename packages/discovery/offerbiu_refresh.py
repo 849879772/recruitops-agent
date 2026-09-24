@@ -30,6 +30,7 @@ def capture_offerbiu_snapshot(
     session: Any | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     scope: Mapping[str, Any] | None = None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Read a validated 2027 autumn-recruitment snapshot from the public API."""
 
@@ -116,6 +117,8 @@ def capture_offerbiu_snapshot(
                 for key in ("page", "size", "totalItems", "totalPages")
             })
             result["items"].extend(rows)
+            if progress_callback is not None:
+                progress_callback(page + 1, total_pages, len(result["items"]))
             if page + 1 >= total_pages:
                 result["complete"] = len(seen) == total_items
                 result["stop_reason"] = "complete" if result["complete"] else "total_mismatch"
@@ -153,6 +156,7 @@ class OfferBiuRefreshService:
         max_pages: int = 150,
         page_size: int = 9,
         delay_seconds: float = 0.25,
+        progress_callback: Callable[[int, int, int], None] | None = None,
     ) -> dict[str, Any]:
         snapshot = capture_offerbiu_snapshot(
             max_pages=max_pages,
@@ -160,6 +164,7 @@ class OfferBiuRefreshService:
             delay_seconds=delay_seconds,
             session=self.session,
             scope=self.scope,
+            progress_callback=progress_callback,
         )
         self.last_registered_ids = ()
         result: dict[str, Any] = {

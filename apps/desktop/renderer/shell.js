@@ -24,7 +24,10 @@ async function command(value) {
   try { const state=await window.desktop.command(value); if(state) render(state); return state; }
   catch (error) {
     $('notice').textContent = error.message; $('notice').style.display = 'block';
-    $('filler-ui-error').textContent='操作未完成：'+String(error.message).slice(0,250);$('filler-ui-error').hidden=false;
+    const errorText=String(error.message);
+    const friendly=/job_detail_not_progress/.test(errorText)?'岗位详情或岗位列表不能作为投递进度链接；清空链接后可先保存投递记录。':
+      /invalid_progress_url/.test(errorText)?'投递进度链接无效，请清空或填写有效的官网链接。':errorText.slice(0,250);
+    $('filler-ui-error').textContent='操作未完成：'+friendly;$('filler-ui-error').hidden=false;
     if(/^filler-profile-(?:save|create|select|rename|delete)$/.test(value.action)&&/stale_revision/.test(String(error.message))) {
       try { const state=await window.desktop.state(); if(state)render(state); } catch {}
     }
@@ -58,6 +61,14 @@ function canOneClick() {
   return !!tab&&!tab.loading&&!profileDirty&&!profileConflict&&(f.profile?.ready??f.profileReady)&&
     (f.pluginReady??f.available)&&allowed('scan')&&allowed('fill');
 }
+function bestResumeTarget(targets) {
+  const scored=targets.map(target=>{
+    const label=String(target.label||'');
+    const score=/附件简历|上传简历|简历附件/.test(label)?3:/简历|resume|\bcv\b/i.test(label)?2:0;
+    return {target,score};
+  }).sort((a,b)=>b.score-a.score);
+  return scored.length&&scored[0].score>0&&(!scored[1]||scored[0].score>scored[1].score)?scored[0].target:null;
+}
 async function oneClickFill() {
   if(!canOneClick())return;
   const run={context:fillContext(currentState),cancelled:false,reason:''};
@@ -84,6 +95,19 @@ async function oneClickFill() {
       oneClickFeedback='正在重新扫描当前页面…';
       f=await scan();if(!f)return;
     }
+    if($('filler-one-click-upload').checked&&f.attachment?.ready&&(f.attachmentTargets||[]).length) {
+      const targets=f.attachmentTargets||[];
+      const target=bestResumeTarget(targets);
+      if(!target || !allowed('attachment-upload',run)) {
+        oneClickFeedback=!target?'无法唯一确定简历上传位置，请手动选择附件目标；尚未填写。':'附件上传当前不可用；尚未填写。';
+        return;
+      }
+      oneClickFeedback='正在上传默认简历并等待网站确认…';
+      const uploaded=await fillerAction('attachment-upload',{scanId:f.scanId,fieldId:target.fieldId,confirmed:true},undefined,run);
+      if(!usable(uploaded)) {oneClickFeedback='简历附件上传未获确认，已停止后续填写；请检查网站页面。';return;}
+      oneClickFeedback='正在识别网站解析后的表单…';
+      f=await scan();if(!f)return;
+    }
     const fields=f.fields||[],matchable=fields.filter(field=>typeof field.fieldId==='string'&&field.fieldId&&field.fillable!==false&&!field.blocked);
     const fieldIds=[...new Set(matchable.map(field=>field.fieldId))];
     const unmatched=fields.filter(field=>!fieldIds.includes(field.fieldId));
@@ -108,6 +132,7 @@ async function oneClickFill() {
     if(!result)oneClickFeedback='填写请求未完成，已生效内容可能保留。'+oneClickFeedback;
   } finally {
     if(run.cancelled)oneClickFeedback=run.reason+oneClickFeedback;
+    if(oneClickRemaining.length)$('filler-advanced').open=true;
     oneClickRun=undefined;oneClickContext=fillContext(currentState);renderFiller(currentState);
   }
 }
@@ -123,7 +148,8 @@ const fillReasonLabels={
   filler_deadline_exceeded:'字段处理超时',filler_answer_conflict:'答案存在冲突',filler_answer_missing:'未找到匹配答案',
   filler_answer_label_ambiguous:'字段名称不唯一，不能安全映射',filler_answer_type_invalid:'答案类型不适用',
   filler_custom_control_unsupported:'自定义控件暂不支持',filler_attachment_unsupported:'仅支持已识别的简历附件',
-  filler_option_missing:'页面没有匹配选项',filler_scan_expired:'扫描已过期'
+  filler_option_missing:'页面没有匹配选项',filler_scan_expired:'扫描已过期',
+  filler_field_not_accepted:'网站没有保存填写结果'
 };
 function fillReason(reason) {
   return typeof reason==='string'&&/^filler_[a-z0-9_]{1,80}$/.test(reason)?(fillReasonLabels[reason]||'填写失败（'+reason.slice(7)+'）'):'未提供详细原因';
@@ -291,6 +317,7 @@ function renderFiller(state) {
     oneClickFeedback='';oneClickRemaining=[];oneClickContext='';
   }
   $('filler-one-click').disabled=!canOneClick();
+  $('filler-one-click-upload').disabled=!!oneClickRun||!f.attachment?.ready;
   $('filler-one-click-feedback').textContent=oneClickRun?.cancelled?oneClickRun.reason:oneClickFeedback;
   $('filler-one-click-feedback').hidden=!oneClickFeedback&&!oneClickRun?.cancelled;
   $('filler-remaining').replaceChildren();$('filler-remaining').hidden=!oneClickRemaining.length;
@@ -477,6 +504,13 @@ function renderFiller(state) {
   renderApplications(f);
 }
 function selectedApplications() { return applicationDrafts.filter(item=>item.selected&&!['saved','queued'].includes(item.result)); }
+function jobPageUrl(value) {
+  try {
+    const url=new URL(value),route=decodeURIComponent(url.pathname.replace(/\/+$/,'')+'/'+url.hash).toLowerCase()
+      .replace(/\/position\/application\/?(?=$|#)/g,'/applications/');
+    return /(?:^|[/#!_-])(?:job|jobs|position|positions|jobdetail|job-detail|detail|apply)(?:[/.?!_-]|$)/.test(route);
+  } catch { return false; }
+}
 function refreshApplicationSelection() {
   const selected=selectedApplications();
   $('filler-application-title').value=selected.length===1?selected[0].title:'';
@@ -493,7 +527,7 @@ function renderApplications(f) {
     if(first){
       $('filler-application-company').value=first.company||first.company_name||'';
       $('filler-application-title').value=first.title;
-      $('filler-application-url').value=first.recordUrl||'';
+      $('filler-application-url').value=jobPageUrl(first.recordUrl)?'':first.recordUrl||'';
       $('filler-application-city').value=first.city||'';
     }
     $('filler-application-confirm').checked=false;
@@ -554,10 +588,15 @@ function renderApplications(f) {
   }}
   $('filler-queue-count').textContent=String(application.pendingCount??queue.length);
   $('filler-application-flush').disabled=!allowed('application-flush')||!queue.length;
-  let urlValid=false;try {const url=new URL($('filler-application-url').value);urlValid=url.protocol==='https:'&&!url.username&&!url.password;}catch{}
+  const enteredUrl=$('filler-application-url').value.trim();
+  let urlValid=!enteredUrl;try {if(enteredUrl){const url=new URL(enteredUrl);urlValid=['http:','https:'].includes(url.protocol)&&!url.username&&!url.password&&!jobPageUrl(enteredUrl);}}catch{}
+  $('filler-application-url-note').textContent=enteredUrl&&!urlValid?'岗位详情或列表不是投递进度页；请清空或填写“我的投递”链接。':
+    !enteredUrl?'可先新增投递；没有进度链接时不会自动复核官网状态。':'';
   const hasTitles=applicationDrafts.length?selected.length>0&&selected.every(item=>item.title.trim()):!!$('filler-application-title').value.trim();
   $('filler-application-save').textContent=applicationDrafts.length?`确认新增 ${selected.length} 条投递`:'确认新增登记';
   $('filler-application-save').disabled=!allowed(selected.length>1?'application-save-batch':'application-save')||!$('filler-application-confirm').checked||!$('filler-application-company').value.trim()||!hasTitles||!urlValid;
+  $('filler-application-sync-page').disabled=!allowed('application-sync-page')||busy||!selected.length||
+    !$('filler-application-company').value.trim()||!selected.every(item=>item.sourceStatus&&item.title===candidates.find(row=>row.id===item.id)?.title);
 }
 function render(state) {
   currentState=state;
@@ -705,6 +744,9 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     return result;
   };
+  $('filler-application-sync-page').onclick=()=>fillerAction('application-sync-page',{
+    company:$('filler-application-company').value.trim(),candidateIds:selectedApplications().map(item=>item.id)
+  });
   $('filler-attachment-upload').onclick=()=>fillerAction('attachment-upload',{scanId:fillerScanId,fieldId:$('filler-upload-target').value});
   renderProfileEditor();setSidebarTab('scan');
   for (const action of ['home', 'workbench', 'back', 'forward', 'reload', 'clear-site', 'hide', 'quit', 'capture', 'use-capture']) $(action).onclick = () => command({ action });

@@ -46,6 +46,7 @@ def _model_payload() -> dict[str, Any]:
             }
         ],
         "advantages": ["有 C++ 项目证据"],
+        "missing_core_requirements": [],
         "gaps": [],
         "summary": "标题通过后使用详情进行评分。",
     }

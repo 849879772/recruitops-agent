@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from packages.orchestration import DailyRecruitmentSync, DailySyncStage, DailySyncStatus
+from packages.pipeline.daily import PipelineInterrupted
 
 
 class Clock:
@@ -78,6 +79,27 @@ def test_crawl_failure_stops_all_write_dependent_stages() -> None:
     assert result.status is DailySyncStatus.FAILED
     assert calls == []
     assert result.error == "RuntimeError: crawler registry failed"
+
+
+def test_crawl_pause_is_recoverable_and_skips_later_stages() -> None:
+    calls = []
+    state = StateStore()
+
+    def pause(_dry_run):
+        raise PipelineInterrupted("time budget reached")
+
+    result = DailyRecruitmentSync(
+        crawl=pause,
+        offline_reconcile=lambda *_args: calls.append("offline"),
+        report=lambda *_args: calls.append("report"),
+        state_store=state,
+    ).run(run_id="paused-run")
+
+    assert result.status is DailySyncStatus.PAUSED
+    assert result.error == "time_budget_reached"
+    assert calls == []
+    assert state.rows[-1].status.value == "stopped"
+    assert state.rows[-1].error_code == "time_budget_reached"
 
 
 def test_dry_run_propagates_to_crawl_and_offline_reconciliation() -> None:

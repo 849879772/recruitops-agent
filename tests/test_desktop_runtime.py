@@ -23,7 +23,7 @@ from packages.desktop_runtime.isolation import InstanceLock, PortLease, child_en
 from packages.desktop_runtime.instance import current_user_sid
 from packages.desktop_runtime.resources import Bundle, Layout, REQUIRED
 from packages.desktop_runtime.supervisor import Events, Supervisor
-from packages.desktop_runtime.windows import WindowsTree, create_restricted_token
+from packages.desktop_runtime.windows import SID_AND_ATTRIBUTES, WindowsTree, create_restricted_token
 
 
 @pytest.fixture
@@ -502,18 +502,74 @@ def test_windows_job_captures_child_output(tmp_path):
 def test_windows_job_launches_with_same_user_restricted_token(tmp_path):
     tree = WindowsTree(token_factory=create_restricted_token)
     marker = tmp_path / "restricted.txt"
+    output = tmp_path / "restricted.log"
     env = {key: value for key, value in os.environ.items() if key.upper() in {"SYSTEMROOT", "WINDIR"}}
     try:
         child = tree.spawn(
             [sys.executable, "-I", "-c",
-             "import ctypes,pathlib,sys; a=ctypes.windll.shell32.IsUserAnAdmin(); pathlib.Path(sys.argv[1]).write_text(str(a))",
+             "import ctypes,pathlib,sys; a=ctypes.windll.shell32.IsUserAnAdmin(); pathlib.Path(sys.argv[1]).write_text(str(a)); print('child output')",
              str(marker)],
-            tmp_path, env,
+            tmp_path, env, output=output,
         )
         assert child.wait(10) == 0
         assert marker.read_text() == "0"
+        assert output.read_text().strip() == "child output"
     finally:
         tree.close()
+
+
+def test_restricted_token_explicitly_disables_postgres_privileged_groups():
+    class Kernel:
+        def __init__(self):
+            self.closed = []
+
+        def GetCurrentProcess(self):
+            return 1
+
+        def CloseHandle(self, handle):
+            self.closed.append(handle.value)
+
+    class Security:
+        def __init__(self):
+            self.disabled = []
+            self.still_privileged = False
+
+        def OpenProcessToken(self, process, access, output):
+            c.cast(output, c.POINTER(w.HANDLE))[0] = w.HANDLE(11)
+            return True
+
+        def CreateWellKnownSid(self, kind, domain, sid, size):
+            c.memset(sid, kind, 1)
+            return True
+
+        def CreateRestrictedToken(self, source, flags, count, disabled, privileges, deleted,
+                                  restricted_count, restricted_sids, output):
+            assert flags == 0x0005
+            entries = c.cast(disabled, c.POINTER(SID_AND_ATTRIBUTES))
+            self.disabled = [c.cast(entries[i].sid, c.POINTER(c.c_byte))[0] for i in range(count)]
+            c.cast(output, c.POINTER(w.HANDLE))[0] = w.HANDLE(12)
+            return True
+
+        def DuplicateToken(self, token, level, output):
+            assert level == 2
+            c.cast(output, c.POINTER(w.HANDLE))[0] = w.HANDLE(13)
+            return True
+
+        def CheckTokenMembership(self, token, sid, output):
+            c.cast(output, c.POINTER(w.BOOL))[0] = w.BOOL(self.still_privileged)
+            return True
+
+    kernel, security = Kernel(), Security()
+    token = create_restricted_token(kernel, security)
+    assert token.value == 12
+    assert security.disabled == [26, 29]
+    assert kernel.closed == [13, 11]
+
+    kernel, security = Kernel(), Security()
+    security.still_privileged = True
+    with pytest.raises(RuntimeFailure, match="process_token_failed"):
+        create_restricted_token(kernel, security)
+    assert kernel.closed == [13, 12, 11]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object native fixture")

@@ -17,6 +17,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from packages.domain.models import TaskRun, TaskStatus
+from packages.pipeline.daily import PipelineInterrupted
 
 
 class DailySyncStage(StrEnum):
@@ -32,12 +33,14 @@ class StageStatus(StrEnum):
     SUCCEEDED = "succeeded"
     SKIPPED = "skipped"
     FAILED = "failed"
+    PAUSED = "paused"
 
 
 class DailySyncStatus(StrEnum):
     SUCCEEDED = "succeeded"
     DEGRADED = "degraded"
     FAILED = "failed"
+    PAUSED = "paused"
 
 
 class StageEvent(BaseModel):
@@ -162,6 +165,8 @@ class DailyRecruitmentSync:
         warnings: list[str] = []
         outputs: dict[DailySyncStage, Any] = {}
         fatal_error: str | None = None
+        paused = False
+        pause_reason: str | None = None
 
         self._persist_task(
             actual_run_id,
@@ -266,6 +271,15 @@ class DailyRecruitmentSync:
                 "批量抓取与增量分析完成",
                 value=pipeline_output,
             )
+        except PipelineInterrupted as exc:
+            paused = True
+            pause_reason = exc.reason_code
+            emit(
+                DailySyncStage.CRAWL,
+                StageStatus.PAUSED,
+                "已安全暂停；可按原任务范围继续",
+                error=str(exc),
+            )
         except Exception as exc:
             fatal_error = f"{type(exc).__name__}: {exc}"
             emit(
@@ -276,7 +290,7 @@ class DailyRecruitmentSync:
             )
 
         offline_output = None
-        if fatal_error is not None or self.offline_reconcile is None:
+        if fatal_error is not None or paused or self.offline_reconcile is None:
             emit(
                 DailySyncStage.OFFLINE_RECONCILIATION,
                 StageStatus.SKIPPED,
@@ -308,7 +322,7 @@ class DailyRecruitmentSync:
                 )
 
         report_output = None
-        if fatal_error is not None or self.report is None:
+        if fatal_error is not None or paused or self.report is None:
             emit(
                 DailySyncStage.REPORTING,
                 StageStatus.SKIPPED,
@@ -343,17 +357,19 @@ class DailyRecruitmentSync:
         status = (
             DailySyncStatus.FAILED
             if fatal_error is not None
+            else DailySyncStatus.PAUSED
+            if paused
             else DailySyncStatus.DEGRADED
             if warnings
             else DailySyncStatus.SUCCEEDED
         )
         self._persist_task(
             actual_run_id,
-            status=TaskStatus.FAILED if fatal_error else TaskStatus.SUCCEEDED,
-            current_step="completed" if fatal_error is None else "failed",
+            status=TaskStatus.FAILED if fatal_error else TaskStatus.STOPPED if paused else TaskStatus.SUCCEEDED,
+            current_step="paused" if paused else "completed" if fatal_error is None else "failed",
             step_count=len(events),
             started_at=started_at,
-            error_code="crawl_failed" if fatal_error else None,
+            error_code="crawl_failed" if fatal_error else pause_reason if paused else None,
         )
         return DailySyncResult(
             run_id=actual_run_id,
@@ -368,7 +384,7 @@ class DailyRecruitmentSync:
             offline_reconciliation=_json_safe(offline_output),
             report=_json_safe(report_output),
             warnings=warnings,
-            error=fatal_error,
+            error=fatal_error or pause_reason,
         )
 
     def _persist_task(

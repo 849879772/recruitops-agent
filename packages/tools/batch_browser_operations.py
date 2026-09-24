@@ -45,6 +45,9 @@ class BatchObserveApplicationStatusInput(ToolInput):
 
     application_ids: list[str] = Field(default_factory=list, max_length=50)
     run_id: str | None = Field(default=None, pattern=r"^status-review-[0-9a-f]{32}$")
+    background: bool = Field(default=False, description="Legacy compatibility flag; reviews always await one bounded foreground wave.")
+    thread_id: str | None = Field(default=None, min_length=1, max_length=255)
+    turn_id: str | None = Field(default=None, min_length=1, max_length=255)
     all_non_terminal: bool = Field(
         default=False,
         description=(
@@ -95,6 +98,8 @@ class BatchObserveApplicationStatusInput(ToolInput):
             raise ValueError(
                 "provide application_ids or enable all_non_terminal"
             )
+        if self.background and not (self.all_non_terminal or self.run_id):
+            raise ValueError("background requires a full review or an existing run_id")
         return self
 
 
@@ -414,6 +419,8 @@ async def batch_observe_application_status(
         concurrency_key = _origin_concurrency_key(normalized_url)
         async with semaphore, origin_locks[concurrency_key]:
             async def observe_once(attempt: int):
+                from .application_review_tasks import REVIEW_CONTEXT
+                review_owner = REVIEW_CONTEXT.get()
                 observation_request = ObserveApplicationStatusPageInput(
                     application_id=application_ids[0],
                     application_ids=application_ids,
@@ -421,6 +428,7 @@ async def batch_observe_application_status(
                     timeout_ms=request.timeout_per_application_ms,
                     include_vision=False,
                     retain_on_pause=False,
+                    task_id=review_owner[1] if review_owner else None,
                     idempotency_key=(
                         f"batch-status-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-"
                         f"{application_ids[0]}-{attempt}"
@@ -612,15 +620,21 @@ async def batch_observe_application_status(
                     operation_id=operation_id, observation=_compact_observation(observation),
                 ))
                 continue
-            update = browser_status_update(
-                BrowserStatusUpdateInput(
-                    application_id=application_id,
-                    page_url=raw_urls[normalized_url],
-                    terminal_result=terminal_result,
-                    operation_id=operation_id,
-                ),
-                storage,
-            )
+            from .application_review_tasks import review_write_guard
+            with review_write_guard() as owns_claim:
+                if not owns_claim:
+                    results.append(_result(application_id, "failed", started=group_started,
+                                           reason="review_owner_changed", operation_id=operation_id))
+                    continue
+                update = browser_status_update(
+                    BrowserStatusUpdateInput(
+                        application_id=application_id,
+                        page_url=raw_urls[normalized_url],
+                        terminal_result=terminal_result,
+                        operation_id=operation_id,
+                    ),
+                    storage,
+                )
             update_data = update.data
             observed_status = _value(getattr(update_data, "observed_status", None)) or None
             reason = getattr(update_data, "reason_code", None) or update.error_code

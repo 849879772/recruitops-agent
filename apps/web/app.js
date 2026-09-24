@@ -60,6 +60,11 @@
     companyPageSize: 30,
     applications: [],
     applicationsRequestId: 0,
+    applicationBrowse: { pageSize: 50, total: 0, columns: {}, query: "" },
+    applicationRequestController: null,
+    jobRequestController: null,
+    jobSummaryMode: null,
+    jobSummaryAt: 0,
     schedules: [],
     allSchedules: [],
     scheduleRequestId: 0,
@@ -135,6 +140,7 @@
     failure: "执行失败",
     safe_stop: "已安全停止",
     stopped: "已停止",
+    paused: "已暂停，可继续",
     retrying: "重试中",
     planned: "已规划",
     tool_completed: "工具已返回",
@@ -228,7 +234,7 @@
     scope_frozen: "抓取范围已确认",
     discovery: "公司发现",
     reconciliation: "公司整理",
-    companies: "岗位抓取",
+    companies: "公司岗位列表抓取",
     details: "职位详情补全",
     crawl: "岗位抓取",
     matching: "岗位评分",
@@ -242,7 +248,143 @@
     const label = RUNTIME_STAGE_LABELS[stage];
     if (!label) return raw;
     const count = detail.match(/^\d+\/\d+$/)?.[0];
-    return count ? `${label} ${count}` : label;
+    return count ? `${label} ${stage === "companies" ? "已处理 " : "本轮 "}${count}` : label;
+  }
+  const DAILY_STAGE_NAMES = {
+    discovery: "公司发现", reconciliation: "公司整理", crawl: "岗位抓取",
+    offline_reconciliation: "岗位状态整理", reporting: "生成结果",
+    companies: "公司岗位列表抓取", jd: "职位详情补全", matching: "岗位评分",
+  };
+  const DAILY_STATUS_NAMES = {
+    accepted: "准备中", pausing: "正在安全暂停", cancelling: "正在安全取消",
+    running: "运行中", succeeded: "已完成", success: "已完成", failed: "失败",
+    paused: "已暂停", stopped: "已中断", pending: "等待中",
+    awaiting_continuation: "等待助理继续下一批",
+  };
+  const DAILY_MODE_NAMES = {
+    full: "后台全量爬取", crawl_only: "后台岗位抓取",
+    score_only: "后台岗位评分", resume: "后台任务续跑",
+  };
+
+  const ACTIVE_TASK_STATUSES = new Set(["accepted", "running", "pausing", "cancelling", "awaiting_continuation"]);
+  function renderDailyProgress(payload) {
+    const card = $("assistant-task-progress");
+    if (!card) return;
+    const runs = (Array.isArray(payload?.runs) ? payload.runs : payload?.run ? [payload.run] : [])
+      .filter(item => ACTIVE_TASK_STATUSES.has(item.status));
+    const run = runs[0];
+    const extra = $("assistant-more-task-progress");
+    clear(extra);
+    card.hidden = !run;
+    if (!run) { const bar = $("assistant-task-progress-bar"); if (bar) bar.hidden = true; return; }
+    renderTaskProgressCard(card, run, true);
+    runs.slice(1).forEach(item => {
+      if (!extra) return;
+      const other = element("section", "assistant-task-progress");
+      extra.appendChild(other);
+      renderTaskProgressCard(other, item, false);
+    });
+  }
+
+  function renderTaskProgressCard(card, run, primary) {
+    const heading = primary ? null : element("div", "assistant-task-progress-head");
+    if (heading) card.appendChild(heading);
+    const node = (suffix, tag, className = "") => {
+      if (primary && $(`assistant-task-progress-${suffix}`)) return $(`assistant-task-progress-${suffix}`);
+      const child = element(tag, className);
+      (heading && ["title", "state"].includes(suffix) ? heading : card).appendChild(child);
+      return child;
+    };
+    const titleNode = node("title", "strong");
+    const stateNode = node("state", "span");
+    const detailNode = node("detail", "p");
+    const bar = node("bar", "progress");
+    const stagesNode = node("stages", "small");
+    const actions = node("actions", "div", "inline-actions"); clear(actions);
+    const stage = run.progress?.stage || run.phase;
+    const taskNames = { application_review: "官网投递状态复核", recruitment_mail: "处理招聘邮件" };
+    const stageNames = { preparing: "准备任务", sync: "同步邮件", syncing: "同步邮件", analysis: "分析与处理", processing: "分析与处理", reviewing: "核查官网状态", application_review: "核查官网状态" };
+    const label = DAILY_STAGE_NAMES[stage] || stageNames[stage] || "准备任务";
+    const progress = run.progress || {};
+    let completed = run.completed ?? null;
+    let total = run.total ?? null;
+    let detail = label;
+    if (taskNames[run.task_kind]) {
+      detail += Number.isInteger(total) && total > 0 ? ` · 已处理 ${completed ?? 0} / ${total} ${run.unit || "条"}` : " · 正在确认处理范围";
+      if (run.task_kind === "application_review" && Number.isInteger(run.remaining)) detail += `，待完成 ${run.remaining}`;
+      if (run.retry_pending > 0) detail += `（含待重试 ${run.retry_pending}）`;
+      if (run.failed > 0) detail += `，失败 ${run.failed}${run.retry_pending > 0 ? "（含待重试）" : ""}`;
+      if (run.blocked > 0) detail += `，待确认 ${run.blocked}`;
+    } else if (stage === "discovery") {
+      completed = progress.pages_fetched; total = progress.pages_total;
+      detail += ` · 已读取 ${completed ?? 0} 页${Number.isInteger(total) && total > 0 ? ` / ${total} 页` : ""}，发现 ${progress.records_seen ?? 0} 条来源`;
+    } else if (stage === "companies") {
+      completed = progress.attempted_unique ?? run.completed ?? progress.confirmed_complete;
+      total = progress.scope_total ?? run.total;
+      detail += ` · 已处理 ${completed ?? 0}${Number.isInteger(total) && total > 0 ? ` / 总计 ${total}` : ""} 家`;
+    } else if (stage === "jd" || stage === "matching") {
+      const durable = stage === "matching" && Number.isInteger(progress.scope_total);
+      completed = durable ? progress.confirmed_complete : progress.run_completed;
+      total = durable ? progress.scope_total : progress.run_total;
+      detail += ` · ${durable ? "已确认完成" : "本轮"} ${completed ?? 0}${Number.isInteger(total) && total > 0 ? ` / ${total}` : ""}`;
+      if (progress.retry_pending > 0) detail += `，待重试 ${progress.retry_pending}`;
+    }
+    titleNode.textContent = `${taskNames[run.task_kind] || DAILY_MODE_NAMES[run.mode] || "后台任务"} · ${label}`;
+    stateNode.textContent = DAILY_STATUS_NAMES[run.status] || "状态未知";
+    detailNode.textContent = detail;
+    const measurable = Number.isInteger(completed) && Number.isInteger(total) && total > 0;
+    bar.hidden = !measurable;
+    if (measurable) { bar.max = 100; bar.value = Math.min(100, Math.max(0, completed / total * 100)); }
+    const stages = ["discovery", "reconciliation", "crawl", "offline_reconciliation", "reporting"];
+    const updated = new Date(run.progress_updated_at || run.updated_at || "");
+    const timestamp = Number.isNaN(updated.getTime()) ? "" : ` · 更新于 ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    stagesNode.textContent = (taskNames[run.task_kind] ? "已处理不等于全部成功，异常项单独统计" : stages.map(key => `${DAILY_STAGE_NAMES[key]}：${DAILY_STATUS_NAMES[run.stages?.[key]] || "待执行"}`).join(" · ")) + timestamp;
+    for (const action of ["pause", "cancel"]) {
+      if (!run.run_id || !(run.actions?.includes(action) || run[`can_${action}`])) continue;
+      const button = element("button", "button button--ghost", action === "pause" ? "暂停" : "取消任务");
+      button.type = "button";
+      button.addEventListener("click", () => void controlBackgroundTask(run, action, button));
+      actions.appendChild(button);
+    }
+  }
+
+  async function controlBackgroundTask(run, action, button) {
+    if (action === "cancel" && !window.confirm("取消当前任务？已保存的数据会保留；正在处理的步骤会安全停止。")) return;
+    if (button) button.disabled = true;
+    try {
+      const result = await api(`/api/local-ui/tasks/${encodeURIComponent(run.run_id)}/control`, {
+        method: "POST", headers: authHeaders("控制后台任务", { "Content-Type": "application/json" }),
+        body: JSON.stringify({ task_kind: run.task_kind || "daily", action }),
+      });
+      if (result?.success === false) throw new Error(result.error_message || result.message || "暂时无法操作该任务");
+      showToast(action === "pause" ? "已请求安全暂停" : "已请求安全取消", "success");
+      await refreshDailyProgress();
+    } catch (error) { showToast(error.message, "error"); }
+    finally { if (button) button.disabled = false; }
+  }
+
+  let taskProgressRequestId = 0;
+  let taskProgressController = null;
+  async function refreshDailyProgress() {
+    const requestId = ++taskProgressRequestId;
+    taskProgressController?.abort();
+    taskProgressController = new AbortController();
+    try {
+      const result = await api("/api/local-ui/tasks/progress", { headers: authHeaders("daily-progress"), signal: taskProgressController.signal });
+      if (requestId !== taskProgressRequestId) return;
+      renderDailyProgress(result);
+      // Approval proposals may arrive after the assistant has ended its reply.
+      try {
+        const approvals = await api("/api/approvals");
+        if (requestId !== taskProgressRequestId) return;
+        state.approvals = normalizeApprovals(approvals);
+        renderMailBindingApprovals();
+      } catch (_) { /* A failed approval refresh never hides real task progress. */ }
+    } catch (error) {
+      if (requestId !== taskProgressRequestId || error.name === "AbortError") return;
+      const card = $("assistant-task-progress");
+      if (card && !card.hidden) setText("assistant-task-progress-state", "暂时无法刷新");
+    }
   }
   const setText = (id, value) => { const node = $(id); if (node) node.textContent = text(value); };
   const clear = (node) => { while (node?.firstChild) node.removeChild(node.firstChild); };
@@ -1258,16 +1400,26 @@
   async function loadJobBrowser({ refreshFeatured = false } = {}) {
     const requestId = state.jobBrowse.requestId + 1;
     state.jobBrowse.requestId = requestId;
+    state.jobRequestController?.abort();
+    const controller = new AbortController();
+    state.jobRequestController = controller;
     $("jobs-table-wrap").dataset.state = "loading";
     try {
-      const payload = await api(`/api/jobs/browse?${jobBrowseQuery().toString()}`);
+      const params = jobBrowseQuery();
+      const includeSummary = refreshFeatured || state.jobSummaryMode !== state.jobBrowse.mode || Date.now() - state.jobSummaryAt > 15000;
+      params.set("include_summary", String(includeSummary));
+      const payload = await api(`/api/jobs/browse?${params.toString()}`, { signal: controller.signal });
       if (requestId !== state.jobBrowse.requestId) return;
-      renderJobStats(payload.stats);
-      if (state.jobBrowse.mode === "all") renderJobFacets(payload.facets);
+      if (payload.stats) renderJobStats(payload.stats);
+      if (state.jobBrowse.mode === "all" && payload.facets) renderJobFacets(payload.facets);
+      if (payload.summary_included !== false && payload.stats) {
+        state.jobSummaryMode = state.jobBrowse.mode;
+        state.jobSummaryAt = Date.now();
+      }
       renderJobTable(payload);
-      if (refreshFeatured || !state.featuredJobs.length) renderFeaturedJobs(payload.featured || []);
+      if (payload.summary_included !== false && (refreshFeatured || !state.featuredJobs.length)) renderFeaturedJobs(payload.featured || []);
     } catch (error) {
-      if (requestId !== state.jobBrowse.requestId) return;
+      if (requestId !== state.jobBrowse.requestId || error.name === "AbortError") return;
       const body = $("jobs-table-body");
       clear(body);
       const row = document.createElement("tr");
@@ -1458,23 +1610,27 @@
 
   function renderApplications(payload = {}) {
     state.applications = Array.isArray(payload.items) ? payload.items : [];
+    state.applicationBrowse.total = payload.total ?? state.applications.length;
     const summary = $("application-summary");
     const kanban = $("application-kanban");
     clear(summary);
     clear(kanban);
-    setText("application-page-description", `步骤看所在列、卡面只看结果 · 共 ${payload.total ?? state.applications.length} 条`);
+    const filtered = Boolean($("application-search")?.value.trim());
+    setText("application-page-description", `${filtered ? "匹配" : "共"} ${state.applicationBrowse.total} 条 · 已显示 ${state.applications.length} 条`);
     APPLICATION_COLUMNS.forEach((column) => {
       const applications = state.applications.filter((application) => column.stages.includes(application.stage));
+      const count = payload.stage_counts && Object.keys(payload.stage_counts).length
+        ? column.stages.reduce((sum, stage) => sum + (payload.stage_counts[stage] || 0), 0) : applications.length;
       const summaryItem = element("div", `application-summary-item application-summary-item--${column.key}`);
       const summaryIcon = appendUiIcon(element("span", "application-summary-icon"), column.key === "closed" ? "close" : column.key);
       const summaryCopy = element("div", "application-summary-copy");
-      summaryCopy.append(element("span", "", column.label), element("strong", "", applications.length), element("small", "", "当前阶段记录"));
+      summaryCopy.append(element("span", "", column.label), element("strong", "", count), element("small", "", "搜索范围内记录"));
       summaryItem.append(summaryIcon, summaryCopy);
       summary.appendChild(summaryItem);
 
       const section = element("section", `kanban-column kanban-column--${column.key}`);
       const header = element("header", "kanban-column-header");
-      header.append(element("h3", "", column.label), element("span", "kanban-count", applications.length));
+      header.append(element("h3", "", column.label), element("span", "kanban-count", count));
       section.appendChild(header);
       const list = element("div", "kanban-list");
       if (!applications.length) {
@@ -1558,9 +1714,25 @@
         });
       }
       section.appendChild(list);
+      const browse = state.applicationBrowse.columns[column.key];
+      if (browse && browse.offset < browse.total) {
+        const more = element("button", "button button--ghost", `加载更多（已显示 ${applications.length} / ${browse.total}）`);
+        more.type = "button";
+        more.dataset.applicationMore = column.key;
+        more.setAttribute("aria-label", `加载更多${column.label}记录`);
+        more.addEventListener("click", async () => {
+          if (more.disabled) return;
+          more.disabled = true;
+          more.textContent = "加载中…";
+          try { await loadApplications({ moreColumn: column.key }); }
+          finally { more.disabled = false; more.textContent = `加载更多（已显示 ${applications.length} / ${browse.total}）`; }
+        });
+        section.appendChild(more);
+      }
       kanban.appendChild(section);
     });
-    setText("nav-application-count", payload.total ?? state.applications.length);
+    setText("nav-application-count", payload.unfiltered_total ?? payload.total ?? state.applications.length);
+    if (!state.applications.length) empty(kanban, "没有匹配的投递记录", filtered ? "试试其他公司或岗位名称，或清除筛选条件。" : "可以手动添加投递，或在招聘官网记录投递。");
     kanban.dataset.state = "ready";
   }
 
@@ -1601,6 +1773,16 @@
       body: JSON.stringify(data),
     });
     const form = document.createElement("form");
+    const companyName = field(form, "公司名称", document.createElement("input"));
+    companyName.type = "text";
+    companyName.required = true;
+    companyName.maxLength = 255;
+    companyName.value = application.company_name || "";
+    const jobTitle = field(form, "岗位名称", document.createElement("input"));
+    jobTitle.type = "text";
+    jobTitle.required = true;
+    jobTitle.maxLength = 512;
+    jobTitle.value = application.job_title || "";
     const stage = field(form, "阶段", select(Object.entries(APPLICATION_STAGE_LABELS), application.stage));
     const previous = (application.stage_history || []).slice(-1)[0] || {};
     const result = field(form, "结果", select(["待", "进行中", "通过", "淘汰", "放弃"].map(x => [x, x]), previous.result || "进行中"));
@@ -1608,7 +1790,9 @@
     note.value = application.note || "";
     note.maxLength = 4000;
     submit(form, "更新", async () => {
-      await request("PATCH", { stage: stage.value, result: result.value, note: note.value, expected_updated_at: application.updated_at });
+      if (!companyName.value.trim() || !jobTitle.value.trim()) throw new Error("公司和岗位名称不能为空");
+      await request("PATCH", { company_name: companyName.value.trim(), job_title: jobTitle.value.trim(),
+        stage: stage.value, result: result.value, note: note.value, expected_updated_at: application.updated_at });
       showToast("投递记录已更新", "success");
       await loadApplications();
     });
@@ -1710,16 +1894,50 @@
     return editor;
   }
 
-  async function loadApplications() {
+  function applicationBrowseQuery(column, offset = 0) {
+    const params = new URLSearchParams({ limit: String(state.applicationBrowse.pageSize), offset: String(offset) });
+    const query = $("application-search")?.value.trim();
+    if (query) params.set("query", query);
+    column.stages.forEach(stage => params.append("stages", stage));
+    return params;
+  }
+
+  async function loadApplications({ moreColumn = null } = {}) {
+    const query = $("application-search")?.value.trim() || "";
+    if (query !== state.applicationBrowse.query) moreColumn = null;
+    const columns = moreColumn ? APPLICATION_COLUMNS.filter(column => column.key === moreColumn) : APPLICATION_COLUMNS;
     const requestId = ++state.applicationsRequestId;
+    state.applicationRequestController?.abort();
+    const controller = new AbortController();
+    state.applicationRequestController = controller;
     try {
-      const payload = await api("/api/applications/page?limit=200&offset=0");
+      const pages = await Promise.all(columns.map(async column => {
+        const offset = moreColumn ? state.applicationBrowse.columns[column.key]?.offset || 0 : 0;
+        const payload = await api(`/api/applications/page?${applicationBrowseQuery(column, offset)}`, { signal: controller.signal });
+        return { column, offset, payload };
+      }));
       if (requestId !== state.applicationsRequestId) return false;
-      renderApplications(payload);
+      if (!moreColumn) state.applicationBrowse.columns = {};
+      state.applicationBrowse.query = query;
+      for (const { column, offset, payload } of pages) {
+        const previous = moreColumn ? state.applicationBrowse.columns[column.key]?.items || [] : [];
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        state.applicationBrowse.columns[column.key] = {
+          items: [...new Map([...previous, ...items].map(item => [item.id, item])).values()],
+          offset: offset + items.length, total: payload.total || 0,
+        };
+      }
+      const payload = pages[0].payload;
+      const stageCounts = payload.stage_counts || {};
+      renderApplications({ ...payload, stage_counts: stageCounts,
+        total: Object.keys(stageCounts).length ? Object.values(stageCounts).reduce((sum, count) => sum + count, 0)
+          : Object.values(state.applicationBrowse.columns).reduce((sum, column) => sum + column.total, 0),
+        items: [...new Map(Object.values(state.applicationBrowse.columns).flatMap(column => column.items).map(item => [item.id, item])).values()],
+      });
       return true;
     } catch (error) {
-      if (requestId !== state.applicationsRequestId) return false;
-      empty($("application-kanban"), "投递记录加载失败", error.message);
+      if (requestId !== state.applicationsRequestId || error.name === "AbortError") return false;
+      if (!moreColumn) empty($("application-kanban"), "投递记录加载失败", error.message);
       showToast(`投递记录加载失败：${error.message}`, "error");
       return false;
     }
@@ -2074,6 +2292,10 @@
       switchView("mail");
     });
     actions.appendChild(openMailbox);
+    const bindMail = element("button", "button button--secondary", "选择或修改关联投递");
+    bindMail.type = "button";
+    bindMail.addEventListener("click", () => void openMailBinding(recordId));
+    actions.appendChild(bindMail);
     content.appendChild(actions);
     content.dataset.state = "ready";
   }
@@ -2086,7 +2308,7 @@
     if (typeof dialog.showModal === "function") dialog.showModal();
     else dialog.setAttribute("open", "");
     try {
-      renderMailDetail(await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}`), recordId);
+      renderMailDetail(await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}?refresh=false`), recordId);
     } catch (error) {
       const summary = state.mails.find((mail) => text(mail.id, "") === text(recordId, ""));
       if (summary) {
@@ -2096,6 +2318,108 @@
         empty($("job-detail-content"), "邮件详情加载失败", error.message);
       }
     }
+  }
+
+  function mailBindingCard(approval) {
+    const preview = approval.preview || {};
+    const after = preview.after || {};
+    const card = element("article", "approval-card");
+    card.appendChild(element("strong", "", after.action === "unbind" ? "确认解除这封邮件的关联" : "确认邮件关联"));
+    card.appendChild(element("p", "", `邮件：${preview.before?.subject || "招聘邮件"}`));
+    card.appendChild(element("p", "", `发件人：${preview.before?.sender || "待核验"}`));
+    card.appendChild(element("p", "", after.action === "unbind" ? "解除关联，保留邮件与已有业务记录。" : `关联到：${after.company_name || "—"} · ${after.job_title || "—"}`));
+    card.appendChild(element("small", "", "仅确认本封邮件与投递的对应关系；不会发送邮件，也不会直接更改投递阶段。后续处理仍检查发件人和事件证据。"));
+    const actions = element("div", "inline-actions");
+    const confirm = element("button", "button button--primary", after.action === "unbind" ? "确认解除" : "确认关联");
+    confirm.type = "button";
+    confirm.addEventListener("click", () => void confirmMailBinding(approval, confirm));
+    const reject = element("button", "button button--ghost", "拒绝"); reject.type = "button";
+    reject.addEventListener("click", () => void decideApproval(approval.token_id, "reject"));
+    actions.append(confirm, reject); card.appendChild(actions);
+    return card;
+  }
+
+  function renderMailBindingApprovals() {
+    const target = $("assistant-mail-binding-approvals");
+    if (!target) return;
+    clear(target);
+    state.approvals.filter(item => item.operation === "recruitment_mail_binding" && ["pending", "approved"].includes(item.status))
+      .forEach(item => target.appendChild(mailBindingCard(item)));
+  }
+
+  async function confirmMailBinding(approval, button) {
+    if (button?.disabled) return;
+    if (button) button.disabled = true;
+    try {
+      if (approval.status !== "approved") {
+        const decision = await api(`/api/approvals/${encodeURIComponent(approval.token_id)}/approve`, {
+          method: "POST", headers: authHeaders("确认邮件关联"),
+        });
+        if (!decision.allowed || decision.status !== "approved") throw new Error("预览已失效，请重新选择并确认");
+      }
+      const audit = await api(`/api/approvals/${encodeURIComponent(approval.token_id)}/execute`, {
+        method: "POST", headers: authHeaders("保存邮件关联", { "Content-Type": "application/json" }),
+        body: JSON.stringify({ operator: "local-ui-user" }),
+      });
+      if (!audit.success) throw new Error("关联未保存，邮件或投递可能已变化，请重新确认");
+      state.approvals = normalizeApprovals(await api("/api/approvals"));
+      renderApprovals();
+      await Promise.all([loadRecruitmentMails({ showLoading: false }), loadFullSchedule()]);
+      showToast(approval.preview?.after?.action === "unbind" ? "关联已解除，邮件及已有记录已保留" : "关联已保存；需要更新阶段或日程时，可让助理继续处理邮件", "success");
+      $("job-detail-dialog")?.close?.();
+    } catch (error) { showToast(error.message, "error"); }
+    finally { if (button) button.disabled = false; }
+  }
+
+  async function openMailBinding(recordId) {
+    const dialog = $("job-detail-dialog");
+    setText("job-detail-company", "邮件关联"); setText("job-detail-title", "选择对应的投递记录");
+    const content = $("job-detail-content"); clear(content);
+    const input = element("input", ""); input.type = "search"; input.placeholder = "搜索公司或岗位名称";
+    input.setAttribute("aria-label", "搜索要关联的投递记录");
+    const search = element("button", "button button--secondary", "搜索"); search.type = "submit";
+    const form = element("form", "application-filter-bar"); form.append(input, search);
+    const candidates = element("div", ""); const previewNode = element("div", "");
+    content.append(element("p", "", "名称不一致时可搜索实际投递。选择后请核对邮件主题、发件人与岗位，再确认关联。"), form, candidates, previewNode);
+    if (!dialog.open) { if (dialog.showModal) dialog.showModal(); else dialog.setAttribute("open", ""); }
+    let sequence = 0;
+    const load = async () => {
+      const request = ++sequence; clear(previewNode); loading(candidates);
+      try {
+        const result = await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}/binding-candidates?query=${encodeURIComponent(input.value || "")}`);
+        if (request !== sequence || content.firstChild == null) return;
+        clear(candidates);
+        const propose = async (applicationId, action, button) => {
+          button.disabled = true;
+          try {
+            const response = await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}/binding-proposals`, {
+              method: "POST", headers: authHeaders("提出邮件关联", { "Content-Type": "application/json" }),
+              body: JSON.stringify({ record_id: recordId, application_id: applicationId, action,
+                content_digest: result.content_digest, binding_revision: result.binding_revision }),
+            });
+            if (!response.success || !response.data?.approval_id) throw new Error("无法生成确认预览");
+            clear(previewNode);
+            previewNode.appendChild(mailBindingCard({ token_id: response.data.approval_id, status: response.data.approval_status,
+              operation: "recruitment_mail_binding", preview: response.data.preview }));
+          } catch (error) { showToast(error.message, "error"); }
+          finally { button.disabled = false; }
+        };
+        for (const item of result.candidates || []) {
+          const row = element("div", "approval-card");
+          row.appendChild(element("p", "", `${item.company_name} · ${item.job_title}`));
+          const button = element("button", "button button--ghost", "选择并查看确认预览"); button.type = "button";
+          button.addEventListener("click", () => void propose(item.application_id, result.current_application_id ? "correct" : "bind", button));
+          row.appendChild(button); candidates.appendChild(row);
+        }
+        if (!result.candidates?.length) empty(candidates, "暂无匹配投递", "输入公司或岗位名称搜索，也可以暂不关联。");
+        if (result.current_application_id) {
+          const unbind = element("button", "button button--ghost", "解除当前关联"); unbind.type = "button";
+          unbind.addEventListener("click", () => void propose(null, "unbind", unbind)); candidates.appendChild(unbind);
+        }
+      } catch (error) { if (request === sequence) empty(candidates, "读取失败", error.message); }
+    };
+    form.addEventListener("submit", event => { event.preventDefault(); void load(); });
+    await load();
   }
 
   const AUTOMATION_STATUS_LABELS = {
@@ -2298,6 +2622,9 @@
   };
 
   const MAIL_PROCESSING_STATUS_LABELS = {
+    ambiguous_application: "多个候选，待确认",
+    failed_terminal: "处理失败，需检查",
+    needs_auth_metadata: "发件人验证信息不足",
     pending: "待处理",
     processed_updated: "已更新投递阶段",
     processed_unchanged: "已核对，无变化",
@@ -2330,6 +2657,10 @@
   }
 
   function mailAssociationState(mail) {
+    if (mail?.binding_state === "stale") return { key: "review", label: "原关联需重新确认" };
+    if (mail?.binding_state === "unbound") return { key: "muted", label: "用户已解除" };
+    if (mail?.binding_state === "confirmed") return { key: "linked", label: "用户已确认" };
+    if (mail?.association_required === false) return { key: "muted", label: "无需关联" };
     if (mail?.application_id) return { key: "linked", label: "已关联" };
     const processing = normalizeMailStatus(mail?.processing_status);
     if (processing === "pending_association") return { key: "pending", label: "待关联" };
@@ -2435,11 +2766,9 @@
       const main = document.createElement("div"); main.className = "mail-row-main";
       const title = document.createElement("strong"); title.className = "mail-subject"; title.textContent = text(mail.subject, "无主题");
       const meta = document.createElement("div"); meta.className = "mail-tags";
-      const confidence = Number.isFinite(Number(mail.confidence)) ? `${Math.round(Number(mail.confidence) * 100)}%` : "待确认";
       meta.appendChild(element("span", "mail-tag mail-tag--category", MAIL_CATEGORY_LABELS[mail.category] || text(mail.category, "其他")));
-      meta.appendChild(element("span", "mail-tag mail-tag--muted", `置信度 ${confidence}`));
       const processingStatus = normalizeMailStatus(mail.processing_status) || "pending";
-      const processing = element("span", `mail-tag mail-tag--${mailProcessingTone(processingStatus)}`, `处理：${mailProcessingLabel(processingStatus)}`);
+      const processing = element("span", `mail-tag mail-tag--${mailProcessingTone(processingStatus)}`, `处理：${mail.processing_label || mailProcessingLabel(processingStatus)}`);
       processing.dataset.status = processingStatus;
       meta.appendChild(processing);
       const association = mailAssociationState(mail);
@@ -2455,7 +2784,9 @@
       open.type = "button"; open.dataset.mailOpenId = text(mail.id, "");
       const review = element("button", "button button--secondary", "生成关联预览");
       review.type = "button"; review.dataset.mailReviewId = text(mail.id, "");
-      actions.append(open, review);
+      const bindMail = element("button", "button button--ghost", mail.application_id ? "修改关联" : "关联投递");
+      bindMail.type = "button"; bindMail.addEventListener("click", () => void openMailBinding(mail.id));
+      actions.append(open, bindMail, review);
       item.append(main, actions); node.appendChild(item);
     });
     node.dataset.state = "ready";
@@ -2464,7 +2795,7 @@
   async function loadRecruitmentMails({ showLoading = true } = {}) {
     if (showLoading) loading($("mail-list"));
     try {
-      const response = await api("/api/recruitment-mails?limit=50");
+      const response = await api("/api/recruitment-mails?limit=50&refresh=false");
       renderMails(response.items || [], Boolean(response.unavailable), mailFreshnessFrom(response));
       return response;
     } catch (error) {
@@ -2645,12 +2976,16 @@
   }
 
   function renderApprovals() {
+    renderMailBindingApprovals();
     const node = $("approval-list"); clear(node);
     const pending = state.approvals.filter((item) => item.status === "pending");
     setText("approval-summary-count", pending.length); setText("approval-list-count", `${state.approvals.length} 条`);
     setText("nav-approval-count", pending.length);
     if (!state.approvals.length) return empty(node, "暂无审批请求", "只读任务不会自动生成写操作。");
     state.approvals.forEach((approval) => {
+      if (approval.operation === "recruitment_mail_binding" && ["pending", "approved"].includes(approval.status)) {
+        node.appendChild(mailBindingCard(approval)); return;
+      }
       const card = document.createElement("article"); card.className = "approval-card";
       const title = document.createElement("strong"); title.textContent = `${text(approval.operation)} · ${text(approval.status)}`;
       const detail = document.createElement("p"); detail.textContent = `任务 ${text(approval.task_id)} · 幂等键 ${text(approval.idempotency_key)}`;
@@ -2734,6 +3069,7 @@
 
   function statusClass(result, response) {
     if (result.status === "preview" || response.status === "preview") return "pending";
+    if (result.status === "paused" || response.status === "paused") return "pending";
     if (result.status === "succeeded" || result.status === "success" || response.success === true) return "success";
     return "error";
   }
@@ -4136,7 +4472,7 @@
         renderApprovals();
         renderDashboardLists();
       }),
-      api(`/api/jobs/browse?first_seen_on=${localDate()}&limit=8&sort=newest`).then((jobs) => {
+      api(`/api/jobs/browse?first_seen_on=${localDate()}&limit=8&sort=newest&include_summary=false`).then((jobs) => {
         state.jobTotal = jobs.total || 0;
         renderJobs(jobs.items || []);
         setText("metric-new-jobs", state.jobTotal);
@@ -4149,47 +4485,53 @@
   async function loadCore() {
     setStatus("loading", "连接中");
     ["today-schedule", "today-new-jobs", "today-todos", "today-anomalies", "pending-approvals", "company-list", "approval-list", "trace-list", "featured-job-list", "application-kanban", "schedule-todo-view", "schedule-calendar-grid", "automation-list"].forEach((id) => loading($(id)));
-    try {
-      const [health, codexHealth, schedule, jobs, companies, approvals, traces, mails, operationalReport] = await Promise.all([
-        api("/health"), api("/api/codex/health").catch((error) => ({ enabled: null, ready: false, state: "unavailable", detail: error.message })),
-        api(`/api/schedule?on=${today}`), api(`/api/jobs/browse?first_seen_on=${today}&limit=8&sort=newest`),
-        api("/api/companies"), api("/api/approvals"), api("/api/codex/traces"),
-        api("/api/recruitment-mails?limit=50").catch((error) => ({
-          items: [],
-          unavailable: true,
-          freshness: { status: "failed", error_type: error.message || "mail_list_unavailable" },
-        })),
-        api(`/api/reports/operational?on=${today}`).catch(() => ({ counts: {}, repair_candidates: [] })),
-      ]);
-      try {
-        await initializeCodex(codexHealth);
-      } catch (error) {
-        state.codexEnabled = codexHealth?.enabled === true;
-        state.codexReady = codexHealth?.ready === true;
-        renderCodexRuntimeStatus();
-        showToast(`Codex 会话初始化失败：${error.message}`, "error");
-      }
-      state.schedules = schedule; state.jobTotal = jobs.total || 0; state.companies = companies; state.approvals = normalizeApprovals(approvals); state.traces = traces; state.operationalReport = operationalReport;
-      renderSchedule(schedule); renderJobs(jobs.items || []); renderCompanies(companies); renderApprovals(); renderMails(mails.items || [], Boolean(mails.unavailable), mailFreshnessFrom(mails)); renderDashboardLists(); renderDashboardTodos(); renderTraces();
-      await Promise.all([
-        loadConversationWorkspace(),
-        loadJobBrowser({ refreshFeatured: true }),
-        loadCompanyRanking(),
-        loadApplications(),
-        loadFullSchedule(),
-        loadAutomations(),
-      ]);
-      setText("today-label", today); setText("last-sync-label", `读取于 ${new Date().toLocaleTimeString()}`);
-      setText("nav-today-count", (jobs.items || []).length); setText("metric-new-jobs", jobs.total || 0); setText("metric-new-jobs-detail", "已确认 2027 校招");
-      setText("metric-schedule", state.schedules.length); setText("metric-schedule-detail", state.schedules.length ? "有安排" : "暂无安排");
-      setText("metric-approvals", state.approvals.filter((item) => item.status === "pending").length); setText("metric-approvals-detail", "等待人工确认");
-      setText("metric-anomalies", operationalReport?.counts?.crawler_issues ?? companies.filter((item) => item.integration_status !== "connected").length); setText("metric-anomalies-detail", "运营报告异常");
-      $("dashboard-status-summary").textContent = `服务 ${health.status} · ${health.mode} · 运营报告已读取`;
-      setStatus("ready", "已连接");
-    } catch (error) {
-      setStatus("error", "读取失败"); showToast(error.message, "error");
-      ["today-schedule", "today-new-jobs", "today-todos", "today-anomalies", "pending-approvals", "company-list", "approval-list", "trace-list", "featured-job-list", "application-kanban", "schedule-todo-view", "schedule-calendar-grid"].forEach((id) => { if ($(id)) empty($(id), "暂时无法读取", error.message); });
-    }
+    const section = (promise, ids) => promise.catch(error => {
+      ids.forEach(id => { if ($(id)) empty($(id), "暂时无法读取", error.message); });
+    });
+    // Each section renders as soon as its own data is ready. Mail/model startup
+    // or a slow operational report must not block the current job page.
+    await Promise.allSettled([
+      api("/health").then(health => {
+        setStatus("ready", "已连接");
+        setText("dashboard-status-summary", `服务 ${health.status} · ${health.mode}`);
+      }).catch(error => { setStatus("error", "连接失败"); showToast(error.message, "error"); }),
+      api("/api/codex/health").catch(error => ({ enabled: null, ready: false, detail: error.message }))
+        .then(async codexHealth => {
+          try { await initializeCodex(codexHealth); await loadConversationWorkspace(); }
+          catch (error) {
+            state.codexEnabled = codexHealth?.enabled === true;
+            state.codexReady = codexHealth?.ready === true;
+            renderCodexRuntimeStatus();
+            showToast(`助理初始化失败：${error.message}`, "error");
+          }
+        }),
+      loadJobBrowser({ refreshFeatured: true }),
+      ...(state.jobBrowse.mode !== "all" ? [loadCompanyRanking()] : []),
+      section(api(`/api/jobs/browse?first_seen_on=${today}&limit=8&sort=newest&include_summary=false`).then(jobs => {
+        state.jobTotal = jobs.total || 0;
+        renderJobs(jobs.items || []);
+        setText("nav-today-count", state.jobTotal); setText("metric-new-jobs", state.jobTotal);
+        setText("metric-new-jobs-detail", "已确认 2027 校招");
+      }), ["today-new-jobs"]),
+      section(api(`/api/schedule?on=${today}`).then(schedule => {
+        state.schedules = schedule; renderSchedule(schedule); renderDashboardTodos();
+        setText("metric-schedule", schedule.length); setText("metric-schedule-detail", schedule.length ? "有安排" : "暂无安排");
+      }), ["today-schedule"]),
+      section(api("/api/companies").then(companies => { state.companies = companies; renderCompanies(companies); }), ["company-list"]),
+      section(api("/api/approvals").then(approvals => {
+        state.approvals = normalizeApprovals(approvals); renderApprovals(); renderDashboardLists(); renderDashboardTodos();
+        setText("metric-approvals", state.approvals.filter(item => item.status === "pending").length);
+        setText("metric-approvals-detail", "等待人工确认");
+      }), ["approval-list", "pending-approvals"]),
+      section(api("/api/codex/traces").then(traces => { state.traces = traces; renderTraces(); }), ["trace-list"]),
+      loadRecruitmentMails({ showLoading: false }),
+      section(api(`/api/reports/operational?on=${today}`).then(report => {
+        state.operationalReport = report; renderDashboardLists(); renderDashboardTodos();
+        setText("metric-anomalies", report?.counts?.crawler_issues ?? 0); setText("metric-anomalies-detail", "运营报告异常");
+      }), ["today-anomalies"]),
+      loadApplications(), loadFullSchedule(), loadAutomations(),
+    ]);
+    setText("today-label", today); setText("last-sync-label", `读取于 ${new Date().toLocaleTimeString()}`);
   }
 
   async function decideApproval(id, decision) {
@@ -4281,6 +4623,7 @@
     if (changed) window.scrollTo(0, viewScroll.get(view) || 0);
     if (changed && view === "schedule") void loadFullSchedule();
     if (changed && view === "applications") void loadApplications();
+    if (view === "assistant") void refreshDailyProgress();
   }
 
   function normalizeApplicationDraft(value) {
@@ -4508,6 +4851,20 @@
         button.removeAttribute("aria-busy");
       }
     });
+    let applicationSearchTimer;
+    $("application-filter-form")?.addEventListener("submit", event => event.preventDefault());
+    $("application-search")?.addEventListener("input", () => {
+      ++state.applicationsRequestId;
+      state.applicationRequestController?.abort();
+      clearTimeout(applicationSearchTimer);
+      applicationSearchTimer = setTimeout(() => void loadApplications(), 250);
+    });
+    $("application-filter-form")?.addEventListener("reset", () => {
+      clearTimeout(applicationSearchTimer);
+      ++state.applicationsRequestId;
+      state.applicationRequestController?.abort();
+      setTimeout(() => { void loadApplications(); }, 0);
+    });
     $("approvals-refresh-button").addEventListener("click", async () => { try { state.approvals = normalizeApprovals(await api("/api/approvals")); renderApprovals(); renderDashboardLists(); renderDashboardTodos(); renderConversation(); } catch (error) { showToast(error.message, "error"); } });
     $("traces-refresh-button").addEventListener("click", refreshTraces);
     $("mail-refresh-button").addEventListener("click", syncRecruitmentMails);
@@ -4646,6 +5003,13 @@
     scheduleFormPayload,
     renderApplications,
     loadApplications,
+    applicationBrowseQuery,
+    loadJobBrowser,
+    openMailBinding,
+    confirmMailBinding,
+    renderMailBindingApprovals,
+    controlBackgroundTask,
+    loadCore,
     loadFullSchedule,
     normalizeApplicationDraft,
     syncRecruitmentMails,
@@ -4654,6 +5018,8 @@
     submitAssistantQuestion,
     appendMessage,
     friendlyRuntimeProgress,
+    renderDailyProgress,
+    refreshDailyProgress,
     deleteConversation,
     state,
   };
@@ -4666,5 +5032,6 @@
       if ([...document.querySelectorAll("[data-view-panel]")].some(panel => panel.dataset.viewPanel === savedView)) initialView = savedView;
     } catch (_) { /* Start at jobs when storage is unavailable. */ }
     bind(); switchView(initialView); updateIntentHint(); renderConversation(); renderTaskHistory(); renderDashboardTodos(); loadCore();
+    window.setInterval(() => { if (activeView === "assistant") void refreshDailyProgress(); }, 5000);
   }
 })();

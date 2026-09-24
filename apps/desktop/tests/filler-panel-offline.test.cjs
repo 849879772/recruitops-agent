@@ -58,15 +58,16 @@ function initialState({fields,queue=[],candidates=[]}={}){
     runtimeRestarting:false,workbenchLoading:false,workbenchRequested:false,workbenchError:false,configurationError:'',
     filler:{available:true,open:true,pluginReady:true,profileReady:true,scanId:'scan-one',undoReady:false,busy:false,message:'Ready',
       capabilities:{persistentProfile:true,attachment:true,repeatedSections:true,frames:true,customAnswers:true,diagnostics:true,applications:true,offlineQueue:true},
-      supportedActions:['filler-scan','filler-frame-allow','filler-fill','filler-prepare','filler-undo','filler-profile-save','filler-profile-create','filler-profile-select','filler-profile-rename','filler-profile-delete',
+      supportedActions:['filler-scan','filler-frame-allow','filler-fill','filler-prepare','filler-undo','filler-attachment-upload','filler-profile-save','filler-profile-create','filler-profile-select','filler-profile-rename','filler-profile-delete',
         'filler-demo-enable','filler-demo-restore','filler-stop','filler-custom-save','filler-custom-delete','filler-application-detect','filler-application-save','filler-application-save-batch',
-        'filler-application-flush','filler-application-cancel','filler-application-retry','filler-application-correct'],
+        'filler-application-flush','filler-application-cancel','filler-application-retry','filler-application-correct','filler-application-sync-page'],
       profile:{ready:true,mode:'personal',version:1,data:profile,activeProfileId:profileId,activeProfileName:'个人资料',personalProfiles:[{id:profileId,name:'个人资料'}]},
       attachment:{ready:false},fields:fields||[field('scan-one','rf-name','姓名','Synthetic Candidate')],results:[],customAnswers:[],diagnostics:[],
       application:{candidates,existing:[],queue,pendingCount:queue.length,message:'待用户确认'}}};
 }
 async function setup(options={}){
   const document=new Document(),state=initialState(options),commands=[],primaryId=state.filler.profile.activeProfileId;
+  document.getElementById('filler-one-click-upload').checked=true;
   const profileSlots=new Map([[primaryId,{data:clone(state.filler.profile.data),answers:[]}]]),demoSlot={data:clone(state.filler.profile.data),answers:[]};
   let nextProfile=0;
   const activeSlot=()=>state.filler.profile.mode==='demo'?demoSlot:profileSlots.get(state.filler.profile.activeProfileId);
@@ -135,6 +136,7 @@ async function setup(options={}){
         f.blockedFrameOrigins=[];f.scanState='complete';f.scanSummary={framesScanned:2,framesFailed:0};
       }
       if(command.action==='filler-prepare'){clearScan();f.scanState='consumed';}
+      if(command.action==='filler-attachment-upload'){clearScan();f.scanState='consumed';f.message='附件已选择并由网站确认接收，请重新扫描解析后的表单。';}
       if(command.action==='filler-fill'){
         f.results=command.fieldIds.map(id=>{
           const selected=f.fields.find(item=>item.fieldId===id),raw=selected?JSON.parse(selected.fieldId)[5]:'';
@@ -146,6 +148,7 @@ async function setup(options={}){
         f.application.candidates=options.candidates||[{id:'candidate-one',company:'Synthetic Robotics',title:'Controls Engineer',recordUrl:'https://careers.example.test/progress'}];
       }
       if(command.action==='filler-application-save')state.lastApplicationSave=command;
+      if(command.action==='filler-application-sync-page')state.lastApplicationSync=command;
       if(command.action==='filler-application-flush')f.application.queue=f.application.queue.map(item=>({...item,attempts:Math.min(3,(item.attempts||0)+1),error:'http_503'}));
       if(command.action==='filler-application-cancel')f.application.queue=f.application.queue.filter(item=>(item.queueId||item.id)!==command.queueId);
       if(command.action==='filler-application-correct'){
@@ -312,8 +315,8 @@ test('new registration saves reviewed fields directly without looking up existin
   const ui=await setup();
   ui.document.getElementById('filler-tab-applications').click();
   assert.equal(ui.commands.length,0);
-  assert.doesNotMatch(html,/filler-application-(?:existing|sync|find)/);
-  assert.doesNotMatch(html,/关联已有投递|同步当前页进度|查找已有记录/);
+  assert.doesNotMatch(html,/filler-application-(?:existing|find)/);
+  assert.doesNotMatch(html,/关联已有投递|查找已有记录/);
   for(const [name,value] of Object.entries({company:'Synthetic Robotics',title:'Controls Engineer',url:'https://careers.example.test/progress',city:'Shanghai'})) {
     const input=ui.document.getElementById('filler-application-'+name);input.value=value;input.oninput();
   }
@@ -323,6 +326,36 @@ test('new registration saves reviewed fields directly without looking up existin
   assert.deepEqual(ui.state.lastApplicationSave,{action:'filler-application-save',company:'Synthetic Robotics',title:'Controls Engineer',recordUrl:'https://careers.example.test/progress',city:'Shanghai'});
   assert.equal('applicationId' in ui.state.lastApplicationSave,false);
   assert.equal('candidateIds' in ui.state.lastApplicationSave,false);
+});
+
+test('a detected job-list URL is not mistaken for a progress page and can be saved without one',async()=>{
+  const ui=await setup({candidates:[{id:'candidate-one',company:'Synthetic Robotics',title:'Controls Engineer',recordUrl:'https://careers.example.test/campus/jobs'}]});
+  ui.document.getElementById('filler-tab-applications').click();
+  assert.equal(ui.document.getElementById('filler-application-url').value,'');
+  assert.match(ui.document.getElementById('filler-application-url-note').textContent,/可先新增投递/);
+  const url=ui.document.getElementById('filler-application-url');
+  url.value='https://careers.example.test/campus/jobs';url.oninput();
+  const confirm=ui.document.getElementById('filler-application-confirm');confirm.checked=true;confirm.onchange();
+  assert.equal(ui.document.getElementById('filler-application-save').disabled,true);
+  assert.match(ui.document.getElementById('filler-application-url-note').textContent,/不是投递进度页/);
+  url.value='';url.oninput();confirm.checked=true;confirm.onchange();
+  assert.equal(ui.document.getElementById('filler-application-save').disabled,false);
+  await ui.document.getElementById('filler-application-save').click();
+  assert.equal(ui.state.lastApplicationSave.recordUrl,'');
+});
+
+test('current-page progress sync selects identified cards independently of registration',async()=>{
+  const ui=await setup({candidates:[
+    {id:'candidate-0',company:'Synthetic Robotics',title:'Controls Engineer',sourceStatus:'笔试',recordUrl:'https://careers.example.test/progress'},
+    {id:'candidate-1',company:'Synthetic Robotics',title:'Research Engineer',sourceStatus:'面试',recordUrl:'https://careers.example.test/progress'}
+  ]});
+  const button=ui.document.getElementById('filler-application-sync-page');
+  assert.equal(button.disabled,false);
+  const rows=descendants(ui.document.getElementById('filler-candidates')).filter(item=>item.tagName==='INPUT');
+  rows[1].checked=true;rows[1].onchange();
+  await button.click();
+  assert.deepEqual(ui.state.lastApplicationSync,{action:'filler-application-sync-page',company:'Synthetic Robotics',candidateIds:['candidate-0','candidate-1']});
+  assert.equal(ui.state.lastApplicationSave,undefined);
 });
 
 test('DOM candidate selection keeps shared company and URL editable without saved-record lookup',async()=>{
@@ -486,11 +519,12 @@ const syntheticFields=[
 const missingRepeater={sectionId:'7:9:education',desired:2,count:1};
 function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};}
 
-test('one click fresh-scans then fills every eligible field without checkbox selection or implicit upload',async()=>{
+test('one click fresh-scans then fills every eligible field without an attachment target',async()=>{
   const ui=await setup({scanFields:syntheticFields}),button=ui.document.getElementById('filler-one-click');
-  assert.match(html,/<button id="filler-one-click"[^>]*>一键填写<\/button>/);
+  assert.match(html,/<button id="filler-one-click"[^>]*>一键扫描并填写<\/button>/);
   assert.match(html,/<details id="filler-advanced">/);
-  assert.ok(html.indexOf('id="filler-advanced"')<html.indexOf('id="filler-select-all"'));
+  assert.ok(html.indexOf('id="filler-scan"')<html.indexOf('id="filler-advanced"'));
+  assert.ok(html.indexOf('id="filler-confirm"')<html.indexOf('id="filler-advanced"'));
   assert.equal(ui.document.getElementById('filler-advanced').open,false);
   const selectAll=ui.document.getElementById('filler-select-all');selectAll.checked=false;selectAll.onchange();
   assert.equal(ui.document.getElementById('filler-confirm').disabled,true);
@@ -503,9 +537,40 @@ test('one click fresh-scans then fills every eligible field without checkbox sel
   assert.ok(fill.fieldIds.every(id=>JSON.parse(id)[4]==='scan-2'));
   assert.match(ui.document.getElementById('filler-one-click-feedback').textContent,/已填写 2 项.*失败 0 项.*另有 2 项需手动处理/);
   assert.match(ui.document.getElementById('filler-remaining').textContent,/补充问题.*未找到匹配答案.*密码/);
+  assert.equal(ui.document.getElementById('filler-advanced').open,true);
   assert.doesNotMatch(ui.document.getElementById('filler-remaining').textContent,/Synthetic Candidate|Example University/);
   assert.equal(ui.document.getElementById('filler-undo').disabled,false);
   assert.equal(button.disabled,false);
+});
+
+test('one click uploads an explicitly selected single resume target before rescanning and filling',async()=>{
+  const ui=await setup({scanFields:syntheticFields.slice(0,2)});
+  ui.state.filler.attachment={ready:true,name:'anonymous.pdf'};
+  ui.state.filler.attachmentTargets=[{fieldId:'resume-target',label:'简历附件'}];ui.push();
+  ui.document.getElementById('filler-one-click-upload').checked=true;
+  await ui.document.getElementById('filler-one-click').click();
+  assert.deepEqual(ui.commands.map(item=>item.action),['filler-scan','filler-attachment-upload','filler-scan','filler-fill']);
+  assert.deepEqual(ui.commands[1],{action:'filler-attachment-upload',scanId:'scan-2',fieldId:'resume-target',confirmed:true});
+  assert.equal(ui.commands[3].scanId,'scan-3');
+});
+
+test('one click never guesses among multiple resume upload targets',async()=>{
+  const ui=await setup();
+  ui.state.filler.attachment={ready:true,name:'anonymous.pdf'};
+  ui.state.filler.attachmentTargets=[{fieldId:'one'},{fieldId:'two'}];ui.push();
+  ui.document.getElementById('filler-one-click-upload').checked=true;
+  await ui.document.getElementById('filler-one-click').click();
+  assert.deepEqual(ui.commands.map(item=>item.action),['filler-scan']);
+  assert.match(ui.document.getElementById('filler-one-click-feedback').textContent,/无法唯一确定简历上传位置/);
+});
+
+test('one click prefers the unique explicit resume upload field over a generic CV field',async()=>{
+  const ui=await setup({scanFields:syntheticFields.slice(0,2)});
+  ui.state.filler.attachment={ready:true,name:'anonymous.pdf'};
+  ui.state.filler.attachmentTargets=[{fieldId:'generic',label:'CV'},{fieldId:'resume',label:'简历附件'}];ui.push();
+  await ui.document.getElementById('filler-one-click').click();
+  assert.deepEqual(ui.commands.map(item=>item.action),['filler-scan','filler-attachment-upload','filler-scan','filler-fill']);
+  assert.equal(ui.commands[1].fieldId,'resume');
 });
 
 test('one click prepares supported missing rows once and fills only the rescanned plan even if rows remain missing',async()=>{

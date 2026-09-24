@@ -56,6 +56,11 @@ def test_daily_sync_status_is_an_immediate_snapshot(tmp_path) -> None:
                 "current_step": "companies:1/10",
                 "step_count": 1,
                 "error": None,
+                "state": {"progress": {
+                    "stage": "companies", "scope_total": 10,
+                    "attempted_unique": 3, "confirmed_complete": 1,
+                    "retry_pending": 2, "remaining": 9,
+                }},
             }
 
     runner = OperationalTaskRunner(
@@ -72,6 +77,24 @@ def test_daily_sync_status_is_an_immediate_snapshot(tmp_path) -> None:
     assert time.monotonic() - started < 0.5
     assert response.data.run_status == "running"
     assert response.data.current_step == "companies:1/10"
+    assert response.data.progress["attempted_unique"] == 3
+    assert response.data.progress["retry_pending"] == 2
+
+
+def test_company_batch_limit_reaches_runtime_handler(tmp_path) -> None:
+    runner = OperationalTaskRunner(
+        LocalTaskScheduler(lock_path=tmp_path / "task.lock"),
+        {TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value:
+         lambda context: {"batch_limit": context.metadata["details"]["company_batch_limit"]}},
+    )
+
+    response = run_daily_recruitment_sync(
+        DailyRecruitmentSyncInput(mode="full", dry_run=True, company_batch_limit=1500),
+        runner,
+    )
+
+    assert response.data.company_batch_limit == 1500
+    assert response.data.result["batch_limit"] == 1500
 
 
 def test_daily_sync_tool_has_no_arbitrary_task_selector(tmp_path) -> None:

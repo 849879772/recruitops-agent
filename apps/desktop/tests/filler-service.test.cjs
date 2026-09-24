@@ -2,7 +2,7 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {EventEmitter}=require('node:events');
 const {FillerService}=require('../dist/filler-service');
-const adapter=require('../../../packages/desktop_filler/index.cjs');
+const desktopAdapter=require('../../../packages/desktop_filler/index.cjs');
 
 function setup(timeout=100) {
   const frame={processId:7,routingId:9,url:'https://example.com/form',detached:false,frames:[],async executeJavaScript(){throw new Error('top frame uses isolated world');}};
@@ -17,6 +17,7 @@ function setup(timeout=100) {
     }});
   frame.framesInSubtree=[frame];
   const adapter={loadDesktopFiller:()=>({}),buildCancelScript:()=> 'cancel',buildScanScript:(_bundle,profile,route)=>{scans.push({profile:structuredClone(profile),route});return 'scan';},buildFillScript:()=> 'fill',buildUndoScript:()=> 'undo',
+    mergeApplicationContexts:desktopAdapter.mergeApplicationContexts,
     aggregateFrameScans(outcomes){const hit=outcomes[0],selectionId=JSON.stringify(['instance',String(wc.id),'7:9',hit.route.documentId,hit.scan.scanId,'name']);return {ok:true,partial:false,failures:[],fields:[{route:hit.route,scanId:hit.scan.scanId,fieldId:'name',selectionId,match:hit.scan.matches[0]}]};}};
   const executor={execute:(page,frame,code)=>page.executeJavaScriptInIsolatedWorld(1005,[{code}]),assignFile:async()=>{throw new Error('unexpected upload');}};
   const service=new FillerService(adapter,()=>{},timeout,executor);service.attach(wc);service.setProfile({basic:{name:'Synthetic'}},1);
@@ -48,7 +49,7 @@ function scanOnlyService({scanResult,executeError}={}) {
     getURL(){return this.url;}});
   frame.framesInSubtree=[frame];
   const executor={execute:async()=>{if(executeError)throw executeError;return typeof scanResult==='function'?scanResult():scanResult;},assignFile:async()=>{throw new Error('unexpected upload');}};
-  const service=new FillerService(adapter,()=>{},100,executor);
+  const service=new FillerService(desktopAdapter,()=>{},100,executor);
   service.attach(wc);service.setProfile({basic:{fullName:'Synthetic Candidate'}},1);
   return {wc,service,frame,executor,setScanResult(value){scanResult=value;}};
 }

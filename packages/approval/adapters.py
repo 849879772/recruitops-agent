@@ -141,6 +141,10 @@ class AgentApplicationWriteAdapter:
     def create_schedule(self, _payload: dict[str, Any]) -> WriteEffect:
         self._unsupported()
 
+    def bind_recruitment_mail(self, payload: dict[str, Any]) -> WriteEffect:
+        from packages.recruitment_mail.binding import MailBindingAdapter
+        return MailBindingAdapter(self.storage).bind_recruitment_mail(payload)
+
     def update_application_stage(self, payload: dict[str, Any]) -> WriteEffect:
         application_id = str(payload["application_id"])
         target = ApplicationStage(str(payload["target_stage"]))
@@ -185,6 +189,15 @@ class AgentApplicationWriteAdapter:
                 ).with_for_update())
                 if mail_record is None or str(mail_record.application_id) != application_id:
                     raise ValueError("mail evidence is not bound to this application")
+                from packages.recruitment_mail.binding import confirmed_binding_matches, binding_revision
+                if (payload.get("mail_content_digest") is not None
+                        and mail_record.content_digest != payload["mail_content_digest"]):
+                    raise ValueError("mail content changed before status write")
+                if (payload.get("mail_binding_revision") is not None
+                        and binding_revision(mail_record) != payload["mail_binding_revision"]):
+                    raise ValueError("mail binding changed before status write")
+                if confirmed_binding_matches(mail_record, application) is False:
+                    raise ValueError("confirmed mail identity changed before status write")
 
             before = {
                 "application_id": application.id,

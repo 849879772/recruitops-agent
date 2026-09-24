@@ -54,9 +54,9 @@ def test_navigation_keeps_business_routes_and_decorative_line_icons():
 def test_script_and_style_versions_are_updated_together():
     versions = parse_navigation().asset_versions
     assert len(versions) == 4
-    assert versions == ["public-ui-20260918"] * 4
+    assert versions == ["public-ui-20260924-1"] * 4
     html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert '<script defer src="./company-sources.js?v=public-ui-20260918"></script>' in html
+    assert '<script defer src="./company-sources.js?v=public-ui-20260924-1"></script>' in html
     assert 'knowledge.js' not in html
 
 

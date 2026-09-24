@@ -115,9 +115,9 @@ def test_registers_exactly_the_read_only_tools() -> None:
         _browser_bridge_store(),
     )
 
-    assert MCP_TOOL_PROTOCOL_VERSION == "24"
-    assert len(MCP_TOOL_NAMES) == 38
-    assert len(MCP_READ_ONLY_TOOL_NAMES) == 24
+    assert MCP_TOOL_PROTOCOL_VERSION == "25"
+    assert len(MCP_TOOL_NAMES) == 47
+    assert len(MCP_READ_ONLY_TOOL_NAMES) == 28
     assert MCP_READ_ONLY_TOOL_NAMES == (
         "capabilities",
         "today_schedule",
@@ -143,6 +143,10 @@ def test_registers_exactly_the_read_only_tools() -> None:
         "automation_schedule_list",
         "application_capture",
         "daily_recruitment_sync_status",
+        "background_task_status",
+        "application_review_status",
+        "recruitment_mail_run_status",
+        "recruitment_mail_binding_candidates",
     )
     assert registered == MCP_READ_ONLY_TOOL_NAMES
     assert tuple(server.tools) == MCP_READ_ONLY_TOOL_NAMES
@@ -188,7 +192,7 @@ def test_agent_profile_exposes_business_tools_not_diagnostic_primitives() -> Non
 
     assert registered == MCP_AGENT_TOOL_NAMES
     assert tuple(server.tools) == MCP_AGENT_TOOL_NAMES
-    assert len(MCP_AGENT_TOOL_NAMES) == 30
+    assert len(MCP_AGENT_TOOL_NAMES) == 39
     assert {
         "search_jobs",
         "application_query",

@@ -31,6 +31,8 @@ def default_task_definitions() -> dict[str, TaskDefinition]:
             max_retries=0,
             misfire_grace_seconds=7_200.0,
             agent_write_enabled=True,
+            cooperative_timeout=True,
+            auto_continue_on_timeout=True,
         ),
         TaskType.CRAWLER_HEALTH.value: TaskDefinition(
             task_id=TaskType.CRAWLER_HEALTH.value,

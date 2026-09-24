@@ -148,6 +148,23 @@ def test_cursor_advanced_polling_counts_as_progress_and_can_complete() -> None:
     asyncio.run(scenario())
 
 
+def test_mail_bounded_waits_are_not_false_no_progress_but_keep_tool_budget() -> None:
+    async def run(wait_ms, budget=8):
+        events = []
+        for index in range(5):
+            event = _tool_event(f"mail-{index}")
+            event["params"]["item"].update(name="recruitment_mail_run_status",
+                arguments={"run_id": "mail-fixture", "wait_ms": wait_ms})
+            events.append(event)
+        loop = TurnStreamLoop(_events(events + [_completed_event()]), thread_id="thread-1", turn_id="turn-1",
+            limits=TurnLimits(turn_timeout_seconds=10, tool_call_budget=budget, repeated_no_progress_limit=2))
+        return await loop.run()
+
+    assert asyncio.run(run(20_000)).status is TurnLoopStatus.COMPLETED
+    assert asyncio.run(run(0)).interruption.reason is TurnInterruptionReason.REPEATED_NO_PROGRESS
+    assert asyncio.run(run(20_000, budget=2)).interruption.reason is TurnInterruptionReason.TOOL_CALL_BUDGET
+
+
 def test_turn_loop_interrupts_an_idle_stream_by_time_limit() -> None:
     async def scenario() -> None:
         gate = asyncio.Event()
