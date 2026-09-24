@@ -5,7 +5,7 @@
 ## 下载
 
 - [GitHub 发布页](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.5)
-- [123 网盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-R4bXd)
+- [123 网盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-xnW2d)
 - [Gitee 源码与更新说明](https://gitee.com/zs-k/recruitops-agent)
 
 文件：`RecruitOps-v0.1.5.zip`，738529313 字节（约 704 MB）。SHA-256 校验文件为 `RecruitOps-v0.1.5.zip.sha256.txt`。
