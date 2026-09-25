@@ -84,20 +84,27 @@ def test_models_share_one_base_and_legacy_preferences_are_normalized(owner):
     get_settings.cache_clear()
     settings = get_settings()
     assert settings.llm_model == settings.codex_model == settings.vision_model == "deepseek-flash"
-    assert settings.model_api_base_url == "https://legacy.example"
+    assert settings.model_api_base_url == "https://api.deepseek.com"
+    assert settings.llm_api_key == ""
+    assert settings.model_connection_migration_required
+    assert json.loads(path.read_text(encoding="utf-8"))["llm_api_key"] == "keep-secret"
     response = client.post("/api/local-ui/configuration/read", headers=headers).json()
-    assert "llm_model" not in response["settings"] and "vision_endpoint" not in response["settings"]
+    assert response["model_migration_required"] is True
     result = client.post("/api/local-ui/configuration/save", headers=headers,
-        json={"settings": {"model_api_base_url": "https://proxy.example/api/v1/", "llm_api_key": ""}})
+        json={"settings": {"model_api_base_url": "https://proxy.example/v1"}})
+    assert result.status_code == 422
+    # An unrelated save cannot reactivate/rebind the retired provider's secret.
+    result = client.post("/api/local-ui/configuration/save", headers=headers,
+        json={"settings": {"llm_enabled": True}})
     assert result.status_code == 200, result.text
-    settings = get_settings()
-    assert settings.codex_model_base_url == "https://proxy.example/api"
-    assert settings.llm_endpoint == "https://proxy.example/api/anthropic/v1/messages"
-    assert settings.vision_endpoint == "https://proxy.example/api/chat/completions"
-    assert settings.llm_api_key == "keep-secret"
-    assert "llm_model" not in json.loads(path.read_text(encoding="utf-8"))
-    assert client.post("/api/local-ui/configuration/save", headers=headers,
-        json={"settings": {"llm_model": "another-model"}}).status_code == 422
+    assert get_settings().llm_api_key == ""
+    assert not get_settings().llm_enabled
+    result = client.post("/api/local-ui/configuration/save", headers=headers,
+        json={"settings": {"model_api_base_url": "https://api.deepseek.com",
+                           "llm_api_key": "new-official-key", "llm_enabled": True}})
+    assert result.status_code == 200, result.text
+    assert get_settings().llm_api_key == "new-official-key"
+    assert get_settings().llm_enabled
 
 
 def test_environment_cannot_split_models(monkeypatch):
@@ -134,9 +141,9 @@ def test_multiple_model_connections_are_redacted_and_active_one_becomes_effectiv
         {"id": "deepseek-main", "name": "DeepSeek", "provider": "deepseek",
          "api_style": "anthropic", "base_url": "https://api.deepseek.com",
          "model": "deepseek-flash", "api_key": "deep-secret"},
-        {"id": "backup", "name": "备用", "provider": "openai-compatible",
-         "api_style": "openai", "base_url": "https://models.example/v1",
-         "model": "example-model", "api_key": "backup-secret"},
+        {"id": "backup", "name": "备用", "provider": "deepseek",
+         "api_style": "anthropic", "base_url": "https://api.deepseek.com",
+         "model": "deepseek-v4-pro", "api_key": "backup-secret"},
     ]
     response = client.post("/api/local-ui/configuration/save", headers=headers, json={
         "settings": {}, "model_connections": connections,
@@ -148,9 +155,9 @@ def test_multiple_model_connections_are_redacted_and_active_one_becomes_effectiv
     assert read.json()["active_model_connection_id"] == "backup"
     assert all(item["key_configured"] for item in read.json()["model_connections"])
     settings = get_settings()
-    assert settings.model_api_style == "openai"
-    assert settings.model_name == "example-model"
-    assert settings.llm_endpoint == "https://models.example/v1/chat/completions"
+    assert settings.model_api_style == "anthropic"
+    assert settings.model_name == "deepseek-v4-pro"
+    assert settings.llm_endpoint == "https://api.deepseek.com/anthropic/v1/messages"
     stored = json.loads((root / ".data/settings/model_connections.json").read_text(encoding="utf-8"))
     assert stored["active_id"] == "backup"
 
@@ -183,23 +190,24 @@ def test_source_shaped_profile_is_normalized_without_persisting_unmigrated_field
     assert read["profile"]["matching"]["primary_directions"] == ["供应链分析"]
 
 
-def test_model_connection_button_contract_checks_openai_chat_and_assistant(owner, monkeypatch):
+def test_model_connection_button_contract_checks_schema_and_assistant(owner, monkeypatch):
     client, headers, _, _ = owner
     calls = []
 
     def fake_transport(endpoint, request_headers, payload, timeout):
         calls.append((endpoint, request_headers, payload, timeout))
-        if endpoint.endswith("/chat/completions"):
-            return {"model": "example-model", "choices": [{"message": {"content": '{"status":"ok"}'}}]}
-        return {"id": "resp_test"}
+        if "text" in payload:
+            return {"status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": '{"result":{"status":"ok"}}'}]}]}
+        return {"id": "resp_test", "status": "completed"}
 
     monkeypatch.setattr("packages.matching.client._default_transport", fake_transport)
     response = client.post("/api/local-ui/configuration/model/test", headers=headers, json={
         "id": "backup",
-        "provider": "openai-compatible",
-        "api_style": "openai",
-        "base_url": "https://models.example/v1",
-        "model": "example-model",
+        "provider": "deepseek",
+        "api_style": "anthropic",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-v4-pro",
         "api_key": "test-key",
     })
 
@@ -207,8 +215,8 @@ def test_model_connection_button_contract_checks_openai_chat_and_assistant(owner
     assert response.json()["structured_output"] is True
     assert response.json()["assistant_runtime"] is True
     assert [call[0] for call in calls] == [
-        "https://models.example/v1/chat/completions",
-        "https://models.example/v1/responses",
+        "https://api.deepseek.com/responses",
+        "https://api.deepseek.com/responses",
     ]
 
 
@@ -245,9 +253,9 @@ def test_resume_parse_reports_missing_model_before_any_transport(owner):
 def test_resume_parse_is_anonymous_profile_driven_and_draft_only(owner, monkeypatch):
     client, headers, root, _ = owner
     model = {
-        "id": "local-openai", "name": "离线夹具模型", "provider": "openai-compatible",
-        "api_style": "openai", "base_url": "https://models.example/v1",
-        "model": "fixture-model", "api_key": "fixture-key",
+        "id": "local-openai", "name": "离线夹具模型", "provider": "deepseek",
+        "api_style": "anthropic", "base_url": "https://api.deepseek.com",
+        "model": "deepseek-flash", "api_key": "fixture-key",
     }
     saved = client.post("/api/local-ui/configuration/save", headers=headers, json={
         "settings": {"llm_enabled": True}, "model_connections": [model],
@@ -265,8 +273,9 @@ def test_resume_parse_is_anonymous_profile_driven_and_draft_only(owner, monkeypa
     }
 
     def fake_transport(endpoint, _headers, _payload, _timeout):
-        assert endpoint == "https://models.example/v1/chat/completions"
-        return {"model": "fixture-model", "choices": [{"message": {"content": json.dumps(draft, ensure_ascii=False)}}]}
+        assert endpoint == "https://api.deepseek.com/responses"
+        return {"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": json.dumps({"result": draft}, ensure_ascii=False)}]}]}
 
     monkeypatch.setattr("packages.matching.client._default_transport", fake_transport)
     response = client.post("/api/local-ui/configuration/resume/parse", headers=headers, json={"text": resume_text})

@@ -295,7 +295,10 @@ def test_incremental_hydration_checkpoint_survives_interruption(setup_pipeline):
     assert len(work["hydration_results"]) == 1
     completed_id = work["jd_results"][0]["job_id"]
     with storage.session() as session:
-        assert session.scalar(select(JobSnapshot)) is None
+        rows = {row.id: row for row in session.scalars(select(JobSnapshot))}
+        assert set(rows) == {"one", "two"}
+        assert rows[completed_id].capture_status == "complete"
+        assert all(row.capture_status == "pending" for key, row in rows.items() if key != completed_id)
         assert session.scalar(select(CompanySourceRecord)).status != "complete"
 
     calls = []
@@ -306,7 +309,8 @@ def test_incremental_hydration_checkpoint_survives_interruption(setup_pipeline):
 
     result = build(crawler=forbidden, jd_hydrator=hydrate, resume_from_checkpoint=True).run()
     assert calls == [row["id"] for row in jobs if row["id"] != completed_id]
-    assert result.new_count == 2
+    assert result.new_count == 0
+    assert result.reused_count == 2
     assert result.company_results[0].detail_success_count == 2
     entry = json.loads(checkpoint.read_text(encoding="utf-8"))["companies"]["a"]
     assert entry["attempts"] == 1
@@ -315,28 +319,35 @@ def test_incremental_hydration_checkpoint_survives_interruption(setup_pipeline):
 
 
 @pytest.mark.parametrize("partial_list", [False, True])
-def test_database_failure_keeps_hydration_for_resume_without_false_completion(
+def test_detail_database_failure_keeps_pending_rows_without_advancing_hydration(
     setup_pipeline, monkeypatch, partial_list,
 ):
     build, storage, checkpoint = setup_pipeline
     listing = replace(crawl(job("one")), has_more=partial_list, pagination_complete=not partial_list)
+    original_persist = DailyRecruitmentPipeline._persist_title_first
 
-    def fail_persist(*args, **kwargs):
-        raise OperationalError("persist jobs", {}, RuntimeError("fixture write failure"))
+    def fail_persist(self, **kwargs):
+        if any(candidate.job.get("capture_status") == "complete" for candidate in kwargs["new_candidates"]):
+            raise OperationalError("persist jobs", {}, RuntimeError("fixture write failure"))
+        return original_persist(self, **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(DailyRecruitmentPipeline, "_persist_title_first", fail_persist)
         with pytest.raises(OperationalError):
             build(crawler=lambda _: listing).run()
     with storage.session() as session:
-        assert session.scalar(select(JobSnapshot)) is None
+        row = session.scalar(select(JobSnapshot))
+        assert row is not None and row.capture_status == "pending"
+        assert row.jd_raw is None and row.match_score is None
         assert session.scalar(select(CompanySourceRecord)).status != "complete"
+    assert not hydration_path(checkpoint).exists()
 
     result = build(
         crawler=(lambda _: listing) if partial_list else forbidden,
-        jd_hydrator=forbidden, resume_from_checkpoint=True,
+        jd_hydrator=detail, resume_from_checkpoint=True,
     ).run()
-    assert result.new_count == 1
+    assert result.new_count == 0
+    assert result.reused_count == 1
     assert result.company_results[0].status == ("partial" if partial_list else "complete")
     entry = json.loads(checkpoint.read_text(encoding="utf-8"))["companies"]["a"]
     assert entry["attempts"] == (2 if partial_list else 1)
@@ -389,6 +400,14 @@ def test_checkpoint_reuse_revalidates_receipts_and_screening(setup_pipeline, mon
         work["accepted_jobs"][0]["detail_url"] += "-changed"
     checkpoint.write_text(json.dumps(payload), encoding="utf-8")
     sidecar.write_text(json.dumps(details), encoding="utf-8")
+    if changed != "internship":
+        # Exercise legacy sidecar-only recovery: modern batches have already
+        # committed details, which are authoritative despite a damaged sidecar.
+        with storage.write_transaction() as session:
+            row = session.get(JobSnapshot, "a")
+            row.jd_raw = None
+            row.capture_evidence = {}
+            row.capture_status = "pending"
     calls = []
 
     def hydrate(row):
@@ -399,9 +418,14 @@ def test_checkpoint_reuse_revalidates_receipts_and_screening(setup_pipeline, mon
                    matcher=forbidden if changed == "internship" else None,
                    resume_from_checkpoint=True).run()
     assert calls == ([] if changed == "internship" else ["a"])
-    assert result.new_count == (0 if changed == "internship" else 1)
+    assert result.new_count == 0
     with storage.session() as session:
-        assert len(list(session.scalars(select(JobSnapshot)))) == result.new_count
+        rows = list(session.scalars(select(JobSnapshot)))
+        assert len(rows) == 1
+        assert rows[0].capture_status == "complete"
+        assert rows[0].availability_status == ("inactive" if changed == "internship" else "active")
+        if changed == "internship":
+            assert rows[0].capture_failure_reason.startswith("excluded:")
 
 
 def test_hydration_batches_do_not_rewrite_list_checkpoint(setup_pipeline, monkeypatch):
@@ -447,7 +471,8 @@ def test_old_list_checkpoint_upgrades_without_recrawl(setup_pipeline):
     upgraded = json.loads(checkpoint.read_text(encoding="utf-8"))
     assert upgraded["version"] == payload["version"] == 1
     assert upgraded["companies"] == payload["companies"]
-    assert result.new_count == 1
+    assert result.new_count == 0
+    assert result.reused_count == 1
     assert hydration_work(checkpoint)["detail_success_count"] == 1
 
 
@@ -461,6 +486,13 @@ def test_fresh_run_does_not_reuse_previous_run_sidecars(setup_pipeline):
     with pytest.raises(RuntimeError):
         build(progress_callback=interrupt).run()
     previous = hydration_path(checkpoint)
+    # Remove only the synthetic DB detail so this exercises sidecar isolation
+    # instead of valid persisted-detail reuse.
+    with storage.write_transaction() as session:
+        row = session.get(JobSnapshot, "a")
+        row.jd_raw = None
+        row.capture_evidence = {}
+        row.capture_status = "pending"
     calls = []
     build(jd_hydrator=lambda row: calls.append(row["id"]) or detail(row)).run()
     assert calls == ["a"]
@@ -480,6 +512,11 @@ def test_resume_reads_legacy_long_hydration_sidecar(setup_pipeline):
     legacy = legacy_hydration_path(checkpoint)
     legacy.parent.mkdir(parents=True, exist_ok=True)
     current.replace(legacy)
+    with storage.write_transaction() as session:
+        row = session.get(JobSnapshot, "a")
+        row.jd_raw = None
+        row.capture_evidence = {}
+        row.capture_status = "pending"
 
     result = build(
         crawler=forbidden,
@@ -487,7 +524,8 @@ def test_resume_reads_legacy_long_hydration_sidecar(setup_pipeline):
         resume_from_checkpoint=True,
     ).run()
 
-    assert result.new_count == 1
+    assert result.new_count == 0
+    assert result.reused_count == 1
 
 
 def test_hydration_sidecar_uses_bounded_names(setup_pipeline):
@@ -570,9 +608,11 @@ def test_sidecar_write_failure_propagates_and_preserves_previous_batch(setup_pip
     assert saved["detail_success_count"] == 1
     completed_id = saved["jd_results"][0]["job_id"]
     with storage.session() as session:
-        assert session.scalar(select(JobSnapshot)) is None
+        rows = {row.id: row for row in session.scalars(select(JobSnapshot))}
+        assert set(rows) == {"one", "two"}
+        assert all(row.capture_status == "complete" for row in rows.values())
         assert session.scalar(select(CompanySourceRecord)).status != "complete"
     calls = []
     build(crawler=forbidden, resume_from_checkpoint=True,
           jd_hydrator=lambda row: calls.append(row["id"]) or detail(row)).run()
-    assert calls == [row["id"] for row in jobs if row["id"] != completed_id]
+    assert calls == []

@@ -32,6 +32,7 @@ def test_child_environment_launches_manifest_chromium(tmp_path, monkeypatch):
         executable_path=str(executable), headless=True, args=["--disable-gpu"]
     )
     assert result is browser.chromium.launch.return_value
+    result.close()
 
 
 def test_desktop_missing_executable_fails_without_fallback():
@@ -58,3 +59,4 @@ def test_non_desktop_browser_configuration_unchanged(env, kwargs, expected):
     with patch.dict("os.environ", env, clear=True):
         launch_browser(browser, headless=True, **kwargs)
     browser.chromium.launch.assert_called_once_with(headless=True, **expected)
+    browser.chromium.launch.return_value.close()

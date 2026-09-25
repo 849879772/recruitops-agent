@@ -29,8 +29,8 @@ def completion_case(tmp_path, monkeypatch):
         monkeypatch.setenv(key, value)
     settings = Settings(_env_file=None, agent_root=root, source_root=root / "unused-source",
         database_url="sqlite:///:memory:", write_enabled=True, llm_enabled=True,
-        llm_api_key="synthetic-not-a-real-key", model_name="fixture-model",
-        model_api_base_url="https://model.example.test", job_analysis_enabled=False,
+        llm_api_key="synthetic-not-a-real-key", model_name="deepseek-flash",
+        model_api_base_url="https://api.deepseek.com", job_analysis_enabled=False,
         codex_runtime_enabled=False, mail_enabled=False, mail_sync_on_startup=False,
         automation_enabled=False, vision_enabled=False, offerbiu_industry_groups=["finance"])
     profile = CandidateProfile(source_ref="fixture", content_hash="0" * 64,

@@ -716,6 +716,7 @@ def test_title_first_detail_workers_are_bounded(tmp_path: Path) -> None:
         jd_hydrator=hydrator,
         matcher=FakeMatcher(),
         max_concurrency=2,
+        detail_max_concurrency=2,
     )
 
     assert result.new_count == len(jobs)

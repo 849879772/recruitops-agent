@@ -274,7 +274,7 @@ def test_default_supervisor_passes_dotenv_provider_key_only_to_child_environment
         agent_root=tmp_path,
         codex_model="deepseek-v4-pro",
         codex_model_provider_id="deepseek",
-        codex_model_base_url="https://api.deepseek.example",
+        codex_model_base_url="https://api.deepseek.com",
         codex_model_api_key_env="RECRUITOPS_LLM_API_KEY",
         codex_reasoning_effort="high",
         codex_command=("codex", "app-server"),
@@ -282,10 +282,13 @@ def test_default_supervisor_passes_dotenv_provider_key_only_to_child_environment
         llm_api_key="dotenv-secret",
         llm_enabled=True,
         job_analysis_enabled=True,
-        llm_model="mail-model",
-        llm_endpoint="https://api.deepseek.example/messages",
+        llm_model="deepseek-v4-pro",
+        llm_endpoint="https://api.deepseek.com/anthropic/v1/messages",
         llm_timeout_seconds=25,
         match_max_concurrency=1,
+        crawl_max_concurrency=3,
+        detail_max_concurrency=5,
+        browser_max_concurrency=2,
     )
     monkeypatch.delenv("RECRUITOPS_LLM_API_KEY", raising=False)
     monkeypatch.setattr(config_module, "get_settings", lambda: settings)
@@ -303,9 +306,13 @@ def test_default_supervisor_passes_dotenv_provider_key_only_to_child_environment
         assert "RECRUITOPS_MATCH_MAX_CONCURRENCY" in forwarded
         assert supervisor.config.environment["RECRUITOPS_LLM_ENABLED"] == "true"
         assert supervisor.config.environment["RECRUITOPS_JOB_ANALYSIS_ENABLED"] == "true"
-        assert supervisor.config.environment["RECRUITOPS_LLM_MODEL"] == "mail-model"
+        assert supervisor.config.environment["RECRUITOPS_LLM_MODEL"] == "deepseek-v4-pro"
         assert supervisor.config.environment["RECRUITOPS_LLM_TIMEOUT_SECONDS"] == "25"
         assert supervisor.config.environment["RECRUITOPS_MATCH_MAX_CONCURRENCY"] == "1"
+        for key, value in (("CRAWL", "3"), ("DETAIL", "5"), ("BROWSER", "2")):
+            name = f"RECRUITOPS_{key}_MAX_CONCURRENCY"
+            assert name in forwarded
+            assert supervisor.config.environment[name] == value
     finally:
         codex_bff.get_codex_supervisor.cache_clear()
 

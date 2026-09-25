@@ -35,21 +35,21 @@
 
 ### 1. 下载桌面版
 
-当前可用版本为 RecruitOps v0.1.5，请下载 `RecruitOps-v0.1.5.zip`：
+当前可用版本为 RecruitOps v0.1.6，请下载 `RecruitOps-v0.1.6.zip`：
 
-- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.5)
-- [Gitee v0.1.5 更新说明](https://gitee.com/zs-k/recruitops-agent/blob/main/docs/RELEASE_v0.1.5.md)（完整安装包请从 GitHub 或 123 云盘下载）
-- [123 云盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-xnW2d)
+- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.6)
+- [Gitee v0.1.6 更新说明](https://gitee.com/zs-k/recruitops-agent/blob/main/docs/RELEASE_v0.1.6.md)（完整压缩包请从 GitHub 或 123 云盘下载）
+- [123 云盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-Aa02d)（含压缩包和 SHA-256 校验文件，无提取码）
 
 安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
 
 ```text
-D9030D35B30F67497EBB6AB9115AA7A587BB2DA52CA2E50A1D233424F7D8C47E
+6518E892E0C6D3E8847A34A773EB8262BCE39A0009F58DFE5F6AFE4C16BBCCF2
 ```
 
 如果旧版已经爬取到岗位，或已有投递记录、招聘邮件，请先阅读[已有数据的桌面版升级步骤](docs/UPGRADE_EXISTING_DATA.md)。不要直接把旧版 `.data` 复制到不同安装路径。
 
-本版重点修复简历结构化解析、评分缺维度、管理员权限启动、全量任务超时接续和批量投递复核，并完善任务进度、邮件关联及投递搜索。完整范围与限制见 [v0.1.5 更新说明](docs/RELEASE_v0.1.5.md)。
+本版重点改进来源刷新容错、长任务成果保存、抓取效率，以及全量任务结束后的自动汇报；模型连接改为仅支持 DeepSeek 官方接口。完整范围与限制见 [v0.1.6 更新说明](docs/RELEASE_v0.1.6.md)。
 
 ### 2. 完整解压
 
@@ -80,12 +80,14 @@ RecruitOps-Desktop-Preview.exe
 ### 1. 配置模型连接
 
 1. 点击 **添加连接**，或编辑已有的主连接。
-2. 选择 `DeepSeek` 或 `OpenAI 兼容接口`。
-3. 填写 API 服务地址、模型名称和 API Key。
+2. 使用 `DeepSeek` 官方接口（地址固定为 `https://api.deepseek.com`），填写官方 API 密钥；不再支持第三方 OpenAI 兼容服务。
+3. 选择 `deepseek-flash` 或 `deepseek-v4-pro` 并填写 API Key；官方地址不可编辑。
 4. 点击 **测试连接**。测试会检查鉴权、模型名称、结构化输出和求职助理接口。
 5. 测试通过后点击 **保存模型连接**。
 
 可以保存多个连接，但同一时间只有一个主连接。简历解析、岗位评分、邮件理解和求职助理都使用当前主连接。
+
+旧第三方连接会停用，请重新保存 DeepSeek 官方密钥；不会把旧密钥自动发送给 DeepSeek，也不会删除业务数据。结构化解析改用官方 Responses 的 JSON Schema 约束，并保留本地字段校验与有限重试。源码改动、验证边界和发布状态见 [DeepSeek 专用接口与截断验证说明](docs/DEEPSEEK_ONLY_SCHEMA_20260925.md)。
 
 ### 2. 上传并分析简历
 

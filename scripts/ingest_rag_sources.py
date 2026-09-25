@@ -9,10 +9,8 @@ from pathlib import Path
 from packages.config import Settings
 from packages.rag import (
     DeterministicEmbeddingProvider,
-    OpenAICompatibleEmbeddingProvider,
     PersistentRagIndexer,
     PgVectorDocumentStore,
-    SemanticPgVectorDocumentStore,
     document_from_profile_config,
     documents_from_text_files,
     load_manifest_documents,
@@ -137,6 +135,8 @@ def _keep_source_refs(documents) -> dict[str, set[str]]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.backend == "semantic":
+        raise SystemExit("Remote compatible embeddings are retired; use --backend pgvector. Existing semantic data is retained.")
     manifest, documents = _load_requested_documents(args)
     if args.prune_managed and manifest is None:
         raise SystemExit("--prune-managed requires --manifest")
@@ -157,24 +157,11 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = Settings()
     database_url = args.database_url or settings.database_url
-    if args.backend == "semantic":
-        if not settings.embedding_endpoint:
-            raise SystemExit("semantic backend requires RECRUITOPS_EMBEDDING_ENDPOINT")
-        provider = OpenAICompatibleEmbeddingProvider(
-            settings.embedding_endpoint,
-            model=settings.embedding_model,
-            api_key=settings.embedding_api_key or None,
-            dimension=settings.embedding_dimension,
-        )
-    else:
-        provider = DeterministicEmbeddingProvider()
+    provider = DeterministicEmbeddingProvider()
 
     engine = create_storage_engine(database_url)
     try:
-        if args.backend == "semantic":
-            store = SemanticPgVectorDocumentStore(engine, provider)
-        else:
-            store = PgVectorDocumentStore(engine, provider)
+        store = PgVectorDocumentStore(engine, provider)
         store.ensure_schema()
         result = PersistentRagIndexer(store).sync_many(documents)
         pruned_chunks = 0

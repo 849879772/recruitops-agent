@@ -53,6 +53,22 @@ def test_current_task_projection_is_guarded_read_only_and_empty_without_work(loc
     assert response.json() == {"run": None, "runs": []}
 
 
+def test_current_task_projection_can_read_one_terminal_run_without_history_fallback(local_api, monkeypatch):
+    client, _, _ = local_api
+    run_id = "a" * 32
+    seen = []
+    monkeypatch.setattr(api, "task_progress", lambda storage, run_id=None: seen.append(run_id) or {
+        "runs": [{"run_id": run_id, "task_kind": "daily", "status": "failed"}],
+        "run": {"run_id": run_id, "task_kind": "daily", "status": "failed"},
+    })
+    headers = {"X-RecruitOps-Local-UI": "1", "Sec-Fetch-Site": "same-origin"}
+    response = client.get("/api/local-ui/tasks/progress", params={"run_id": run_id}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["run"]["status"] == "failed"
+    assert seen == [run_id]
+    assert client.get("/api/local-ui/tasks/progress", params={"run_id": "short"}, headers=headers).status_code == 422
+
+
 def test_control_is_gated_and_persists_only_explicit_action(local_api, monkeypatch):
     client, store, settings = local_api
     calls = []

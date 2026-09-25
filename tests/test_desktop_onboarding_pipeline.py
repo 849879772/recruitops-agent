@@ -56,13 +56,13 @@ def test_every_configured_industry_reaches_capture_and_registration(group):
     assert registry.list_sources()["total"] == 2  # Preserve history, don't crawl it.
 
 
-def test_all_industries_and_mismatched_response_fail_closed():
+def test_all_industries_trust_selected_source_scope_not_stale_row_labels():
     groups = [code for code, _ in OFFERBIU_INDUSTRY_GROUP_OPTIONS]
     result = capture_offerbiu_snapshot(session=Session(groups), scope={"industry_groups": groups})
     assert result["complete"] and len(result["items"]) == len(groups)
     result = capture_offerbiu_snapshot(session=Session(["finance"], "internet-tech"),
                                       scope={"industry_groups": ["finance"]})
-    assert not result["complete"] and result["stop_reason"] == "source_filter_mismatch"
+    assert result["complete"] and result["scope_verified"]
     for invalid in ([], ["unknown"], "finance"):
         with pytest.raises(ValueError):
             capture_offerbiu_snapshot(session=Session([]), scope={"industry_groups": invalid})
@@ -82,9 +82,9 @@ def test_blank_profile_and_edited_keywords_are_not_developer_defaults():
 @pytest.mark.parametrize("scheduled", [False, True])
 def test_saved_provider_profile_reach_real_scoring_code_without_network(owner, monkeypatch, scheduled):
     client, headers, root, storage = owner
-    connection = {"id": "fixture", "name": "Fixture", "provider": "openai-compatible",
-                  "api_style": "openai", "base_url": "https://model.example.test/v1",
-                  "model": "fixture-score", "api_key": "synthetic-not-a-credential"}
+    connection = {"id": "fixture", "name": "Fixture", "provider": "deepseek",
+                  "api_style": "anthropic", "base_url": "https://api.deepseek.com",
+                  "model": "deepseek-flash", "api_key": "synthetic-not-a-credential"}
     profile = {"skills": ["SQL"], "matching": {"title_keywords": ["Supply Chain"],
                "project_evidence": ["Supply Chain SQL analysis"]},
                "scope": {"industry_groups": ["finance"]}}
@@ -103,16 +103,19 @@ def test_saved_provider_profile_reach_real_scoring_code_without_network(owner, m
 
     def transport(endpoint, headers, payload, timeout):
         calls.append(payload)
-        assert endpoint == "https://model.example.test/v1/chat/completions"
+        assert endpoint == "https://api.deepseek.com/responses"
         assert "Authorization" in headers and "x-api-key" not in headers
-        assert payload["model"] == "fixture-score"
-        assert "Supply Chain" in payload["messages"][1]["content"]
+        assert payload["model"] == "deepseek-flash"
+        assert "Supply Chain" in payload["input"]
         result = {"matched_directions": [], "primary_match_direction": None,
                   "score_breakdown": {"core_direction": 25, "required_skills": 20,
                                       "project_evidence": 20, "engineering_stack": 10},
-                  "evidence_level": "partial", "evidence": [], "summary": "Synthetic score"}
-        return {"choices": [{"message": {"content": json.dumps(result)}}],
-                "usage": {"prompt_tokens": 12, "completion_tokens": 8}}
+                  "evidence_level": "partial", "evidence": [{"jd_requirement": "SQL",
+                  "profile_evidence": "SQL analysis", "relation": "direct", "requirement_type": "core"}],
+                  "summary": "Synthetic score", "missing_core_requirements": [], "advantages": [], "gaps": []}
+        return {"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": json.dumps({"result": result})}]}],
+                "usage": {"input_tokens": 12, "output_tokens": 8}}
 
     wire = DeepSeekClient(api_key=settings.llm_api_key, model=settings.llm_model,
                           endpoint=settings.llm_endpoint, api_style=settings.model_api_style,
@@ -150,19 +153,23 @@ def test_saved_provider_profile_reach_real_scoring_code_without_network(owner, m
     with storage.session() as db:
         jobs = list(db.scalars(select(JobSnapshot)))
         analyses = list(db.scalars(select(JobAnalysisSnapshot)))
-    assert [row.title for row in jobs] == ["Supply Chain Analyst"]
+    # Early persistence retains discovered evidence, including a later-excluded
+    # internship. It must not receive a model score.
+    assert {row.title for row in jobs} == {"Supply Chain Analyst", "Supply Chain Operations"}
+    assert next(row for row in jobs if row.title == "Supply Chain Operations").match_score is None
     assert set(hydrated) == {"good", "intern-jd"}
     assert len(calls) == 1
-    assert len(analyses) == 1 and analyses[0].analysis_status == "complete"
-    assert analyses[0].model == "fixture-score"
+    completed = [row for row in analyses if row.analysis_status == "complete"]
+    assert len(completed) == 1
+    assert completed[0].model == "deepseek-flash"
 
 
-def test_openai_truncation_is_failure_not_success():
-    wire = DeepSeekClient(api_key="fixture", model="fixture", api_style="openai",
-                          transport=lambda *args: {"choices": [{"finish_reason": "length",
-                                                                 "message": {"content": "{}"}}]})
+def test_deepseek_truncation_is_failure_not_success():
+    wire = DeepSeekClient(api_key="fixture", model="deepseek-flash",
+                         transport=lambda *args: {"status": "incomplete",
+                             "incomplete_details": {"reason": "max_output_tokens"}})
     with pytest.raises(DeepSeekClientError, match="response_truncated"):
-        wire.complete(system_prompt="JSON", user_prompt="fixture")
+        wire.complete_structured(system_prompt="JSON", user_prompt="fixture", schema={"type": "object"})
 
 
 def test_runtime_capabilities_can_be_saved_without_saving_launch_authority(owner):
@@ -237,9 +244,9 @@ def test_desktop_mask_is_authoritative_after_preferences(owner, monkeypatch, mas
     preferences = dict.fromkeys(DESKTOP_CAPABILITY_FIELDS, True)
     preferences.update({
         "llm_api_key": "synthetic-model-key",
-        "model_api_style": "openai",
-        "model_api_base_url": "https://model.example.test/v1",
-        "model_name": "fixture-model",
+        "model_api_style": "anthropic",
+        "model_api_base_url": "https://api.deepseek.com",
+        "model_name": "deepseek-flash",
         "mail_imap_host": "imap.example.test",
         "mail_imap_port": 993,
         "mail_imap_username": "fixture@example.test",
@@ -317,9 +324,9 @@ def test_completion_rejected_before_any_configuration_write(owner, monkeypatch):
 
 def test_keyless_draft_saves_and_credentials_do_not_enable_features(owner):
     client, headers, _, _ = owner
-    connection = {"id": "draft", "name": "Draft", "provider": "openai-compatible",
-                  "api_style": "openai", "base_url": "https://model.example.test/v1",
-                  "model": "fixture", "api_key": ""}
+    connection = {"id": "draft", "name": "Draft", "provider": "deepseek",
+                  "api_style": "anthropic", "base_url": "https://api.deepseek.com",
+                  "model": "deepseek-flash", "api_key": ""}
     payload = {"model_connections": [connection], "active_model_connection_id": "draft",
                "profile": {"skills": [], "matching": {"title_keywords": ["测试工程师"]}},
                "settings": {"mail_enabled": False}}

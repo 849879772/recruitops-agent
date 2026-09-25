@@ -44,6 +44,9 @@ class RecordingAdapter:
     def create_schedule(self, payload):
         return self._record(OperationName.SCHEDULE_CREATE, payload)
 
+    def bind_recruitment_mail(self, payload):
+        return self._record(OperationName.RECRUITMENT_MAIL_BINDING, payload)
+
 
 def _preview(operation: OperationName, key: str) -> ApprovalPreview:
     values: dict[str, object] = {

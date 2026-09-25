@@ -506,6 +506,9 @@ def get_codex_supervisor() -> CodexSupervisor:
         "RECRUITOPS_CHECKPOINT_MODE",
         "RECRUITOPS_TRACE_PATH",
         "RECRUITOPS_CRAWL_MAX_CONCURRENCY",
+        "RECRUITOPS_DETAIL_MAX_CONCURRENCY",
+        "RECRUITOPS_BROWSER_MAX_CONCURRENCY",
+        "RECRUITOPS_CRAWL_RESOURCE_ROOT",
         "RECRUITOPS_BROWSER_CHANNEL",
         "RECRUITOPS_BROWSER_EXECUTABLE_PATH",
         "RECRUITOPS_EMBEDDING_ENDPOINT",
@@ -588,6 +591,9 @@ def get_codex_supervisor() -> CodexSupervisor:
         "llm_endpoint",
         "llm_timeout_seconds",
         "match_max_concurrency",
+        "crawl_max_concurrency",
+        "detail_max_concurrency",
+        "browser_max_concurrency",
     ):
         value = getattr(settings, field, None)
         if value is not None:

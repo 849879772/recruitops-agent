@@ -133,7 +133,7 @@ class FakeMatcher:
         }
 
 
-def test_pipeline_selects_agent_companies_and_writes_one_transaction(tmp_path: Path) -> None:
+def test_pipeline_selects_agent_companies_and_commits_each_phase(tmp_path: Path) -> None:
     config = _write_companies(
         tmp_path / "companies.yaml",
         {
@@ -205,9 +205,9 @@ def test_pipeline_selects_agent_companies_and_writes_one_transaction(tmp_path: P
     assert crawler_calls == ["Connected Co"]
     assert len(matcher.calls) == 1
     assert source_write_calls == 6
-    # Title-first saves all admitted rows before scoring, then persists the
-    # completed score in a second transaction.
-    assert write_calls - source_write_calls == 2
+    # Listing admission, detail capture, metadata reconciliation, and scoring
+    # each have a durable transaction boundary.
+    assert write_calls - source_write_calls == 4
     with storage.session() as session:
         # The title-first run registers every configured company, including
         # skipped and currently unusable entries, before crawling candidates.
@@ -1118,7 +1118,8 @@ def test_matching_runs_concurrently_and_checkpoints_batches(tmp_path: Path) -> N
     assert peak_active >= 2
     assert result.new_count == 8
     assert source_write_calls == 2
-    assert write_calls - source_write_calls == 4
+    # Three listing, three detail, three scoring batches plus reconciliation.
+    assert write_calls - source_write_calls == 10
     assert [item for item in progress if item[0] == "matching"] == [
         ("matching", 3, 8),
         ("matching", 6, 8),

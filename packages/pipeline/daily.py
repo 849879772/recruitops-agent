@@ -7,19 +7,23 @@ so a run can be tested without a network or a model call.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 import hashlib
+import heapq
 import inspect
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import re
 from threading import Event
+from time import monotonic, sleep
 from typing import Any, Protocol
 import unicodedata
 from urllib.parse import urlsplit
@@ -27,7 +31,8 @@ from uuid import uuid4
 
 import yaml
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import select
+from requests.exceptions import ConnectionError as RequestConnectionError
+from sqlalchemy import select, update
 
 from packages.discovery import classify_oc_destination_url, source_identity_for_url
 from packages.domain.job_identity import build_job_identity, normalize_job_identity_url, normalize_job_title
@@ -60,6 +65,11 @@ from .isolation import (
     crawl_company_result_isolated,
     fetch_job_detail_result_isolated,
 )
+from .company_checkpoint import (
+    COMPACT_COMPANY_CHECKPOINT_MIN_SCOPE,
+    COMPACT_COMPANY_CHECKPOINT_VERSION,
+    company_receipt_path,
+)
 
 try:
     from packages.matching import content_fingerprint as _matching_content_fingerprint
@@ -87,6 +97,11 @@ DEFAULT_DETAIL_REUSE_TTL_HOURS = 24.0
 _FINGERPRINT_RE = re.compile(r":fp:(?P<fingerprint>[0-9a-f]{64})$")
 _TITLE_FIRST_PENDING_ANALYSIS_VERSION = "title-first-pending-v1"
 _TITLE_FIRST_CAPTURE_POLICY = "title_first_v2"
+_COMPANY_PROGRESS_INTERVAL_SECONDS = 2.5
+_SHORT_RETRY_COOLDOWN_SECONDS = 1.0
+_DELAYED_RETRY_COOLDOWN_SECONDS = 30.0
+_COMPANY_RETRY_STAGE_BUDGET_SECONDS = 180.0
+_COMPANY_RETRY_STAGE_MAX_TASKS = 50
 _FILTERED_STATUSES = {
     "cohort_unconfirmed",
     "early_batch",
@@ -132,8 +147,14 @@ class MatcherProtocol(Protocol):
     def match(self, job: Mapping[str, Any], *, existing_analysis: Any = None) -> Any: ...
 
 
-def _default_jd_hydrator(job: dict[str, Any]) -> Mapping[str, Any]:
-    return fetch_job_detail_result_isolated(job, timeout_seconds=120.0)
+def _default_jd_hydrator(
+    job: dict[str, Any], *, resource_root: Path | str | None = None,
+    browser_max_concurrency: int = 6,
+) -> Mapping[str, Any]:
+    return fetch_job_detail_result_isolated(
+        job, timeout_seconds=120.0, resource_root=resource_root,
+        browser_max_concurrency=browser_max_concurrency,
+    )
 
 
 def _now() -> datetime:
@@ -487,6 +508,7 @@ class CrawlResult:
     entry_attempts: Sequence[Mapping[str, Any]] = ()
     scope_key: str | None = None
     error_code: str | None = None
+    resource_timing: Mapping[str, float | int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -663,6 +685,67 @@ class _CompanyWork:
 
 
 _COMPANY_CHECKPOINT_VERSION = 1
+
+
+def company_scope_digest(companies: Sequence[PipelineCompany]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [_dump(company.crawler_config()) for company in companies],
+            sort_keys=True, ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _atomic_checkpoint(path: Path, payload: Mapping[str, Any]) -> None:
+    """Replace a receipt only after flushing it, retaining the previous valid JSON."""
+
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    backup = path.with_name(path.name + ".bak")
+    temporary = path.with_name(path.name + ".tmp")
+    backup_temporary = backup.with_name(backup.name + ".tmp")
+    for attempt in range(3):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            previous = None
+            if path.is_file():
+                try:
+                    previous = path.read_text(encoding="utf-8")
+                    if not isinstance(json.loads(previous), Mapping):
+                        previous = None
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    previous = None
+            if previous is not None:
+                with backup_temporary.open("w", encoding="utf-8") as handle:
+                    handle.write(previous)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                backup_temporary.replace(backup)
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+            return
+        except OSError as exc:
+            if attempt == 2:
+                raise PipelineError(
+                    f"checkpoint persistence failed; stopping without advancing recovery: {path}"
+                ) from exc
+            sleep(0.05 * (attempt + 1))
+
+
+def _restore_checkpoint_primary(path: Path, encoded: bytes) -> None:
+    """Restore an indexed backup without rotating away that valid backup."""
+
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except OSError as exc:
+        raise PipelineError(f"indexed company receipt could not be restored: {path}") from exc
 
 
 def _checkpoint_work_payload(work: _CompanyWork) -> dict[str, Any]:
@@ -1048,6 +1131,47 @@ def _pagination_failure_reason(result: CrawlResult, *, completeness_known: bool)
     return None
 
 
+def _company_retry_kind(work: _CompanyWork) -> str | None:
+    """Retry only failures that can plausibly change without a code or login fix."""
+
+    if work.list_complete and not work.failure_reason:
+        return None
+    reason = _compact(work.failure_reason).casefold()
+    if reason in {"connection_error", "connection_reset", "fetch_failed", "request_failed",
+                  "http_502", "http_503", "http_504"}:
+        return "short"
+    if reason in {"crawler_timeout", "timeout", "http_429", "rate_limited"}:
+        return "delayed"
+    if reason == "crawler_worker_failed" and work.run_reason.casefold() in {
+        "worker_error:connectionerror", "worker_error:connectionreseterror",
+        "worker_error:timeout", "worker_error:readtimeout",
+    }:
+        return "delayed"
+    if reason == "pagination_incomplete" and any(
+        "timeout" in _compact(item).casefold()
+        or "request_failed" in _compact(item).casefold()
+        or "rate_limit" in _compact(item).casefold()
+        for item in work.crawl_evidence.get("termination_reasons") or ()
+    ):
+        return "delayed"
+    return None
+
+
+def _bounded_resource_timing(raw: Any) -> dict[str, float | int]:
+    if not isinstance(raw, Mapping):
+        return {}
+    result: dict[str, float | int] = {}
+    for key in ("browser_wait_seconds", "http_wait_seconds"):
+        value = raw.get(key)
+        if type(value) in {float, int} and math.isfinite(value) and value >= 0:
+            result[key] = min(float(value), 3600.0)
+    for key in ("browser_acquisitions", "http_acquisitions"):
+        value = raw.get(key)
+        if type(value) is int and value >= 0:
+            result[key] = min(value, 100_000)
+    return result
+
+
 def _normalize_crawl_result(raw: Any, company: PipelineCompany) -> CrawlResult:
     if isinstance(raw, CrawlResult):
         return raw
@@ -1141,6 +1265,7 @@ def _normalize_crawl_result(raw: Any, company: PipelineCompany) -> CrawlResult:
         entry_attempts=tuple(combined.get("entry_attempts") or ()),
         scope_key=_compact(combined.get("scope_key")) or None,
         error_code=_compact(combined.get("error_code")) or None,
+        resource_timing=_bounded_resource_timing(combined.get("resource_timing")),
     )
 
 
@@ -1518,6 +1643,9 @@ def _analysis_model(
     if payload.get("eligible") is False and status == "complete":
         status = "filtered"
     score = _safe_score(payload.get("match_score", payload.get("score")))
+    if status == "complete" and score is None:
+        status = "failed"
+        payload["error_code"] = payload.get("error_code") or "invalid_match_score"
     analyzed_at = payload.get("analyzed_at")
     if not isinstance(analyzed_at, datetime):
         analyzed_at = _timestamp(clock)
@@ -1683,9 +1811,13 @@ class DailyRecruitmentPipeline:
         matcher: MatcherProtocol | Callable[..., Any] | None = None,
         jd_hydrator: Callable[[dict[str, Any]], Any] | None = _default_jd_hydrator,
         profile: Any = None,
-        max_concurrency: int = 4,
-        match_max_concurrency: int = 4,
+        max_concurrency: int = 10,
+        detail_max_concurrency: int = 10,
+        match_max_concurrency: int = 6,
         checkpoint_batch_size: int = 25,
+        checkpoint_interval_seconds: float = 5.0,
+        resource_root: Path | str | None = None,
+        browser_max_concurrency: int = 6,
         company_timeout_seconds: float = 300.0,
         detail_reuse_ttl_hours: float = DEFAULT_DETAIL_REUSE_TTL_HOURS,
         company_ids: Sequence[str] = (),
@@ -1698,12 +1830,18 @@ class DailyRecruitmentPipeline:
     ):
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
+        if detail_max_concurrency < 1:
+            raise ValueError("detail_max_concurrency must be positive")
+        if browser_max_concurrency < 1:
+            raise ValueError("browser_max_concurrency must be positive")
         if company_timeout_seconds <= 0:
             raise ValueError("company_timeout_seconds must be positive")
         if match_max_concurrency < 1:
             raise ValueError("match_max_concurrency must be positive")
         if checkpoint_batch_size < 1:
             raise ValueError("checkpoint_batch_size must be positive")
+        if not math.isfinite(checkpoint_interval_seconds) or checkpoint_interval_seconds <= 0:
+            raise ValueError("checkpoint_interval_seconds must be positive")
         if company_batch_limit is not None and company_batch_limit < 1:
             raise ValueError("company_batch_limit must be positive")
         try:
@@ -1719,10 +1857,18 @@ class DailyRecruitmentPipeline:
         self.profile = profile
         self.matcher = matcher if matcher is not None else DeterministicMatcher(profile)
         self._deterministic_only = matcher is None or isinstance(matcher, DeterministicMatcher)
-        self.jd_hydrator = jd_hydrator
+        self.jd_hydrator = (
+            partial(_default_jd_hydrator, resource_root=resource_root,
+                    browser_max_concurrency=browser_max_concurrency)
+            if jd_hydrator is _default_jd_hydrator else jd_hydrator
+        )
+        self.resource_root = resource_root
+        self.browser_max_concurrency = browser_max_concurrency
         self.max_concurrency = max_concurrency
+        self.detail_max_concurrency = detail_max_concurrency
         self.match_max_concurrency = match_max_concurrency
         self.checkpoint_batch_size = checkpoint_batch_size
+        self.checkpoint_interval_seconds = checkpoint_interval_seconds
         self.company_timeout_seconds = company_timeout_seconds
         self.detail_reuse_ttl_hours = detail_reuse_ttl_hours
         self.company_ids = tuple(dict.fromkeys(_compact(value) for value in company_ids if _compact(value)))
@@ -1733,17 +1879,22 @@ class DailyRecruitmentPipeline:
         )
         self.resume_from_checkpoint = bool(resume_from_checkpoint)
         self._checkpoint_company_ids: tuple[str, ...] = ()
+        self._checkpoint_scope_digest = ""
+        self._company_checkpoint_version = _COMPANY_CHECKPOINT_VERSION
+        self._company_checkpoint_index: dict[str, Any] | None = None
         self._hydration_checkpoint_id = uuid4().hex
         self.progress_callback = progress_callback
+        self.active_company_count = 0
+        self.complete_company_count = 0
         self.stop_requested = stop_requested
         self.company_batch_limit = company_batch_limit
         self.clock = clock
 
     def _check_stop(self) -> None:
         if self.stop_requested is not None and self.stop_requested.is_set():
-            raise PipelineInterrupted("time budget reached; saved work can be resumed")
+            raise PipelineInterrupted("time budget reached; recovery requires a valid saved checkpoint")
 
-    def _bounded_futures(self, executor, items, submit, limit: int):
+    def _bounded_futures(self, executor, items, submit, limit: int, *, heartbeat=None):
         """Keep only a small in-flight window; drain it before a pause."""
 
         remaining = iter(items)
@@ -1760,10 +1911,119 @@ class DailyRecruitmentPipeline:
 
         fill()
         while futures:
-            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            done, _ = wait(
+                tuple(futures),
+                timeout=min(1.0, self.checkpoint_interval_seconds) if heartbeat else None,
+                return_when=FIRST_COMPLETED,
+            )
+            if heartbeat is not None:
+                heartbeat()
             for future in done:
                 yield future, futures.pop(future)
             fill()
+
+    def _load_compact_company_entries(
+        self, payload: Mapping[str, Any], *, dry_run: bool,
+    ) -> dict[str, dict[str, Any]]:
+        assert self.checkpoint_path is not None
+        receipt_set_id = payload.get("hydration_checkpoint_id")
+        if not isinstance(receipt_set_id, str) or not re.fullmatch(r"[0-9a-f]{32}", receipt_set_id):
+            raise PipelineError("resume checkpoint has an invalid receipt set")
+        index = payload.get("companies")
+        if not isinstance(index, Mapping):
+            raise PipelineError("resume checkpoint has no company index")
+        entries: dict[str, dict[str, Any]] = {}
+        for company_id, indexed in index.items():
+            if not isinstance(company_id, str) or not isinstance(indexed, Mapping):
+                raise PipelineError("resume checkpoint has an invalid company index")
+            if company_id not in self._checkpoint_company_ids:
+                raise PipelineError(f"resume checkpoint contains company outside frozen scope: {company_id}")
+            status = indexed.get("status")
+            attempts = indexed.get("attempts")
+            receipt_hash = indexed.get("receipt_sha256")
+            if (status not in {"complete", "partial", "failed"}
+                    or type(attempts) is not int or attempts < 1
+                    or not isinstance(receipt_hash, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", receipt_hash)):
+                raise PipelineError(f"resume checkpoint has invalid index entry: {company_id}")
+            path = company_receipt_path(self.checkpoint_path, receipt_set_id, company_id)
+            receipt = None
+            receipt_bytes = None
+            from_backup = False
+            for candidate in (path, path.with_name(path.name + ".bak")):
+                try:
+                    encoded = candidate.read_bytes()
+                    if hashlib.sha256(encoded).hexdigest() != receipt_hash:
+                        continue
+                    decoded = json.loads(encoded)
+                    if not isinstance(decoded, Mapping):
+                        continue
+                    receipt = decoded
+                    receipt_bytes = encoded
+                    from_backup = candidate != path
+                    break
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+            if receipt is None:
+                raise PipelineError(f"indexed company receipt is missing or corrupt: {company_id}")
+            entry = receipt.get("entry")
+            if (receipt.get("version") != COMPACT_COMPANY_CHECKPOINT_VERSION
+                    or receipt.get("hydration_checkpoint_id") != receipt_set_id
+                    or receipt.get("scope_digest") != self._checkpoint_scope_digest
+                    or receipt.get("company_id") != company_id
+                    or not isinstance(entry, Mapping)
+                    or entry.get("status") != status
+                    or entry.get("attempts") != attempts):
+                raise PipelineError(f"indexed company receipt is invalid: {company_id}")
+            if from_backup and not dry_run:
+                # A replacement receipt may have been written before its index.
+                # Restore the indexed generation before another retry rotates .bak.
+                assert receipt_bytes is not None
+                _restore_checkpoint_primary(path, receipt_bytes)
+                LOGGER.warning("[%s] restored indexed company receipt from backup", company_id)
+            entries[company_id] = dict(entry)
+        self._company_checkpoint_index = dict(payload)
+        return entries
+
+    def _promote_legacy_company_checkpoint(
+        self, entries: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Publish the compact index only after every legacy receipt is durable."""
+
+        assert self.checkpoint_path is not None
+        index: dict[str, Any] = {
+            "version": COMPACT_COMPANY_CHECKPOINT_VERSION,
+            "hydration_checkpoint_id": self._hydration_checkpoint_id,
+            "company_ids": list(self._checkpoint_company_ids),
+            "scope_digest": self._checkpoint_scope_digest,
+            "companies": {},
+        }
+        for company_id, entry in entries.items():
+            attempts = entry.get("attempts")
+            if type(attempts) is not int or attempts < 1:
+                raise PipelineError(f"legacy company checkpoint has invalid attempts: {company_id}")
+            receipt = {
+                "version": COMPACT_COMPANY_CHECKPOINT_VERSION,
+                "hydration_checkpoint_id": self._hydration_checkpoint_id,
+                "scope_digest": self._checkpoint_scope_digest,
+                "company_id": company_id,
+                "entry": dict(entry),
+            }
+            receipt_hash = hashlib.sha256(
+                json.dumps(receipt, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            sidecar = company_receipt_path(
+                self.checkpoint_path, self._hydration_checkpoint_id, company_id,
+            )
+            _atomic_checkpoint(sidecar, receipt)
+            index["companies"][company_id] = {
+                "status": entry["status"],
+                "attempts": attempts,
+                "receipt_sha256": receipt_hash,
+            }
+        _atomic_checkpoint(self.checkpoint_path, index)
+        self._company_checkpoint_version = COMPACT_COMPANY_CHECKPOINT_VERSION
+        self._company_checkpoint_index = index
 
     def _load_company_checkpoint(
         self,
@@ -1773,29 +2033,48 @@ class DailyRecruitmentPipeline:
     ) -> tuple[dict[str, dict[str, Any]], dict[str, _CompanyWork]]:
         """Load one run's immutable company set and completed crawl receipts."""
 
+        self._checkpoint_scope_digest = company_scope_digest(selected)
+        self._checkpoint_company_ids = tuple(item.id for item in selected)
         if self.checkpoint_path is None:
             if self.resume_from_checkpoint:
                 raise PipelineError("resume checkpoint reference is missing")
             return {}, {}
         if self.resume_from_checkpoint:
-            if not self.checkpoint_path.is_file():
+            backup = self.checkpoint_path.with_name(self.checkpoint_path.name + ".bak")
+            if not self.checkpoint_path.is_file() and not backup.is_file():
                 raise PipelineError(
                     f"resume checkpoint does not exist: {self.checkpoint_path}"
                 )
-            try:
-                payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise PipelineError(
-                    f"resume checkpoint is unreadable: {self.checkpoint_path}"
-                ) from exc
-            if not isinstance(payload, Mapping) or payload.get("version") != _COMPANY_CHECKPOINT_VERSION:
+            payload = None
+            for path in (self.checkpoint_path, backup):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    break
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+            if payload is None:
+                raise PipelineError(f"resume checkpoint is unreadable: {self.checkpoint_path}")
+            if (not isinstance(payload, Mapping)
+                    or payload.get("version") not in {
+                        _COMPANY_CHECKPOINT_VERSION, COMPACT_COMPANY_CHECKPOINT_VERSION,
+                    }):
                 raise PipelineError("resume checkpoint has an unsupported format")
+            self._company_checkpoint_version = payload["version"]
             expected_ids = tuple(item.id for item in selected)
             self._checkpoint_company_ids = expected_ids
             stored_ids = payload.get("company_ids")
             if not isinstance(stored_ids, list) or tuple(str(item) for item in stored_ids) != expected_ids:
                 raise PipelineError("resume checkpoint company scope does not match frozen scope")
-            entries = payload.get("companies")
+            if payload.get("scope_digest", self._checkpoint_scope_digest) != self._checkpoint_scope_digest:
+                raise PipelineError("resume checkpoint company scope does not match frozen scope")
+            if (self._company_checkpoint_version == COMPACT_COMPANY_CHECKPOINT_VERSION
+                    and payload.get("scope_digest") != self._checkpoint_scope_digest):
+                raise PipelineError("resume checkpoint has no verified company scope digest")
+            entries = (
+                self._load_compact_company_entries(payload, dry_run=dry_run)
+                if self._company_checkpoint_version == COMPACT_COMPANY_CHECKPOINT_VERSION
+                else payload.get("companies")
+            )
             if not isinstance(entries, Mapping):
                 raise PipelineError("resume checkpoint has no company entries")
             unknown_ids = set(str(key) for key in entries) - set(expected_ids)
@@ -1807,16 +2086,23 @@ class DailyRecruitmentPipeline:
             parsed: dict[str, _CompanyWork] = {}
             for company in selected:
                 entry = entries.get(company.id)
-                if not isinstance(entry, Mapping):
+                if company.id not in entries:
                     continue
+                if not isinstance(entry, Mapping):
+                    raise PipelineError(f"resume checkpoint has invalid entry: {company.id}")
                 status = str(entry.get("status") or "")
                 work_payload = entry.get("work")
+                if status not in {"complete", "partial", "failed"}:
+                    raise PipelineError(f"resume checkpoint has invalid status: {company.id}")
                 if status in {"complete", "partial", "failed"}:
                     if not isinstance(work_payload, Mapping):
                         raise PipelineError(
                             f"resume checkpoint has invalid work: {company.id}"
                         )
-                    parsed[company.id] = _work_from_checkpoint(company, work_payload)
+                    try:
+                        parsed[company.id] = _work_from_checkpoint(company, work_payload)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise PipelineError(f"resume checkpoint has invalid work: {company.id}") from exc
             hydration_id = payload.get("hydration_checkpoint_id")
             if hydration_id is not None:
                 if not isinstance(hydration_id, str) or not re.fullmatch(r"[0-9a-f]{32}", hydration_id):
@@ -1830,11 +2116,20 @@ class DailyRecruitmentPipeline:
                         continue
                     try:
                         details = json.loads(sidecar.read_text(encoding="utf-8"))
-                    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                        raise PipelineError(f"unreadable hydration checkpoint: {company_id}") from exc
-                    if not isinstance(details, Mapping) or details.get("company_id") != company_id:
-                        raise PipelineError(f"invalid hydration checkpoint: {company_id}")
-                    restored = _work_from_checkpoint(work.company, details)
+                        if (
+                            not isinstance(details, Mapping)
+                            or details.get("company_id") != company_id
+                            or details.get("version", _COMPANY_CHECKPOINT_VERSION) != _COMPANY_CHECKPOINT_VERSION
+                            or details.get("hydration_checkpoint_id", hydration_id) != hydration_id
+                            or details.get("scope_digest", self._checkpoint_scope_digest) != self._checkpoint_scope_digest
+                        ):
+                            raise PipelineError("invalid hydration receipt")
+                        restored = _work_from_checkpoint(work.company, details)
+                    except (OSError, UnicodeError, json.JSONDecodeError, PipelineError, TypeError, ValueError, OverflowError):
+                        # The main receipt still owns the frozen listing. Rebuild
+                        # only this company's missing details from durable rows.
+                        LOGGER.warning("[%s] ignoring damaged hydration checkpoint", company_id)
+                        continue
                     work.hydration_results = restored.hydration_results
                     work.jd_results = restored.jd_results
                     work.detail_success_count = restored.detail_success_count
@@ -1844,26 +2139,63 @@ class DailyRecruitmentPipeline:
                 # Upgrade an old list-only checkpoint once, without changing its
                 # version or receipts. Subsequent JD batches only write sidecars.
                 payload["hydration_checkpoint_id"] = self._hydration_checkpoint_id
-                temporary = self.checkpoint_path.with_name(self.checkpoint_path.name + ".tmp")
-                temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-                temporary.replace(self.checkpoint_path)
+                payload["scope_digest"] = self._checkpoint_scope_digest
+                _atomic_checkpoint(self.checkpoint_path, payload)
+            if (self._company_checkpoint_version == _COMPANY_CHECKPOINT_VERSION
+                    and len(selected) >= COMPACT_COMPANY_CHECKPOINT_MIN_SCOPE
+                    and not dry_run):
+                try:
+                    self._promote_legacy_company_checkpoint(entries)
+                except (PipelineError, OSError, TypeError, ValueError) as exc:
+                    LOGGER.warning("legacy company checkpoint remains in v1 format: %s", exc)
             return {str(key): dict(value) for key, value in entries.items() if isinstance(value, Mapping)}, parsed
 
         if not dry_run:
             self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             self._checkpoint_company_ids = tuple(item.id for item in selected)
-            payload = {
-                "version": _COMPANY_CHECKPOINT_VERSION,
-                "hydration_checkpoint_id": self._hydration_checkpoint_id,
-                "company_ids": [item.id for item in selected],
-                "companies": {},
-            }
-            temporary = self.checkpoint_path.with_name(self.checkpoint_path.name + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                encoding="utf-8",
+            self._company_checkpoint_version = (
+                COMPACT_COMPANY_CHECKPOINT_VERSION
+                if len(selected) >= COMPACT_COMPANY_CHECKPOINT_MIN_SCOPE
+                else _COMPANY_CHECKPOINT_VERSION
             )
-            temporary.replace(self.checkpoint_path)
+            if self._company_checkpoint_version == COMPACT_COMPANY_CHECKPOINT_VERSION:
+                existing = None
+                if self.checkpoint_path.is_file():
+                    try:
+                        existing = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                        raise PipelineError("existing compact company checkpoint is unreadable") from exc
+                elif self.checkpoint_path.with_name(self.checkpoint_path.name + ".bak").is_file():
+                    raise PipelineError("existing compact company checkpoint requires resume")
+                if existing is not None:
+                    if (not isinstance(existing, Mapping)
+                            or existing.get("version") != COMPACT_COMPANY_CHECKPOINT_VERSION
+                            or existing.get("company_ids") != list(self._checkpoint_company_ids)
+                            or existing.get("scope_digest") != self._checkpoint_scope_digest
+                            or existing.get("companies") != {}
+                            or not isinstance(existing.get("hydration_checkpoint_id"), str)
+                            or not re.fullmatch(r"[0-9a-f]{32}", existing["hydration_checkpoint_id"])):
+                        raise PipelineError("existing compact company checkpoint requires resume")
+                    self._hydration_checkpoint_id = existing["hydration_checkpoint_id"]
+                    self._company_checkpoint_index = dict(existing)
+                else:
+                    self._company_checkpoint_index = {
+                        "version": COMPACT_COMPANY_CHECKPOINT_VERSION,
+                        "hydration_checkpoint_id": self._hydration_checkpoint_id,
+                        "company_ids": list(self._checkpoint_company_ids),
+                        "scope_digest": self._checkpoint_scope_digest,
+                        "companies": {},
+                    }
+                    _atomic_checkpoint(self.checkpoint_path, self._company_checkpoint_index)
+            else:
+                payload = {
+                    "version": _COMPANY_CHECKPOINT_VERSION,
+                    "hydration_checkpoint_id": self._hydration_checkpoint_id,
+                    "company_ids": [item.id for item in selected],
+                    "scope_digest": self._checkpoint_scope_digest,
+                    "companies": {},
+                }
+                _atomic_checkpoint(self.checkpoint_path, payload)
         return {}, {}
 
     def _write_company_checkpoint(
@@ -1884,24 +2216,49 @@ class DailyRecruitmentPipeline:
             if work.raw_job_count or work.accepted_jobs
             else "failed"
         )
-        entries[work.company.id] = {
+        entry = {
             "status": status,
             "attempts": max(1, int(attempts)),
             "work": _checkpoint_work_payload(work),
         }
-        payload = {
-            "version": _COMPANY_CHECKPOINT_VERSION,
-            "hydration_checkpoint_id": self._hydration_checkpoint_id,
-            "company_ids": list(self._checkpoint_company_ids),
-            "companies": dict(entries),
-        }
-        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.checkpoint_path.with_name(self.checkpoint_path.name + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True),
-            encoding="utf-8",
-        )
-        temporary.replace(self.checkpoint_path)
+        if self._company_checkpoint_version == COMPACT_COMPANY_CHECKPOINT_VERSION:
+            if self._company_checkpoint_index is None:
+                raise PipelineError("compact company checkpoint index is not initialized")
+            receipt = {
+                "version": COMPACT_COMPANY_CHECKPOINT_VERSION,
+                "hydration_checkpoint_id": self._hydration_checkpoint_id,
+                "scope_digest": self._checkpoint_scope_digest,
+                "company_id": work.company.id,
+                "entry": entry,
+            }
+            receipt_hash = hashlib.sha256(
+                json.dumps(receipt, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            sidecar = company_receipt_path(
+                self.checkpoint_path, self._hydration_checkpoint_id, work.company.id,
+            )
+            _atomic_checkpoint(sidecar, receipt)
+            index = dict(self._company_checkpoint_index)
+            index["companies"] = {
+                **self._company_checkpoint_index["companies"],
+                work.company.id: {
+                    "status": status,
+                    "attempts": entry["attempts"],
+                    "receipt_sha256": receipt_hash,
+                },
+            }
+            _atomic_checkpoint(self.checkpoint_path, index)
+            self._company_checkpoint_index = index
+        else:
+            payload = {
+                "version": _COMPANY_CHECKPOINT_VERSION,
+                "hydration_checkpoint_id": self._hydration_checkpoint_id,
+                "company_ids": list(self._checkpoint_company_ids),
+                "scope_digest": self._checkpoint_scope_digest,
+                "companies": {**entries, work.company.id: entry},
+            }
+            _atomic_checkpoint(self.checkpoint_path, payload)
+        entries[work.company.id] = entry
 
     def _hydration_checkpoint_path(self, company_id: str) -> Path:
         assert self.checkpoint_path is not None
@@ -1925,6 +2282,9 @@ class DailyRecruitmentPipeline:
             return
         path = self._hydration_checkpoint_path(work.company.id)
         payload = {
+            "version": _COMPANY_CHECKPOINT_VERSION,
+            "hydration_checkpoint_id": self._hydration_checkpoint_id,
+            "scope_digest": self._checkpoint_scope_digest,
             "company_id": work.company.id,
             "hydration_results": _dump(work.hydration_results),
             "jd_results": _dump(work.jd_results),
@@ -1932,10 +2292,7 @@ class DailyRecruitmentPipeline:
             "detail_failure_count": work.detail_failure_count,
             "detail_failure_reasons": dict(work.detail_failure_reasons),
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-        temporary.replace(path)
+        _atomic_checkpoint(path, payload)
 
     @staticmethod
     def _merge_partial_checkpoint_work(
@@ -1951,7 +2308,9 @@ class DailyRecruitmentPipeline:
         current.raw_job_count = max(current.raw_job_count, previous.raw_job_count)
         merged_jobs: list[dict[str, Any]] = []
         seen_job_keys: set[str] = set()
-        for item in [*previous.accepted_jobs, *current.accepted_jobs]:
+        # The current list owns updated URLs/metadata for an existing identity;
+        # earlier partial rows only fill gaps in the latest bounded result.
+        for item in [*current.accepted_jobs, *previous.accepted_jobs]:
             key = _compact(item.get("id")) or _compact(item.get("business_key"))
             if key and key in seen_job_keys:
                 continue
@@ -2361,6 +2720,13 @@ class DailyRecruitmentPipeline:
             selected,
             dry_run=dry_run,
         )
+        self.complete_company_count = sum(
+            entry.get("status") == "complete" for entry in checkpoint_entries.values()
+        )
+        # Retain the pre-run view for new/reused classification while each
+        # company's admitted list is committed as soon as its crawl returns.
+        existing_by_company = self._read_existing_for_companies(item.id for item in selected)
+        written = False
         works: list[_CompanyWork] = []
         resumed_company_ids: list[str] = []
         retry_companies: list[PipelineCompany] = []
@@ -2377,10 +2743,18 @@ class DailyRecruitmentPipeline:
                     works.append(work)
                     resumed_company_ids.append(company.id)
                     continue
+                if isinstance(entry, Mapping) and int(entry.get("attempts") or 0) >= 3:
+                    work = checkpoint_works.get(company.id)
+                    if work is None:
+                        raise PipelineError(
+                            f"resume checkpoint is missing exhausted company: {company.id}"
+                        )
+                    works.append(work)
+                    continue
                 retry_companies.append(company)
                 retried_company_ids.append(company.id)
             if self.progress_callback is not None:
-                self.progress_callback("companies", len(works), len(selected))
+                self.progress_callback("companies", len(checkpoint_entries), len(selected))
         else:
             retry_companies = list(selected)
 
@@ -2389,11 +2763,15 @@ class DailyRecruitmentPipeline:
             # have never been attempted in the frozen scope.
             retry_companies.sort(key=lambda company: company.id in checkpoint_entries)
 
-        def checkpoint_company(work: _CompanyWork) -> None:
+        def checkpoint_company(work: _CompanyWork) -> _CompanyWork:
+            nonlocal written
             previous = checkpoint_works.get(work.company.id)
             if previous is not None:
                 work.hydration_results = dict(previous.hydration_results)
             merged = self._merge_partial_checkpoint_work(previous, work)
+            written = self._persist_title_first_listing(
+                merged, existing_by_company.get(work.company.id, ()), dry_run=dry_run,
+            ) or written
             checkpoint_works[work.company.id] = merged
             previous_entry = checkpoint_entries.get(work.company.id)
             previous_attempts = (
@@ -2407,9 +2785,20 @@ class DailyRecruitmentPipeline:
                 attempts=previous_attempts + 1,
                 dry_run=dry_run,
             )
+            self.complete_company_count += (
+                int(not merged.failure_reason and merged.list_complete)
+                - int(isinstance(previous_entry, Mapping) and previous_entry.get("status") == "complete")
+            )
+            return merged
 
         def checkpoint_details(work: _CompanyWork) -> None:
             self._write_hydration_checkpoint(work, dry_run=dry_run)
+
+        # Legacy list-only receipts may predate durable pending rows.
+        for work in works:
+            written = self._persist_title_first_listing(
+                work, existing_by_company.get(work.company.id, ()), dry_run=dry_run,
+            ) or written
 
         batch_companies = (
             retry_companies[:self.company_batch_limit]
@@ -2418,11 +2807,14 @@ class DailyRecruitmentPipeline:
         works.extend(
             self._crawl_companies(
                 batch_companies,
-                progress_offset=len(works) if self.resume_from_checkpoint else 0,
+                progress_offset=len(checkpoint_entries) if self.resume_from_checkpoint else 0,
                 progress_total=len(selected),
-                checkpoint_callback=checkpoint_company
-                if self.checkpoint_path is not None
-                else None,
+                attempted_company_ids=tuple(checkpoint_entries),
+                prior_attempts_by_company={
+                    company_id: int(entry.get("attempts") or 0)
+                    for company_id, entry in checkpoint_entries.items()
+                },
+                checkpoint_callback=checkpoint_company,
             )
         )
         self._check_stop()
@@ -2432,7 +2824,6 @@ class DailyRecruitmentPipeline:
                 reason_code="company_batch_limit_reached",
             )
         works = sorted(works, key=lambda item: item.company.id)
-        existing_by_company = self._read_existing_for_companies(item.id for item in selected)
         existing_by_title: dict[tuple[str, str], list[_ExistingSnapshot]] = {}
         existing_by_key: dict[tuple[str, str], _ExistingSnapshot] = {}
         for company_id, rows in existing_by_company.items():
@@ -2470,6 +2861,9 @@ class DailyRecruitmentPipeline:
         resolved_detail_titles: dict[str, set[str]] = {
             work.company.id: set() for work in works
         }
+        restored_detail_ids: dict[str, set[str]] = {
+            work.company.id: set() for work in works
+        }
 
         for work in works:
             company_id = work.company.id
@@ -2484,6 +2878,15 @@ class DailyRecruitmentPipeline:
                 seen_title_keys.add(title_key)
                 existing = existing_by_key.get((company_id, title_key))
                 if existing is not None:
+                    if not stored_detail_retry_required(existing.job):
+                        stored_screening = _screen_title(_snapshot_job_payload(existing.job), self.profile)
+                        if not bool(getattr(stored_screening, "eligible", False)):
+                            reasons = _screening_reasons(stored_screening) or ("title_not_matched",)
+                            metrics[company_id]["filtered"] += 1
+                            filtered_reasons[company_id].update(reasons)
+                            rejection_reasons.update(reasons)
+                            rejected_ids.append(existing.job.id)
+                            continue
                     metrics[company_id]["reused"] += 1
                     reused_ids.append(existing.job.id)
                     if existing.job.id not in existing_update_ids:
@@ -2496,6 +2899,7 @@ class DailyRecruitmentPipeline:
                             retry_job["id"] = existing.job.id
                             retry_job["company_id"] = company_id
                             retry_job["company"] = work.company.name
+                            retry_job["title_key"] = title_key
                             retry_job["capture_status"] = "pending"
                             retry_job["capture_failure_reason"] = ""
                             retry_job["availability_status"] = "active"
@@ -2511,6 +2915,13 @@ class DailyRecruitmentPipeline:
                             )
                     else:
                         resolved_detail_titles[company_id].add(title_key)
+                        if self.resume_from_checkpoint and (
+                            _is_title_first_pending_analysis(existing.analysis)
+                            or any(receipt.get("job_id") == existing.job.id
+                                   and receipt.get("status") == "complete"
+                                   for receipt in work.hydration_results.values())
+                        ):
+                            restored_detail_ids[company_id].add(existing.job.id)
                         if (
                             not self._deterministic_only
                             and (
@@ -2572,9 +2983,37 @@ class DailyRecruitmentPipeline:
                     ):
                         inactive_ids.append(existing.job.id)
 
+        def persist_details(batch: Sequence[_TitleFirstCandidate]) -> None:
+            nonlocal written
+            for candidate in batch:
+                screening = screen_title_job(candidate.job, self.profile)
+                if not screening.eligible:
+                    if candidate.existing is not None:
+                        continue
+                    # A provisional list row remains auditable when its JD
+                    # subsequently provides explicit exclusion evidence.
+                    candidate.job["availability_status"] = "inactive"
+                    candidate.job["capture_failure_reason"] = (
+                        "excluded:" + (screening.reasons or [screening.analysis_status.value])[0]
+                    )
+                elif (
+                    _capture_status(candidate.job.get("capture_status")) == "complete"
+                    and (candidate.existing is None or not _existing_score_is_valid(candidate.existing))
+                ):
+                    candidate.analysis = self._pending_title_first_analysis(candidate)
+            admitted = [
+                candidate for candidate in batch
+                if candidate.existing is None or screen_title_job(candidate.job, self.profile).eligible
+            ]
+            written = self._persist_title_first(
+                companies=(), existing_updates=(), new_candidates=admitted,
+                scored_candidates=(), inactive_ids=(), dry_run=dry_run,
+            ) or written
+
         self._hydrate_title_first_candidates(
             candidates,
             checkpoint_callback=checkpoint_details if self.checkpoint_path is not None else None,
+            persist_callback=persist_details,
         )
         # Details can reveal internship evidence absent from the listing title.
         # Recheck before both persistence and scoring; never store new rejected rows.
@@ -2596,7 +3035,7 @@ class DailyRecruitmentPipeline:
                 metrics[company_id]["new"] -= 1
         candidates = retained_candidates
         for work in works:
-            work.detail_success_count = 0
+            work.detail_success_count = len(restored_detail_ids[work.company.id])
             work.detail_failure_count = 0
             work.detail_failure_reasons.clear()
         for candidate in candidates:
@@ -2650,25 +3089,16 @@ class DailyRecruitmentPipeline:
         scoring_candidate_count = len(score_candidates)
         scored_count = 0
 
-        if not self._deterministic_only:
-            for candidate in candidates:
-                if (
-                    _capture_status(candidate.job.get("capture_status")) == "complete"
-                    and (
-                        candidate.existing is None
-                        or not _existing_score_is_valid(candidate.existing)
-                    )
-                ):
-                    candidate.analysis = self._pending_title_first_analysis(candidate)
-
+        # Candidate details and pending analyses were committed in bounded
+        # batches; only company metadata and safe reconciliation remain here.
         written = self._persist_title_first(
             companies=requested,
             existing_updates=existing_updates,
-            new_candidates=candidates,
+            new_candidates=(),
             scored_candidates=(),
             inactive_ids=inactive_ids,
             dry_run=dry_run,
-        )
+        ) or written
 
         # Source bookkeeping must not gate durable jobs or pending score markers.
         # Let errors propagate after persistence, never report a successful run.
@@ -2714,6 +3144,22 @@ class DailyRecruitmentPipeline:
             matching_abort = Event()
             matching_abort_code: str | None = None
             completed = 0
+            last_score_flush = monotonic()
+
+            def flush_scores(*, force: bool = False) -> None:
+                nonlocal written, last_score_flush
+                if not scored_checkpoint or (
+                    not force and len(scored_checkpoint) < self.checkpoint_batch_size
+                    and monotonic() - last_score_flush < self.checkpoint_interval_seconds
+                ):
+                    return
+                written = self._persist_title_first(
+                    companies=(), existing_updates=(), new_candidates=(),
+                    scored_candidates=tuple(scored_checkpoint), inactive_ids=(), dry_run=dry_run,
+                ) or written
+                scored_checkpoint.clear()
+                last_score_flush = monotonic()
+
             if score_candidates:
                 self._check_stop()
                 with ThreadPoolExecutor(
@@ -2726,6 +3172,7 @@ class DailyRecruitmentPipeline:
                             self._score_title_first_candidate, item, matching_abort
                         ),
                         self.match_max_concurrency,
+                        heartbeat=flush_scores,
                     ):
                         try:
                             analysis = future.result()
@@ -2755,16 +3202,7 @@ class DailyRecruitmentPipeline:
                                 else:
                                     scored_count += 1
                         completed += 1
-                        if len(scored_checkpoint) >= self.checkpoint_batch_size:
-                            written = self._persist_title_first(
-                                companies=(),
-                                existing_updates=(),
-                                new_candidates=(),
-                                scored_candidates=tuple(scored_checkpoint),
-                                inactive_ids=(),
-                                dry_run=dry_run,
-                            ) or written
-                            scored_checkpoint.clear()
+                        flush_scores()
                         progress_due = (
                             completed % self.checkpoint_batch_size == 0
                             or completed == len(score_candidates)
@@ -2773,15 +3211,7 @@ class DailyRecruitmentPipeline:
                             self.progress_callback(
                                 "matching", completed, len(score_candidates)
                             )
-            if scored_checkpoint:
-                written = self._persist_title_first(
-                    companies=(),
-                    existing_updates=(),
-                    new_candidates=(),
-                    scored_candidates=tuple(scored_checkpoint),
-                    inactive_ids=(),
-                    dry_run=dry_run,
-                ) or written
+            flush_scores(force=True)
             self._check_stop()
             if matching_abort_code is not None:
                 raise PipelineError(
@@ -3043,12 +3473,32 @@ class DailyRecruitmentPipeline:
         candidates: Sequence[_TitleFirstCandidate],
         *,
         checkpoint_callback: Callable[[_CompanyWork], None] | None = None,
+        persist_callback: Callable[[Sequence[_TitleFirstCandidate]], None] | None = None,
     ) -> None:
         """Hydrate new candidates in the same bounded pool as legacy details."""
 
         if not candidates:
             return
         dirty: dict[str, _CompanyWork] = {}
+        batch: list[_TitleFirstCandidate] = []
+        last_flush = monotonic()
+
+        def flush(*, force: bool = False) -> None:
+            nonlocal last_flush
+            if not batch or (
+                not force and len(batch) < self.checkpoint_batch_size
+                and monotonic() - last_flush < self.checkpoint_interval_seconds
+            ):
+                return
+            # The database transaction must commit before its receipt advances.
+            if persist_callback is not None:
+                persist_callback(tuple(batch))
+            if checkpoint_callback is not None:
+                for work in dirty.values():
+                    checkpoint_callback(work)
+            batch.clear()
+            dirty.clear()
+            last_flush = monotonic()
         inputs: dict[int, tuple[str, Mapping[str, Any] | None]] = {}
         for candidate in candidates:
             # Bind receipts to the exact listing input, not just a shared title.
@@ -3071,25 +3521,31 @@ class DailyRecruitmentPipeline:
             active_keys = {
                 inputs[id(item)][0] for item in candidates if item.work is work
             }
+            retry_ids = {_compact(item.job.get("id")) for item in candidates if item.work is work}
             work.hydration_results = {
-                key: value for key, value in work.hydration_results.items() if key in active_keys
+                key: value for key, value in work.hydration_results.items()
+                if key in active_keys or value.get("job_id") not in retry_ids
             }
-            work.jd_results = []
-            work.detail_success_count = 0
-            work.detail_failure_count = 0
-            work.detail_failure_reasons.clear()
+            work.jd_results = [item for item in work.jd_results if item.get("job_id") not in retry_ids]
+            work.detail_success_count = sum(item.get("status") == "complete" for item in work.jd_results)
+            work.detail_failure_count = sum(item.get("status") == "failed" for item in work.jd_results)
+            work.detail_failure_reasons = Counter(
+                item.get("failure_reason") or "detail_capture_failed"
+                for item in work.jd_results if item.get("status") == "failed"
+            )
         total = len(candidates)
         if self.progress_callback is not None:
             self.progress_callback("jd", 0, total)
         completed = 0
-        with ThreadPoolExecutor(max_workers=min(self.max_concurrency, total)) as executor:
+        with ThreadPoolExecutor(max_workers=min(self.detail_max_concurrency, total)) as executor:
             for future, candidate in self._bounded_futures(
                 executor,
                 candidates,
                 lambda pool, item: pool.submit(
                     self._hydrate_title_first, item, inputs[id(item)][1]
                 ),
-                self.max_concurrency,
+                self.detail_max_concurrency,
+                heartbeat=flush,
             ):
                 try:
                     diagnostic = future.result()
@@ -3125,12 +3581,9 @@ class DailyRecruitmentPipeline:
                     work.detail_failure_count += 1
                     work.detail_failure_reasons[diagnostic.get("failure_reason") or "detail_capture_failed"] += 1
                 dirty[work.company.id] = work
+                batch.append(candidate)
                 completed += 1
-                if completed % self.checkpoint_batch_size == 0 or completed == total:
-                    if checkpoint_callback is not None:
-                        for work in dirty.values():
-                            checkpoint_callback(work)
-                    dirty.clear()
+                flush(force=completed == total)
                 if (
                     self.progress_callback is not None
                     and (
@@ -3139,9 +3592,7 @@ class DailyRecruitmentPipeline:
                     )
                 ):
                     self.progress_callback("jd", completed, total)
-        if dirty and checkpoint_callback is not None:
-            for work in dirty.values():
-                checkpoint_callback(work)
+        flush(force=True)
         self._check_stop()
 
     def _pending_title_first_analysis(
@@ -3170,8 +3621,21 @@ class DailyRecruitmentPipeline:
 
         if abort_event.is_set():
             return None
-        raw_result = self._call_title_first_matcher(candidate)
-        return _analysis_model(raw_result, candidate.job, self.clock)
+        try:
+            raw_result = self._call_title_first_matcher(candidate)
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None) or getattr(
+                getattr(exc, "response", None), "status_code", None
+            )
+            code = f"http_{status_code}"
+            if code not in _FATAL_MATCH_ERROR_CODES:
+                raise
+            abort_event.set()
+            return JobAnalysis(analysis_status="failed", error_code=code)
+        analysis = _analysis_model(raw_result, candidate.job, self.clock)
+        if analysis.error_code in _FATAL_MATCH_ERROR_CODES:
+            abort_event.set()
+        return analysis
 
     def _call_title_first_matcher(self, candidate: _TitleFirstCandidate) -> Any:
         service = getattr(self.matcher, "service", None)
@@ -3377,12 +3841,12 @@ class DailyRecruitmentPipeline:
             for company in company_models:
                 upsert_company_snapshot(session, company)
             for existing in existing_updates:
-                row = session.get(JobSnapshot, existing.job.id)
-                if row is None:
-                    continue
-                row.last_seen_at = now
-                if hasattr(row, "availability_status"):
-                    row.availability_status = "active"
+                session.execute(
+                    update(JobSnapshot).where(JobSnapshot.id == existing.job.id).values(
+                        last_seen_at=now, availability_status="active",
+                        updated_at=JobSnapshot.updated_at,
+                    )
+                )
             for job_id in dict.fromkeys(_compact(item) for item in inactive_ids if _compact(item)):
                 row = session.get(JobSnapshot, job_id)
                 if row is not None and hasattr(row, "availability_status"):
@@ -3393,23 +3857,76 @@ class DailyRecruitmentPipeline:
             for candidate in candidates:
                 model = self._title_first_job_model(candidate, now=now)
                 _upsert_status = _capture_status(candidate.job.get("capture_status"))
+                failure_reason = _compact(candidate.job.get("capture_failure_reason"))
+                stored = session.get(JobSnapshot, model.id)
+                analysis = candidate.analysis
+                if stored is not None:
+                    if failure_reason.startswith("excluded:") and _stored_capture_status(stored) == "complete":
+                        # A concurrent capture may have completed after the
+                        # pre-run read. Exclusions only change provisional rows.
+                        continue
+                    preserved = {"created_at": stored.created_at, "first_seen_at": stored.first_seen_at}
+                    if _upsert_status != "complete" and _stored_capture_status(stored) == "complete":
+                        preserved.update(
+                            jd_raw=stored.jd_raw, detail_url=stored.detail_url,
+                            capture_evidence=dict(stored.capture_evidence or {}),
+                            updated_at=stored.updated_at, source_ref=stored.source_ref,
+                        )
+                        _upsert_status = "complete"
+                        failure_reason = stored.capture_failure_reason or ""
+                    model = model.model_copy(update=preserved)
+                    if analysis is not None and analysis.analysis_status == "pending":
+                        stored_analysis = session.get(JobAnalysisSnapshot, model.id)
+                        if _existing_score_is_valid(_ExistingSnapshot(stored, stored_analysis)):
+                            analysis = None
                 self._upsert_title_first_job(
                     session,
                     model,
                     capture_status=_upsert_status,
-                    capture_failure_reason=_compact(
-                        candidate.job.get("capture_failure_reason")
-                    ),
+                    capture_failure_reason=failure_reason,
                     availability_status=_stored_availability_status(candidate.job),
                     title_key=candidate.title_key,
                     preserve_existing_score=(
-                        candidate.analysis is not None
-                        and candidate.analysis.analysis_status in {"failed", "refused"}
+                        analysis is None
+                        or analysis.analysis_status in {"pending", "failed", "refused"}
                     ),
                 )
-                if candidate.analysis is not None:
-                    upsert_job_analysis_snapshot(session, model, candidate.analysis)
+                if analysis is not None:
+                    upsert_job_analysis_snapshot(session, model, analysis)
         return True
+
+    def _persist_title_first_listing(
+        self, work: _CompanyWork, existing: Sequence[_ExistingSnapshot], *, dry_run: bool,
+    ) -> bool:
+        """Admit a company's eligible list rows before recording list completion."""
+
+        seen = {_title_key(work.company.id, item.job.title) for item in existing}
+        pending: list[_TitleFirstCandidate] = []
+        written = False
+        for job in sorted(work.accepted_jobs, key=lambda row: (_title_key(work.company.id, row.get("title")), _compact(row.get("id")))):
+            title_key = _title_key(work.company.id, job.get("title"))
+            if not title_key or title_key in seen:
+                continue
+            seen.add(title_key)
+            screening = _screen_title(job, self.profile)
+            if not bool(getattr(screening, "eligible", False)):
+                continue
+            pending.append(_TitleFirstCandidate(
+                work=work, title_key=title_key, screening=screening,
+                job={**job, "jd_raw": None, "capture_evidence": {},
+                     "capture_status": "pending", "capture_failure_reason": "",
+                     "availability_status": "active"},
+            ))
+            if len(pending) >= self.checkpoint_batch_size:
+                written = self._persist_title_first(
+                    companies=(work.company,), existing_updates=(), new_candidates=pending,
+                    scored_candidates=(), inactive_ids=(), dry_run=dry_run,
+                ) or written
+                pending.clear()
+        return self._persist_title_first(
+            companies=(work.company,), existing_updates=(), new_candidates=pending,
+            scored_candidates=(), inactive_ids=(), dry_run=dry_run,
+        ) or written
 
     def _process_job(
         self,
@@ -3827,7 +4344,7 @@ class DailyRecruitmentPipeline:
 
         reusable_hydrator = ReusingDetailHydrator(fetch_detail)
         with reusable_hydrator, ThreadPoolExecutor(
-            max_workers=min(self.max_concurrency, len(pending))
+            max_workers=min(self.detail_max_concurrency, len(pending))
         ) as executor:
             futures = {
                 executor.submit(
@@ -3970,58 +4487,177 @@ class DailyRecruitmentPipeline:
         *,
         progress_offset: int = 0,
         progress_total: int | None = None,
-        checkpoint_callback: Callable[[_CompanyWork], None] | None = None,
+        attempted_company_ids: Sequence[str] = (),
+        prior_attempts_by_company: Mapping[str, int] | None = None,
+        checkpoint_callback: Callable[[_CompanyWork], _CompanyWork | None] | None = None,
     ) -> list[_CompanyWork]:
         self._check_stop()
         if not companies:
             return []
-        works: list[_CompanyWork] = []
-        completed = 0
-        confirmed = progress_offset
+        works: dict[str, _CompanyWork] = {}
+        attempted = set(attempted_company_ids)
+        processed = progress_offset
         total = progress_total if progress_total is not None else len(companies)
+        last_progress = monotonic()
+
+        def progress(*, force: bool = False) -> None:
+            nonlocal last_progress
+            if self.progress_callback is None:
+                return
+            now = monotonic()
+            if force or now - last_progress >= _COMPANY_PROGRESS_INTERVAL_SECONDS:
+                self.progress_callback("companies", processed, total)
+                last_progress = now
+
         if self.progress_callback is not None:
-            self.progress_callback("companies", confirmed, total)
+            self.progress_callback("companies", processed, total)
+        # Admission uses the configured entry host. A crawler may later redirect
+        # or choose a browser fallback; the shared resource layer enforces the
+        # actual host/browser limits after that point.
+        first_pass = deque(companies)
+        delayed: list[tuple[float, int, PipelineCompany, str]] = []
+        retry_sequence = 0
+        retry_submitted = 0
+        retry_deadline: float | None = None
+        attempt_counts = dict(prior_attempts_by_company or {})
+        initial_since_short_retry = 0
+        active_hosts: Counter[str] = Counter()
+        render_active = 0
+        browser_slots = min(self.browser_max_concurrency, self.max_concurrency)
+
+        def host(company: PipelineCompany) -> str:
+            return (urlsplit(company.careers_url).hostname or company.id).casefold()
+
         with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(companies))) as executor:
-            pending = iter(companies)
-            futures = {}
+            futures: dict[Any, tuple[PipelineCompany, str]] = {}
 
-            def submit_next() -> bool:
+            def eligible(company: PipelineCompany) -> bool:
+                return (
+                    active_hosts[host(company)] < 2
+                    and (company.crawler_key.casefold() != "render" or render_active < browser_slots)
+                )
+
+            def submit_ready() -> None:
+                nonlocal render_active, initial_since_short_retry, retry_submitted
                 if self.stop_requested is not None and self.stop_requested.is_set():
-                    return False
-                company = next(pending, None)
-                if company is None:
-                    return False
-                futures[executor.submit(self._crawl_one, company)] = company
-                return True
+                    return
+                while len(futures) < self.max_concurrency:
+                    company = None
+                    stage = "initial"
 
-            for _ in range(min(self.max_concurrency, len(companies))):
-                submit_next()
-            while futures:
-                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                    def take_ready_retry(*, short_only: bool) -> tuple[PipelineCompany, str] | None:
+                        now = monotonic()
+                        ready = []
+                        while delayed and delayed[0][0] <= now:
+                            ready.append(heapq.heappop(delayed))
+                        chosen = None
+                        for index, item in enumerate(ready):
+                            if eligible(item[2]) and (not short_only or item[3] == "short"):
+                                _, _, chosen_company, chosen_stage = ready.pop(index)
+                                chosen = chosen_company, chosen_stage
+                                break
+                        for item in ready:
+                            heapq.heappush(delayed, item)
+                        return chosen
+
+                    if initial_since_short_retry >= 4:
+                        retry = take_ready_retry(short_only=True)
+                        if retry is not None:
+                            company, stage = retry
+                            initial_since_short_retry = 0
+                    if company is None:
+                        for _ in range(len(first_pass)):
+                            candidate = first_pass.popleft()
+                            if eligible(candidate):
+                                company = candidate
+                                initial_since_short_retry += 1
+                                break
+                            first_pass.append(candidate)
+                    if company is None:
+                        retry = take_ready_retry(short_only=False)
+                        if retry is not None:
+                            company, stage = retry
+                    if company is None:
+                        break
+                    if stage != "initial":
+                        if retry_submitted >= _COMPANY_RETRY_STAGE_MAX_TASKS or (
+                            retry_deadline is not None and monotonic() >= retry_deadline
+                        ):
+                            continue
+                        retry_submitted += 1
+                    attempt_counts[company.id] = attempt_counts.get(company.id, 0) + 1
+                    active_hosts[host(company)] += 1
+                    if company.crawler_key.casefold() == "render":
+                        render_active += 1
+                    futures[executor.submit(self._crawl_one, company)] = company, stage
+                self.active_company_count = len(futures)
+
+            submit_ready()
+            while futures or first_pass or delayed:
+                if not first_pass and retry_deadline is None and not any(
+                    stage == "initial" for _, stage in futures.values()
+                ):
+                    retry_deadline = monotonic() + _COMPANY_RETRY_STAGE_BUDGET_SECONDS
+                if delayed and (
+                    retry_submitted >= _COMPANY_RETRY_STAGE_MAX_TASKS or (
+                        retry_deadline is not None and monotonic() >= retry_deadline
+                    )
+                ):
+                    delayed.clear()
+                if not futures and self.stop_requested is not None and self.stop_requested.is_set():
+                    break
+                if not futures:
+                    # Cool-down occupies no worker, browser, or host slot.
+                    delay = max(0.0, delayed[0][0] - monotonic()) if delayed else 0.1
+                    if self.stop_requested is not None:
+                        self.stop_requested.wait(min(0.5, delay))
+                    else:
+                        sleep(min(0.5, delay))
+                    submit_ready()
+                    progress()
+                    continue
+                done, _ = wait(tuple(futures), timeout=0.5, return_when=FIRST_COMPLETED)
                 for future in done:
-                    company = futures.pop(future)
+                    company, stage = futures.pop(future)
+                    active_hosts[host(company)] -= 1
+                    if company.crawler_key.casefold() == "render":
+                        render_active -= 1
+                    self.active_company_count = len(futures)
                     try:
                         work = future.result()
                     except Exception as exc:  # defensive isolation around injected crawlers
                         LOGGER.warning("[%s] crawler failed: %s", company.name, exc)
                         work = _CompanyWork(company=company, failure_reason="crawler_failed")
-                    works.append(work)
                     if checkpoint_callback is not None:
-                        checkpoint_callback(work)
-                    completed += 1
-                    if not work.failure_reason and work.list_complete:
-                        confirmed += 1
-                    if self.progress_callback is not None and (
-                        completed % self.checkpoint_batch_size == 0
-                        or completed == len(companies)
-                        or (self.stop_requested is not None and self.stop_requested.is_set())
-                    ):
-                        self.progress_callback("companies", confirmed, total)
-                    submit_next()
+                        work = checkpoint_callback(work) or work
+                    else:
+                        work = self._merge_partial_checkpoint_work(works.get(company.id), work)
+                    works[company.id] = work
+                    if company.id not in attempted:
+                        attempted.add(company.id)
+                        processed += 1
+                    if self.stop_requested is None or not self.stop_requested.is_set():
+                        kind = _company_retry_kind(work)
+                        if attempt_counts[company.id] < 3 and (
+                            (stage == "initial" and kind) or (stage == "short" and kind == "short")
+                        ):
+                            retry_sequence += 1
+                            next_stage = "short" if stage == "initial" and kind == "short" else "delayed"
+                            cooldown = (
+                                _SHORT_RETRY_COOLDOWN_SECONDS if next_stage == "short"
+                                else _DELAYED_RETRY_COOLDOWN_SECONDS
+                            )
+                            heapq.heappush(
+                                delayed, (monotonic() + cooldown, retry_sequence, company, next_stage)
+                            )
+                submit_ready()
+                progress(force=bool(done) and (not futures and not first_pass and not delayed))
+                if self.stop_requested is not None and self.stop_requested.is_set():
+                    progress(force=True)
+            self.active_company_count = 0
         self._check_stop()
-        if self.progress_callback is not None:
-            self.progress_callback("companies", confirmed, total)
-        return works
+        progress(force=True)
+        return [works[company.id] for company in companies if company.id in works]
 
     def _crawl_one(self, company: PipelineCompany) -> _CompanyWork:
         work = _CompanyWork(company=company)
@@ -4050,6 +4686,7 @@ class DailyRecruitmentPipeline:
                 "termination_reasons": list(result.termination_reasons),
                 "source_runs": list(result.source_runs),
                 "entry_attempts": list(result.entry_attempts),
+                "resource_timing": _bounded_resource_timing(result.resource_timing),
                 "observed_job_ids": [_stable_job_id(company, _as_mapping(job)) for job in result.jobs],
                 "observed_titles": [
                     _text(_field(job, "title"))
@@ -4187,8 +4824,14 @@ class DailyRecruitmentPipeline:
         except IsolatedWorkerError as exc:
             LOGGER.warning("[%s] crawler worker failed: %s", company.name, exc)
             work.failure_reason = "crawler_worker_failed"
+            if exc.resource_timing:
+                work.crawl_evidence["resource_timing"] = _bounded_resource_timing(exc.resource_timing)
             if exc.error_type:
                 work.run_reason = f"worker_error:{exc.error_type}"
+            return work
+        except (ConnectionError, RequestConnectionError) as exc:
+            LOGGER.warning("[%s] crawler connection failed: %s", company.name, exc)
+            work.failure_reason = "connection_error"
             return work
         except Exception as exc:
             LOGGER.warning("[%s] crawler/audit failed: %s", company.name, exc)
@@ -4205,6 +4848,8 @@ class DailyRecruitmentPipeline:
                             "crawl_timeout_seconds", self.company_timeout_seconds
                         )
                     ),
+                    resource_root=self.resource_root,
+                    browser_max_concurrency=self.browser_max_concurrency,
                 )
             else:
                 # Explicit maps are a test/custom injection boundary and may not
@@ -4413,9 +5058,13 @@ def run_daily_pipeline(
     matcher: MatcherProtocol | Callable[..., Any] | None = None,
     jd_hydrator: Callable[[dict[str, Any]], Any] | None = _default_jd_hydrator,
     profile: Any = None,
-    max_concurrency: int = 4,
-    match_max_concurrency: int = 4,
+    max_concurrency: int = 10,
+    detail_max_concurrency: int = 10,
+    match_max_concurrency: int = 6,
     checkpoint_batch_size: int = 25,
+    checkpoint_interval_seconds: float = 5.0,
+    resource_root: Path | str | None = None,
+    browser_max_concurrency: int = 6,
     detail_reuse_ttl_hours: float = DEFAULT_DETAIL_REUSE_TTL_HOURS,
     company_ids: Sequence[str] = (),
     checkpoint_path: Path | str | None = None,
@@ -4438,8 +5087,12 @@ def run_daily_pipeline(
         jd_hydrator=jd_hydrator,
         profile=profile,
         max_concurrency=max_concurrency,
+        detail_max_concurrency=detail_max_concurrency,
         match_max_concurrency=match_max_concurrency,
         checkpoint_batch_size=checkpoint_batch_size,
+        checkpoint_interval_seconds=checkpoint_interval_seconds,
+        resource_root=resource_root,
+        browser_max_concurrency=browser_max_concurrency,
         detail_reuse_ttl_hours=detail_reuse_ttl_hours,
         company_ids=company_ids,
         checkpoint_path=checkpoint_path,

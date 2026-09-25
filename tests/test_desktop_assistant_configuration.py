@@ -9,9 +9,9 @@ from packages.scheduler import TaskContext, TaskType, build_runtime_task_handler
 from tests.test_owner_configuration import owner
 
 
-MODEL = {"id": "synthetic", "name": "Synthetic", "provider": "openai-compatible",
-         "api_style": "openai", "base_url": "https://model.example.test/v1",
-         "model": "fixture", "api_key": "fixture-not-a-real-key"}
+MODEL = {"id": "synthetic", "name": "Synthetic", "provider": "deepseek",
+         "api_style": "anthropic", "base_url": "https://api.deepseek.com",
+         "model": "deepseek-flash", "api_key": "fixture-not-a-real-key"}
 URL = "/api/local-ui/configuration"
 
 

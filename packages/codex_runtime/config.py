@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from packages.model_policy import official_base, official_model
 
 
 class RestartPolicy(StrEnum):
@@ -87,6 +88,8 @@ class CodexHomeConfig(BaseModel):
         return names
 
     def render_toml(self) -> str:
+        official_base(self.base_url)
+        official_model(self.model)
         if self.model_auto_compact_token_limit >= self.model_context_window:
             raise ValueError("auto-compaction limit must be smaller than the model context window")
         quote = lambda value: json.dumps(value, ensure_ascii=False)
@@ -96,7 +99,7 @@ class CodexHomeConfig(BaseModel):
             (
                 f"model = {quote(self.model)}",
                 f"model_provider = {quote(self.provider_id)}",
-                f"model_reasoning_effort = {quote(self.reasoning_effort)}",
+                f"model_reasoning_effort = {quote({'medium': 'high', 'xhigh': 'max'}.get(self.reasoning_effort, self.reasoning_effort))}",
                 f"model_context_window = {self.model_context_window}",
                 f"model_auto_compact_token_limit = {self.model_auto_compact_token_limit}",
                 'approval_policy = "on-request"',

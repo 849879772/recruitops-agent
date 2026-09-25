@@ -20,6 +20,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -571,6 +572,9 @@ class HotjobRecruitCrawler(BaseCrawler):
         self.metrics = {}
         self.api_attempted = False
         self.api_valid_response = False
+        self.api_rate_limited = False
+        self.crawl_error_code = ""
+        self.pagination_diagnostics = []
 
     def _set_termination(self, reason: str, has_more: bool | None = None):
         self.pagination_termination_reason = reason
@@ -601,6 +605,7 @@ class HotjobRecruitCrawler(BaseCrawler):
             "detail_count": self.detail_count,
             "detail_complete": self.detail_complete,
             "detail_failures": list(self.detail_failures),
+            "pagination_diagnostics": list(self.pagination_diagnostics),
             "read_only": True,
         }
         self.metrics = {
@@ -636,11 +641,12 @@ class HotjobRecruitCrawler(BaseCrawler):
             documents.append((response.url, response.text))
         except requests.RequestException as exc:
             logger.debug("[%s] hotjob 根入口请求失败: %s", self.company_name, exc)
-        if not documents or not re.search(r"/SU[0-9a-fA-F]+", " ".join(item[1] for item in documents)):
+        if (not self._budget_exhausted() and
+                (not documents or not re.search(r"/SU[0-9a-fA-F]+", " ".join(item[1] for item in documents)))):
             html = render_page(
                 self.careers_url,
                 wait_for=None,
-                timeout_ms=30000,
+                timeout_ms=max(1, int(self._remaining_seconds(30) * 1000)),
                 extra_wait_ms=1500,
                 scroll_times=1,
             )
@@ -1000,8 +1006,13 @@ class HotjobRecruitCrawler(BaseCrawler):
                 payload = response.json()
             except Exception as exc:  # noqa: BLE001
                 self.fetch_failed = True
+                response_status = getattr(getattr(exc, "response", None), "status_code", None)
+                if response_status == 429:
+                    self.api_rate_limited = True
+                    self.crawl_error_code = "rate_limited"
                 self._set_termination(
                     "hard_timeout" if self._budget_exhausted()
+                    else f"api_rate_limited_page_{page}" if self.api_rate_limited
                     else f"api_request_failed_page_{page}",
                     True,
                 )
@@ -1172,7 +1183,15 @@ class HotjobRecruitCrawler(BaseCrawler):
         elif self.pagination_termination_reason == "not_started":
             self._set_termination("api_pagination_incomplete", True)
         self.detail_complete = False
-        hydrated = self._hydrate_api_jobs(jobs)
+        # The title-first pipeline hydrates each saved job in its dedicated JD
+        # stage. Fetching every detail here competes for the same two host slots
+        # and repeats the later capture. Direct crawler callers keep legacy mode.
+        if os.environ.get("RECRUITOPS_HOTJOB_LIST_ONLY") == "1":
+            self.detail_expected_total = len(jobs)
+            self.detail_count = 0
+            hydrated = jobs
+        else:
+            hydrated = self._hydrate_api_jobs(jobs)
         self._update_evidence()
         return hydrated
 
@@ -1246,7 +1265,8 @@ class HotjobRecruitCrawler(BaseCrawler):
         self.resolved_source_url = self.careers_url
         foxconn_url = self._foxconn_url()
         if foxconn_url:
-            html = render_page(foxconn_url, wait_for=None, timeout_ms=45000,
+            html = render_page(foxconn_url, wait_for=None,
+                               timeout_ms=max(1, int(self._remaining_seconds(45) * 1000)),
                                extra_wait_ms=self.EXTRA_WAIT_MS, scroll_times=self.SCROLL_TIMES)
             if html:
                 jobs = self._parse_foxconn(html, foxconn_url)
@@ -1270,13 +1290,25 @@ class HotjobRecruitCrawler(BaseCrawler):
                 return []
 
         api_jobs = self._fetch_new_pb_api()
-        if self.api_valid_response or self.pages_seen or api_jobs:
+        if self.api_valid_response or self.pages_seen or api_jobs or self.api_rate_limited:
             logger.info("[%s] hotjob API 抓到 %d 个岗位", self.company_name, len(api_jobs))
             return api_jobs
 
-        # 先桌面 /pb/school.html；为空再退移动 /mc/position/campus（部分租户桌面 404）
-        for url, parse in ((self._list_url(), self._parse_pb), (self._mc_url(), self._parse_mc)):
-            html = render_page(url, wait_for=None, timeout_ms=45000,
+        # A rendered observation may supply rows but cannot prove pagination.
+        # Keep the API failure alongside the final rendered-page reason.
+        if self.pagination_termination_reason.startswith("api_"):
+            self.pagination_diagnostics.append({"reason": self.pagination_termination_reason})
+
+        # Start with the observed source route; some tenants expose only their
+        # mobile page. A second render remains available when the first is empty.
+        routes = ((self._list_url(), self._parse_pb), (self._mc_url(), self._parse_mc))
+        if "/mc/" in urlparse(self.careers_url).path.casefold():
+            routes = tuple(reversed(routes))
+        for url, parse in routes:
+            if self._budget_exhausted():
+                break
+            html = render_page(url, wait_for=None,
+                               timeout_ms=max(1, int(self._remaining_seconds(45) * 1000)),
                                extra_wait_ms=self.EXTRA_WAIT_MS, scroll_times=self.SCROLL_TIMES)
             if not html:
                 continue

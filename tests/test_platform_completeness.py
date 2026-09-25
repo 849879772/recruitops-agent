@@ -12,7 +12,7 @@ import requests
 
 def _load_adapter(module_name: str):
     """Load one adapter without importing the registry's unrelated renderers."""
-    package_name = "_platform_completeness_crawlers"
+    package_name = "packages.recruitment_core._platform_completeness_crawlers"
     crawler_dir = Path(__file__).parents[1] / "packages" / "recruitment_core" / "crawlers"
     if package_name not in sys.modules:
         package = types.ModuleType(package_name)

@@ -78,41 +78,34 @@ def discover_recruitment_entries(
     *,
     render: Callable[..., Any] | None = None,
     http_get: Callable[..., Any] | None = None,
+    http_only: bool = False,
 ) -> list[str]:
-    """Render a public entry, then use HTTP only if rendering produced no HTML.
+    """Inspect a public entry over HTTP, rendering only when links need JavaScript.
 
     Only observed links to known adapters are returned. No URL synthesis, form
     submission, authenticated browser session, or challenge bypass is attempted.
+    ``http_only`` is used for the short preflight before a generic crawl.
     """
     error = _entry_error(source_url)
     if error:
         raise _DiscoveryError(*error)
     deadline = perf_counter() + max(0.0, timeout_seconds)
-    remaining = deadline - perf_counter()
-    if remaining <= 0:
-        raise _DiscoveryError("timeout", "Entry discovery deadline exhausted.")
     render = render or render_page
     http_get = http_get or requests.get
-    # Leave room for the HTTP fallback; avoid extra fixed sleeps after navigation.
-    try:
-        page_html = render(
-            source_url, timeout_ms=max(1, int(min(30.0, remaining * 0.6) * 1_000)),
-            extra_wait_ms=0, scroll_times=0,
-            annotate_visibility=True,
-        )
-    except (OSError, RuntimeError, TimeoutError):
-        page_html = None
     base_url = source_url
-    if not str(page_html or "").strip():
+    http_deadline = perf_counter() + min(10.0, max(0.0, deadline - perf_counter()) * 0.4)
+    try:
         for _ in range(4):
-            remaining = deadline - perf_counter()
+            remaining = min(deadline, http_deadline) - perf_counter()
             if remaining <= 0:
-                raise _DiscoveryError("timeout", "Entry discovery deadline exhausted.")
+                break
             response = http_get(
                 base_url,
                 headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-CN,zh;q=0.9"},
-                timeout=min(15.0, remaining), allow_redirects=False,
+                timeout=min(6.0, remaining), allow_redirects=False,
             )
+            if response.status_code == 429:
+                raise _DiscoveryError("rate_limited", "The public entry is temporarily rate limited.")
             if response.status_code in {401, 403}:
                 raise _DiscoveryError("access_denied", "The public entry requires authorization.")
             if response.status_code in {301, 302, 303, 307, 308}:
@@ -125,12 +118,39 @@ def discover_recruitment_entries(
                     raise _DiscoveryError(*error)
                 continue
             response.raise_for_status()
-            page_html = response.text
+            candidates = _entry_candidates(response.text, base_url, source_url)
+            if candidates:
+                return candidates
             break
         else:
             raise _DiscoveryError("entry_discovery_failed", "Entry redirect limit reached.")
+    except (requests.RequestException, OSError, TimeoutError):
+        pass
+    if http_only:
+        return []
+    return _render_entry_candidates(base_url, source_url, deadline, render)
+
+
+def _render_entry_candidates(
+    base_url: str, source_url: str, deadline: float, render: Callable[..., Any],
+) -> list[str]:
+    remaining = deadline - perf_counter()
+    if remaining <= 0:
+        raise _DiscoveryError("timeout", "Entry discovery deadline exhausted.")
+    try:
+        page_html = render(
+            base_url, timeout_ms=max(1, int(min(30.0, remaining) * 1_000)),
+            extra_wait_ms=0, scroll_times=0,
+            annotate_visibility=True,
+        )
+    except (OSError, RuntimeError, TimeoutError):
+        page_html = None
     if perf_counter() >= deadline:
         raise _DiscoveryError("timeout", "Entry discovery deadline exhausted.")
+    return _entry_candidates(page_html, base_url, source_url)
+
+
+def _entry_candidates(page_html: Any, base_url: str, source_url: str) -> list[str]:
     soup = BeautifulSoup(str(page_html or ""), "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     if any(_visible_control(node) for node in soup.select('input[type="password"]')) or _sms_login_wall(soup):
@@ -141,6 +161,8 @@ def discover_recruitment_entries(
         raise _DiscoveryError("captcha_required", "The entry requires a CAPTCHA or verification.")
     candidates: dict[str, int] = {}
     for anchor in soup.find_all("a", href=True):
+        if not _visible_control(anchor):
+            continue
         href = str(anchor.get("href") or "").strip()
         if not href or href == "#":
             continue
@@ -198,6 +220,9 @@ def crawl_with_entry_discovery(
     selected_url, selected_key = source_url, key
     attempts: list[dict[str, Any]] = []
     effective_urls: list[str] = []
+    pretried_urls: set[str] = set()
+    http_preflight_done = False
+    preflight_base_url = source_url
     discovery_error: tuple[str, str] | None = None
 
     def finish() -> dict[str, Any]:
@@ -276,6 +301,32 @@ def crawl_with_entry_discovery(
             best, selected_url, selected_key = result, url, adapter
 
     try:
+        if key == "render" and discover is None and diagnosis.entry_kind != "existing_adapter":
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                raise _DiscoveryError("timeout", "Entry crawl deadline exhausted.")
+            http_preflight_done = True
+
+            def preflight_get(url: str, **kwargs: Any) -> Any:
+                nonlocal preflight_base_url
+                preflight_base_url = url
+                return requests.get(url, **kwargs)
+
+            # A short HTTP preflight can route a public campus link directly to
+            # its adapter, without starting a generic Chromium crawl first.
+            for url in discover_recruitment_entries(
+                source_url, min(5.0, remaining), http_get=preflight_get,
+                http_only=True,
+            ):
+                candidate = diagnose_candidate_entry(url)
+                if candidate.entry_kind != "existing_adapter" or not candidate.crawler_key:
+                    continue
+                if source_url not in effective_urls:
+                    effective_urls.append(source_url)
+                attempt(url, candidate.crawler_key)
+                pretried_urls.add(url)
+                if best["jobs"] or best.get("error_code") in {"login_required", "captcha_required", "access_denied"}:
+                    return finish()
         attempt(source_url, key)
         # Even incomplete jobs are evidence, not a reason to replace this run.
         if best["jobs"] or key not in {"render", "static_html"}:
@@ -285,9 +336,16 @@ def crawl_with_entry_discovery(
         remaining = deadline - perf_counter()
         if remaining <= 0:
             raise _DiscoveryError("timeout", "Entry crawl deadline exhausted.")
-        candidates = (discover or discover_recruitment_entries)(source_url, remaining)
-        seen = {source_url}
-        tried = 0
+        if discover is not None:
+            candidates = discover(source_url, remaining)
+        elif http_preflight_done:
+            candidates = _render_entry_candidates(
+                preflight_base_url, source_url, deadline, render_page,
+            )
+        else:
+            candidates = discover_recruitment_entries(source_url, remaining)
+        seen = {source_url, *pretried_urls}
+        tried = len(pretried_urls)
         for url in candidates:
             if url in seen:
                 continue

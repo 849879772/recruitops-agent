@@ -52,3 +52,22 @@ def test_filter_and_multiple_entries_have_stable_ids():
     assert first["out_of_scope"] == 1
     assert registry.list_sources()["total"] == 2
     storage.engine.dispose()
+
+
+@pytest.mark.parametrize("complete,filters", [
+    (True, {"seasonYear": 2026}),
+    (False, {"seasonYear": 2027}),
+    (True, {}),
+])
+def test_unverified_year_scope_does_not_override_row_evidence(complete, filters):
+    storage = Storage.from_url("sqlite:///:memory:", initialize=True)
+    registry = CompanySourceRegistry(storage)
+    snapshot = {"source": "offerbiu", "complete": complete, "filters": filters,
+                "items": [{"id": "old", "companyName": "Example", "targetYears": [2026],
+                           "recruitType": "秋招", "industryGroupCodes": ["internet-tech"],
+                           "applyUrl": "https://jobs.example.com/campus"}]}
+    result = import_offerbiu_sources(registry, snapshot)
+    assert result["retained"] == 0
+    assert result["out_of_scope"] == 1
+    assert registry.list_sources()["total"] == 0
+    storage.engine.dispose()

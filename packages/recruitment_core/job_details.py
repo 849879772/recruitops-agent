@@ -1952,7 +1952,9 @@ def fetch_configured_page_job_description_result(job: dict) -> JobDetailHydratio
                 request_result = replace(result, attempts=tuple(attempts))
                 if result.complete and not (is_list and job.get("entry_click_texts")):
                     return request_result
-                if result.status in _IDENTITY_FAILURES and not is_list:
+                if result.status == "identity_mismatch" or (
+                    result.status in _IDENTITY_FAILURES and not is_list
+                ):
                     return request_result
                 if result.status == "detail_link" and result.detail_url not in visited:
                     url = result.detail_url

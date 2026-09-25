@@ -28,9 +28,11 @@ class _FakeProcess:
         self._timeout = timeout
         self.terminated = False
         self.request = ""
+        self.communicate_timeout = 0.0
 
     def communicate(self, _request: str, timeout: float) -> tuple[str, str]:
         self.request = _request
+        self.communicate_timeout = timeout
         if self._timeout:
             raise subprocess.TimeoutExpired("worker", timeout)
         return self._stdout, self._stderr
@@ -82,6 +84,52 @@ def test_isolated_crawl_passes_a_smaller_budget_to_the_child(monkeypatch: pytest
 
     child_budget = float(launches[0]["env"][isolation.CRAWL_TIMEOUT_ENV])
     assert 0 < child_budget < 60
+    assert process.communicate_timeout == 120
+    assert float(launches[0]["env"]["RECRUITOPS_CRAWL_RESOURCE_DEADLINE"]) > isolation.time.monotonic()
+
+
+def test_browser_limit_defaults_to_six_and_explicit_four_six_reach_worker(monkeypatch):
+    process = _FakeProcess(stdout=json.dumps({"ok": True, "jobs": []}))
+    environments = []
+
+    def popen(*_args, **kwargs):
+        environments.append(kwargs["env"])
+        return process
+
+    monkeypatch.setattr(isolation.subprocess, "Popen", popen)
+    isolation.crawl_company_isolated({}, timeout_seconds=30)
+    assert environments[-1]["RECRUITOPS_BROWSER_MAX_CONCURRENCY"] == "6"
+    for limit in (4, 6):
+        isolation.crawl_company_isolated({}, timeout_seconds=30, browser_max_concurrency=limit)
+        assert environments[-1]["RECRUITOPS_BROWSER_MAX_CONCURRENCY"] == str(limit)
+    with pytest.raises(ValueError, match="between 1 and 6"):
+        isolation.crawl_company_isolated({}, timeout_seconds=30, browser_max_concurrency=7)
+
+
+@pytest.mark.parametrize("entrypoint", [
+    isolation.crawl_company_isolated, isolation.crawl_company_result_isolated,
+    isolation.fetch_job_detail_isolated, isolation.fetch_job_detail_result_isolated,
+])
+def test_worker_resource_config_is_explicit_and_does_not_mutate_parent(
+    entrypoint, monkeypatch, tmp_path,
+) -> None:
+    process = _FakeProcess(stdout=json.dumps({"ok": True, "jobs": [], "result": {"jobs": []}, "detail": ""}))
+    launches = []
+
+    def popen(*_args, **kwargs):
+        launches.append(kwargs)
+        return process
+
+    monkeypatch.setattr(isolation.subprocess, "Popen", popen)
+    monkeypatch.setenv("RECRUITOPS_BROWSER_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("RECRUITOPS_CRAWL_RESOURCE_ROOT", "parent-fixture-root")
+    entrypoint({}, timeout_seconds=30, resource_root=tmp_path, browser_max_concurrency=1)
+    child = launches[0]["env"]
+    assert child["RECRUITOPS_CRAWL_RESOURCE_ROOT"] == str(tmp_path.resolve())
+    assert child["RECRUITOPS_BROWSER_MAX_CONCURRENCY"] == "1"
+    assert float(child["RECRUITOPS_CRAWL_RESOURCE_DEADLINE"]) > isolation.time.monotonic()
+    assert isolation.os.environ["RECRUITOPS_CRAWL_RESOURCE_ROOT"] == "parent-fixture-root"
+    assert isolation.os.environ["RECRUITOPS_BROWSER_MAX_CONCURRENCY"] == "2"
 
 
 def test_isolated_crawler_kills_process_tree_on_timeout(
@@ -140,6 +188,7 @@ def test_isolated_crawler_surfaces_worker_error(
                 "ok": False,
                 "error_type": "PermissionError",
                 "error": "site rejected request",
+                "resource_timing": {"browser_wait_seconds": 2.5},
             }
         ),
         returncode=1,
@@ -152,6 +201,17 @@ def test_isolated_crawler_surfaces_worker_error(
             timeout_seconds=30,
         )
     assert caught.value.error_type == "PermissionError"
+    assert caught.value.resource_timing == {"browser_wait_seconds": 2.5}
+
+
+def test_worker_resource_timing_reaches_crawl_result(monkeypatch):
+    process = _FakeProcess(stdout=json.dumps({
+        "ok": True, "result": {"jobs": []},
+        "resource_timing": {"http_wait_seconds": 1.25, "browser_acquisitions": 1},
+    }))
+    monkeypatch.setattr(isolation.subprocess, "Popen", lambda *_a, **_k: process)
+    result = isolation.crawl_company_result_isolated({}, timeout_seconds=30)
+    assert result["resource_timing"] == {"http_wait_seconds": 1.25, "browser_acquisitions": 1}
 
 
 def test_request_is_serialized_before_worker_starts(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -357,3 +357,35 @@ def test_renderer_respects_navigation_ready_state(monkeypatch, ready_state) -> N
 
     assert renderer.render_page("https://example.com/jobs/42", **options) == "<main>ready</main>"
     assert calls[0][1] == {"wait_until": ready_state, "timeout": 30000}
+
+
+def test_renderer_selector_uses_dom_ready_unless_networkidle_is_explicit(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from packages.recruitment_core.crawlers import render as renderer
+
+    calls = []
+    page = SimpleNamespace(
+        route=lambda *args: None,
+        goto=lambda url, **kwargs: calls.append(kwargs),
+        wait_for_selector=lambda selector, **kwargs: calls.append((selector, kwargs)),
+        content=lambda: "<main><a class='job'>职位</a></main>",
+    )
+    context = SimpleNamespace(add_init_script=lambda *args: None, new_page=lambda: page, close=lambda: None)
+    browser = SimpleNamespace(new_context=lambda **kwargs: context, close=lambda: None)
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *args):
+            return None
+
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", PlaywrightContext)
+    monkeypatch.setattr(renderer, "launch_browser", lambda *args, **kwargs: browser)
+
+    assert renderer.render_page("https://example.com/jobs", wait_for=".job")
+    assert calls[0]["wait_until"] == "domcontentloaded"
+    assert calls[1][0] == ".job"
+    calls.clear()
+    assert renderer.render_page("https://example.com/jobs", wait_for=".job", wait_until="networkidle")
+    assert calls[0]["wait_until"] == "networkidle"

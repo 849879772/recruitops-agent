@@ -4,6 +4,8 @@ import logging
 import re
 import time
 from collections.abc import Mapping
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from typing import Any, Literal, Optional, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -50,6 +52,73 @@ _DETAIL_CONTENT_SELECTORS = (
     "[class*='job-content']", "[class*='job_content']", "[class*='rich-text']",
     "[class*='rich_text']",
 )
+
+
+class _RenderBrowserSession:
+    """Keep one browser for consecutive pages, with a fresh context per page."""
+
+    def __init__(self) -> None:
+        self._stack = ExitStack()
+        self._browser = None
+
+    def browser(self, sync_playwright):
+        if self._browser is None:
+            try:
+                playwright = self._stack.enter_context(sync_playwright())
+                browser = launch_browser(
+                    playwright,
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                self._stack.callback(browser.close)
+                self._browser = browser
+            except BaseException:
+                self.close()
+                raise
+        return self._browser
+
+    def close(self) -> None:
+        try:
+            self._stack.close()
+        finally:
+            self._stack = ExitStack()
+            self._browser = None
+
+
+_ACTIVE_RENDER_SESSION: ContextVar[_RenderBrowserSession | None] = ContextVar(
+    "recruitops_render_browser_session", default=None,
+)
+
+
+@contextmanager
+def company_render_session():
+    """Bound browser reuse to one disposable company worker operation."""
+    session = _RenderBrowserSession()
+    token = _ACTIVE_RENDER_SESSION.set(session)
+    try:
+        yield session
+    finally:
+        try:
+            session.close()
+        finally:
+            _ACTIVE_RENDER_SESSION.reset(token)
+
+
+@contextmanager
+def _borrow_render_browser(sync_playwright):
+    session = _ACTIVE_RENDER_SESSION.get()
+    if session is not None:
+        yield session.browser(sync_playwright)
+    else:
+        temporary = _RenderBrowserSession()
+        try:
+            yield temporary.browser(sync_playwright)
+        finally:
+            temporary.close()
 
 
 def _remaining_ms(deadline: float | None, fallback: int) -> int:
@@ -780,7 +849,7 @@ def render_page(
     detail_title: str = "",
     detail_job_id: str = "",
     annotate_visibility: bool = False,
-    wait_until: Literal["domcontentloaded", "load", "networkidle"] = "networkidle",
+    wait_until: Literal["domcontentloaded", "load", "networkidle"] | None = None,
 ) -> Optional[str]:
     """渲染 SPA 页面并返回完整 HTML。失败时返回 None。
 
@@ -792,7 +861,7 @@ def render_page(
         scroll_times: 额外滚动到底的次数（触发列表懒加载/分页加载）
         click_texts: 按顺序点击完全匹配的可见文本，用于展开筛选或行内详情
         click_selectors: 按顺序点击 CSS 选择器匹配的首个可见元素
-        wait_until: 导航完成条件；详情页可选 domcontentloaded，避免持续请求耗尽外层预算
+        wait_until: 显式导航完成条件；未指定且有 wait_for 时先等 DOM 再等目标元素
     """
     deadline = time.monotonic() + max(1, timeout_ms) / 1000
     try:
@@ -805,16 +874,7 @@ def render_page(
         return None
 
     try:
-        with sync_playwright() as p:
-            browser = launch_browser(
-                p,
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
+        with _borrow_render_browser(sync_playwright) as browser:
             context = browser.new_context(
                 user_agent=_USER_AGENT,
                 viewport={"width": 1366, "height": 768},
@@ -824,8 +884,9 @@ def render_page(
             context.add_init_script(_STEALTH_INIT_SCRIPT)
 
             page = context.new_page()
+            navigation_wait_until = wait_until or ("domcontentloaded" if wait_for else "networkidle")
             detail_mode = detail_interaction is not None or (
-                wait_until == "domcontentloaded" and not wait_for and not scroll_times
+                navigation_wait_until == "domcontentloaded" and not wait_for and not scroll_times
             )
             pending_requests: set[int] = set()
             failed_requests: list[str] = []
@@ -894,12 +955,12 @@ def render_page(
                 try:
                     page.goto(
                         url,
-                        wait_until=wait_until,
+                        wait_until=navigation_wait_until,
                         timeout=_remaining_ms(deadline, timeout_ms),
                     )
                 except PWTimeout:
                     navigation_state = "navigation_timeout"
-                    logger.warning("[render] goto %s 超时 %s（仍尝试解析当前页面）", wait_until, url)
+                    logger.warning("[render] goto %s 超时 %s（仍尝试解析当前页面）", navigation_wait_until, url)
                 except Exception:
                     navigation_state = "navigation_failed"
                     logger.warning("[render] goto failed; keeping current page", exc_info=True)
@@ -993,7 +1054,6 @@ def render_page(
                 return _read_stable_content(page)
             finally:
                 context.close()
-                browser.close()
     except Exception as e:
         logger.error("[render] 渲染异常 %s: %s", url, e)
         return None

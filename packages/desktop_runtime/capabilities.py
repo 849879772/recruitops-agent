@@ -3,9 +3,9 @@
 import json
 import ipaddress
 import re
-from urllib.parse import urlsplit
 
 from packages.user_settings import DEFAULT_ON_CAPABILITY_FIELDS
+from packages.model_policy import official_base, official_model
 
 from . import RuntimeFailure
 
@@ -17,17 +17,16 @@ CAPABILITY_FIELDS = (
 
 
 def saved_model_configured(settings):
-    """Saved connection shape only, not provider or agent process readiness."""
+    """Official saved connection only; legacy third-party keys stay disabled."""
     if not isinstance(settings, dict) or settings.get("model_api_style") not in ("anthropic", "openai"):
         return False
     if not all(isinstance(settings.get(name), str) and settings[name].strip()
                for name in ("llm_api_key", "model_name", "model_api_base_url")):
         return False
     try:
-        parsed = urlsplit(settings["model_api_base_url"].strip())
-        local_http = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-        return bool((parsed.scheme == "https" or local_http) and parsed.hostname
-                    and not (parsed.username or parsed.password or parsed.query or parsed.fragment))
+        official_base(settings["model_api_base_url"])
+        official_model(settings["model_name"])
+        return True
     except ValueError:
         return False
 

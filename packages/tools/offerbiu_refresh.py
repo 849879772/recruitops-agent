@@ -37,6 +37,12 @@ class OfferBiuSourceRefreshData(ToolModel):
     new_companies: int = Field(default=0, ge=0)
     excluded_reasons: dict[str, int] = Field(default_factory=dict)
     complete: bool
+    partial: bool = False
+    usable: bool = False
+    reason: str | None = None
+    counters: dict[str, int] = Field(default_factory=dict)
+    resumed: bool = False
+    fresh: bool = False
     stop_reason: str | None = None
     pages_fetched: int = Field(ge=0)
     records_seen: int = Field(ge=0)
@@ -86,7 +92,11 @@ def refresh_offerbiu_sources(
             source_ref="https://offerbiu.com/companies/",
         )],
         error_code=None if complete else ToolErrorCode.SOURCE_UNAVAILABLE,
-        error_message=None if complete else f"BIU refresh stopped: {payload['stop_reason']}",
+        error_message=None if complete else (
+            f"BIU 来源部分完成，已保存可用来源；剩余来源待补查：{payload['stop_reason']}"
+            if payload.get("partial") and payload.get("applied") else
+            f"BIU refresh stopped: {payload['stop_reason']}"
+        ),
         timeout_ms=request.timeout_ms,
         elapsed_ms=elapsed_ms,
         read_only=False,

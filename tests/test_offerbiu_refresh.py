@@ -1,3 +1,5 @@
+import pytest
+
 from packages.discovery.company_registry import CompanySourceRegistry
 from packages.discovery.offerbiu_refresh import OfferBiuRefreshService
 from packages.storage import Storage
@@ -27,6 +29,7 @@ class _Session:
         self.pages = pages
 
     def get(self, _url, *, params, **_kwargs):
+        assert dict(params)["seasonYear"] == "2027"
         page = int(dict(params)["page"])
         return _Response(self.pages[page])
 
@@ -101,6 +104,53 @@ def test_incomplete_refresh_never_writes_registry():
     assert response.data is not None and response.data.applied is False
     assert response.data.pending_entry_count is None
     assert CompanySourceRegistry(storage).list_sources()["total"] == 0
+
+
+@pytest.mark.parametrize("years", [None, [], [2026], ["2027"], "missing"])
+def test_year_filtered_refresh_trusts_source_cohort_through_registration(years):
+    storage = Storage.from_url("sqlite+pysqlite:///:memory:", initialize=True)
+    registry = CompanySourceRegistry(storage)
+    row = _row("two", "https://jobs.example.com/other")
+    if years == "missing":
+        row.pop("targetYears")
+    else:
+        row["targetYears"] = years
+    service = OfferBiuRefreshService(registry, session=_Session([
+        _payload(0, [_row("one", "https://jobs.example.com/campus")]),
+        _payload(1, [row]),
+    ]))
+    result = service.refresh(delay_seconds=0)
+    assert result["complete"] is True
+    assert result["stop_reason"] == "complete"
+    assert result["pages_fetched"] == 2
+    assert result["records_seen"] == result["registered_entries"] == 2
+    assert result["out_of_scope"] == 0
+    assert registry.list_sources()["total"] == 2
+    assert row.get("targetYears", "missing") == years  # Preserve source evidence.
+    storage.engine.dispose()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("recruitType", "春招"),
+    ("industryGroupCodes", ["finance"]),
+])
+def test_verified_request_scope_overrides_stale_row_metadata(field, value):
+    storage = Storage.from_url("sqlite+pysqlite:///:memory:", initialize=True)
+    registry = CompanySourceRegistry(storage)
+    row = _row("two", "https://jobs.example.com/other")
+    row.pop("targetYears")
+    row[field] = value
+    service = OfferBiuRefreshService(registry, session=_Session([
+        _payload(0, [_row("one", "https://jobs.example.com/campus")]),
+        _payload(1, [row]),
+    ]))
+    result = service.refresh(delay_seconds=0)
+    assert result["complete"] is True
+    assert result["stop_reason"] == "complete"
+    assert result["applied"] is True
+    assert result["out_of_scope"] == 0
+    assert registry.list_sources()["total"] == 2
+    storage.engine.dispose()
 
 
 def test_refresh_reports_validated_page_progress_without_early_writes():

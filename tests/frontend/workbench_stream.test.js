@@ -317,7 +317,7 @@ test("assistant company progress counts all persisted outcomes without showing r
     return jsonResponse({ run: {
       status: "running", phase: "companies",
       stages: { discovery: "succeeded", crawl: "running" },
-      progress: { stage: "companies", scope_total: 3321, attempted_unique: 1400,
+      progress: { stage: "companies", scope_total: 3321, attempted_unique: 1400, active_count: 10,
         confirmed_complete: 1283, retry_pending: 117 },
     } });
   });
@@ -326,6 +326,7 @@ test("assistant company progress counts all persisted outcomes without showing r
   assert.equal(calls[0].options.headers["X-RecruitOps-Local-UI"], "1");
   assert.equal(document.getElementById("assistant-task-progress").hidden, false);
   assert.match(document.getElementById("assistant-task-progress-detail").textContent, /已处理 1400 \/ 总计 3321 家/);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /当前正在处理 10 家/);
   assert.doesNotMatch(document.getElementById("assistant-task-progress-detail").textContent, /待重试|失败|已确认完成/);
   assert.equal(document.getElementById("assistant-task-progress-bar").hidden, false);
   assert.equal(document.getElementById("assistant-task-progress-bar").value, 1400 / 3321 * 100);
@@ -342,6 +343,164 @@ test("assistant company progress counts all persisted outcomes without showing r
 function turnEvent() {
   return frame("turn", { id: "turn-1", thread_id: "thread-1" });
 }
+
+test("discovery does not show a full-range percentage before confirming sources", () => {
+  const { document, hooks } = loadApp(async () => jsonResponse({ run: null }));
+  hooks.renderDailyProgress({ run: { status: "running", phase: "discovery", stages: {},
+    progress: { stage: "discovery", pages_fetched: 4, pages_total: 30, records_seen: 200,
+      total_confirmed: false } } });
+  assert.equal(document.getElementById("assistant-task-progress-bar").hidden, true);
+  assert.match(document.getElementById("assistant-task-progress-detail").textContent, /来源范围确认中/);
+  hooks.renderDailyProgress({ run: { status: "running", phase: "companies",
+    stages: { discovery: "partial", offline_reconciliation: "skipped" },
+    progress: { stage: "companies", attempted_unique: 1, scope_total: 2 } } });
+  assert.match(document.getElementById("assistant-task-progress-stages").textContent, /公司发现：部分完成/);
+  assert.match(document.getElementById("assistant-task-progress-stages").textContent, /岗位状态整理：已跳过/);
+});
+
+test("a finished background crawl triggers one read-only assistant summary in its original conversation", async () => {
+  const runId = "a".repeat(32);
+  let finished = false;
+  const calls = [];
+  const answer = `本轮完成，新增 12 个岗位。${runId}`;
+  const { hooks } = loadApp(async (url, options) => {
+    calls.push({ url, options });
+    if (url === "/api/local-ui/tasks/progress") {
+      return jsonResponse(finished ? { runs: [], run: null } : { runs: [{
+        run_id: runId, task_kind: "daily", thread_id: "thread-1", mode: "full", status: "running", phase: "companies",
+        progress: { stage: "companies", attempted_unique: 2, scope_total: 3 },
+      }] });
+    }
+    if (url === `/api/local-ui/tasks/progress?run_id=${runId}`) {
+      return jsonResponse({ run: { run_id: runId, task_kind: "daily", thread_id: "thread-1", mode: "full", status: "completed" } });
+    }
+    if (url === "/api/approvals") return jsonResponse([]);
+    if (url.includes("/turns/stream")) return streamResponse([
+      { value: bytes([
+        turnEvent(),
+        frame("text_delta", turnEventPayload("text_delta", "event-1", { text: answer })),
+        frame("turn_completed", turnEventPayload("turn_completed", "event-2")),
+      ].join("")), done: false },
+      completeRead(),
+    ]);
+    if (url === "/api/codex/threads") return jsonResponse({ threads: [] });
+    throw new Error(`Unexpected ${url}`);
+  });
+
+  await hooks.refreshDailyProgress();
+  assert.equal(hooks.state.dailyNotices[runId].status, "active");
+  finished = true;
+  await hooks.refreshDailyProgress();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(hooks.state.dailyNotices[runId].status, "reported");
+  const starts = calls.filter((call) => call.url.includes("/turns/stream"));
+  assert.equal(starts.length, 1);
+  const prompt = JSON.parse(starts[0].options.body).text;
+  assert.match(prompt, /daily_recruitment_sync_status/);
+  assert.match(prompt, /不得启动、恢复、取消任务或写入数据/);
+  assert.equal(hooks.state.messages.at(-1).body, "本轮完成，新增 12 个岗位。本次任务");
+  assert.equal(hooks.state.tasks.at(-1).user_request, "后台爬取结果自动汇报");
+  await hooks.refreshDailyProgress();
+  assert.equal(calls.filter((call) => call.url.includes("/turns/stream")).length, 1);
+});
+
+test("a crawl that fails before the first progress poll is still tracked from its tool receipt", async () => {
+  const runId = "e".repeat(32);
+  let modelTurns = 0;
+  const { hooks } = loadApp(async (url) => {
+    if (url.includes("/turns/stream")) {
+      modelTurns += 1;
+      const events = modelTurns === 1 ? [
+        turnEvent(),
+        frame("item_completed", turnEventPayload("item_completed", "event-tool", {
+          payload: { tool_name: "daily_recruitment_sync", output: JSON.stringify({ data: { run_id: runId, run_status: "failed" } }) },
+        })),
+        frame("turn_completed", turnEventPayload("turn_completed", "event-end")),
+      ] : [turnEvent(), frame("turn_completed", turnEventPayload("turn_completed", "event-report"))];
+      return streamResponse([{ value: bytes(events.join("")), done: false }, completeRead()]);
+    }
+    if (url === "/api/local-ui/tasks/progress") return jsonResponse({ runs: [] });
+    if (url === `/api/local-ui/tasks/progress?run_id=${runId}`) {
+      return jsonResponse({ run: { run_id: runId, task_kind: "daily", thread_id: "thread-1", mode: "full", status: "failed" } });
+    }
+    if (url === "/api/approvals") return jsonResponse([]);
+    if (url === "/api/codex/threads") return jsonResponse({ threads: [] });
+    throw new Error(`Unexpected ${url}`);
+  });
+  await hooks.runCodexAssistantQuery("全量爬取", "", "");
+  assert.equal(hooks.state.dailyNotices[runId].status, "active");
+  await hooks.refreshDailyProgress();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(modelTurns, 2);
+  assert.equal(hooks.state.dailyNotices[runId].status, "reported");
+});
+
+test("a failed crawl waits for the original conversation before reporting", async () => {
+  const runId = "b".repeat(32);
+  let finished = false;
+  let starts = 0;
+  const { hooks } = loadApp(async (url) => {
+    if (url === "/api/local-ui/tasks/progress") return jsonResponse(finished ? { runs: [] } : {
+      runs: [{ run_id: runId, task_kind: "daily", thread_id: "thread-1", mode: "full", status: "running" }],
+    });
+    if (url === `/api/local-ui/tasks/progress?run_id=${runId}`) {
+      return jsonResponse({ run: { run_id: runId, task_kind: "daily", thread_id: "thread-1", mode: "full", status: "failed" } });
+    }
+    if (url === "/api/approvals") return jsonResponse([]);
+    if (url.includes("/turns/stream")) {
+      starts += 1;
+      return streamResponse([{ value: bytes([turnEvent(), frame("turn_completed", turnEventPayload("turn_completed", "event-1"))].join("")), done: false }]);
+    }
+    if (url === "/api/codex/threads") return jsonResponse({ threads: [] });
+    throw new Error(`Unexpected ${url}`);
+  });
+  await hooks.refreshDailyProgress();
+  hooks.state.codexThreadId = "thread-2";
+  finished = true;
+  await hooks.refreshDailyProgress();
+  assert.equal(starts, 0);
+  assert.equal(hooks.state.dailyNotices[runId].status, "ready");
+  hooks.state.codexThreadId = "thread-1";
+  await hooks.refreshDailyProgress();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(starts, 1);
+  assert.equal(hooks.state.dailyNotices[runId].status, "reported");
+});
+
+test("a deliberately paused crawl does not trigger a completion summary", async () => {
+  const runId = "c".repeat(32);
+  let finished = false;
+  let terminalReads = 0;
+  const { hooks } = loadApp(async (url) => {
+    if (url === "/api/local-ui/tasks/progress") return jsonResponse(finished ? { runs: [] } : {
+      runs: [{ run_id: runId, task_kind: "daily", thread_id: "thread-1", mode: "full", status: "running" }],
+    });
+    if (url === `/api/local-ui/tasks/progress?run_id=${runId}`) {
+      terminalReads += 1;
+      return jsonResponse({ run: { run_id: runId, task_kind: "daily", thread_id: "thread-1", status: "paused" } });
+    }
+    if (url === "/api/approvals") return jsonResponse([]);
+    throw new Error(`Unexpected ${url}`);
+  });
+  await hooks.refreshDailyProgress();
+  finished = true;
+  await hooks.refreshDailyProgress();
+  await hooks.refreshDailyProgress();
+  assert.equal(hooks.state.dailyNotices[runId].status, "dismissed");
+  assert.equal(terminalReads, 1);
+});
+
+test("conversation recovery hides the internal automatic-report prompt and run ID", () => {
+  const runId = "d".repeat(32);
+  const { hooks } = loadApp(async () => { throw new Error("No fetch expected"); });
+  const messages = hooks.codexHistoryMessages({ id: "thread-1", turns: [{ id: "turn-auto", items: [
+    { id: "user-auto", type: "userMessage", content: `[RecruitOps 自动任务汇报] run_id="${runId}"` },
+    { id: "answer-auto", type: "agentMessage", text: `本轮失败。${runId}` },
+  ] }] });
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, "assistant");
+  assert.equal(messages[0].body, "本轮失败。本次任务");
+});
 
 function turnEventPayload(eventType, eventId, extra = {}) {
   return {

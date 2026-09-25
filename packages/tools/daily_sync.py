@@ -101,6 +101,7 @@ def _compact_status_result(value: Any) -> Any:
         "reused", "rejected", "failed", "failed_companies", "failed_jobs",
         "filtered", "written", "analysis_enabled", "scoring_candidates",
         "scored", "scoring_failed", "unscored",
+        "source_partial", "warnings", "source_coverage",
     )
     compact = {key: pipeline[key] for key in scalar_keys if key in pipeline}
     for key in ("rejection_reasons", "failure_reasons", "scoped_company_ids"):

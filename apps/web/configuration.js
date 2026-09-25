@@ -14,7 +14,6 @@
   const split = (value) => value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const MODEL_PRESETS = {
     deepseek: {label: "DeepSeek", api_style: "anthropic", base_url: "https://api.deepseek.com", model: "deepseek-flash"},
-    "openai-compatible": {label: "OpenAI 兼容接口", api_style: "openai", base_url: "", model: ""},
   };
   const degreeOption = (value) => {
     const text = String(value || "");
@@ -26,9 +25,11 @@
     const response = await fetch(`/api/local-ui/configuration/${path}`, {
       method: "POST", credentials: "same-origin",
       headers: {"Content-Type": "application/json", "X-RecruitOps-Local-UI": "1"},
-      body: JSON.stringify(payload), signal: AbortSignal.timeout(path === "resume/parse" ? 60000 : 30000),
+      body: JSON.stringify(payload), signal: AbortSignal.timeout(path === "resume/parse" ? 105000 : path === "model/test" ? 50000 : 30000),
     });
-    const result = await response.json();
+    let result;
+    try { result = JSON.parse(await response.text()); }
+    catch { throw new Error(`服务返回了无法解析的响应（HTTP ${response.status}），请查看服务日志；保存操作请重新读取配置确认结果。`); }
     if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "输入格式有误");
     return result;
   }
@@ -134,11 +135,19 @@
         const option = document.createElement("option"); option.value = value; option.textContent = preset.label;
         provider.append(option);
       }
-      provider.value = connection.provider || "deepseek";
-      const providerHint = document.createElement("small"); providerHint.textContent = "官方 DeepSeek 直接选 DeepSeek，其他兼容服务选择兼容接口。";
+      provider.value = "deepseek"; provider.disabled = true;
+      const providerHint = document.createElement("small"); providerHint.textContent = "仅支持 DeepSeek 官方服务，助理、解析与评分统一使用。";
       providerLabel.append(providerCaption, provider, providerHint);
-      const base = input("API 服务地址", "base_url", "url", "DeepSeek 会自动填写；其他服务填写其接口基础地址。"); base.control.value = connection.base_url || "";
-      const model = input("模型名称", "model", "text", "填写服务商提供的准确模型标识。"); model.control.value = connection.model || "";
+      const base = input("API 服务地址", "base_url", "url", "固定使用 DeepSeek 官方地址。"); base.control.value = MODEL_PRESETS.deepseek.base_url; base.control.readOnly = true;
+      const model = {wrapper: document.createElement("label"), control: document.createElement("select")};
+      model.wrapper.append(document.createTextNode("模型名称"));
+      model.control.dataset.modelField = "model";
+      for (const value of ["deepseek-flash", "deepseek-v4-pro"]) {
+        const option = document.createElement("option"); option.value = value; option.textContent = value;
+        model.control.append(option);
+      }
+      model.control.value = connection.model || MODEL_PRESETS.deepseek.model;
+      model.wrapper.append(model.control);
       const key = input("API 密钥", "api_key", "password", "已保存时留空表示不修改。");
       key.control.value = connection.api_key || "";
       key.control.placeholder = connection.key_configured ? "已保存，留空不修改" : "请输入 API 密钥";
@@ -217,6 +226,7 @@
       renderReadiness(payload);
       workingProfile = structuredClone(payload.profile);
       modelConnections = payload.model_connections.map((item) => ({...item}));
+      inlineMessage("model-connection-message", payload.model_migration_required ? "旧连接不是受支持的 DeepSeek 官方连接，已停止使用。请重新填写官方密钥；岗位和简历数据不受影响。" : "", Boolean(payload.model_migration_required));
       activeModelConnectionId = payload.active_model_connection_id;
       renderModelConnections();
       for (const [key, value] of Object.entries(payload.settings)) {
@@ -309,7 +319,7 @@
       key_configured: modelConnections.find((saved) => saved.id === item.id)?.key_configured || false,
     }));
     const id = `model-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
-    modelConnections.push({id, name: "备用模型", provider: "openai-compatible", api_style: "openai", base_url: "", model: "", key_configured: false});
+    modelConnections.push({id, name: "备用 DeepSeek 连接", provider: "deepseek", ...MODEL_PRESETS.deepseek, key_configured: false});
     renderModelConnections();
     inlineMessage("model-connection-message", "已添加备用连接，请填写后保存。", false);
   });

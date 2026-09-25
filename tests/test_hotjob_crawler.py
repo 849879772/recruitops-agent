@@ -217,3 +217,144 @@ def test_rendered_fallback_is_stable_but_never_claims_full_pagination(
     assert crawler.has_more is True
     assert crawler.pagination_complete is False
     assert crawler.pagination_termination_reason == "rendered_list_pagination_unverified"
+
+
+def test_title_first_list_mode_keeps_rows_and_defers_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawler = HotjobRecruitCrawler("测试公司", f"{ORIGIN}/pb/school.html")
+    calls = _install_api(monkeypatch, crawler, {
+        1: {"totalPage": 1, "pageSize": 1, "dataCount": 1, "pageData": [_row("list-1")]},
+    })
+    details = []
+    monkeypatch.setattr(
+        hotjob_module, "_fetch_hotjob_position_detail",
+        lambda url: details.append(url) or ("已抓详情", url, "active"),
+    )
+    monkeypatch.setenv("RECRUITOPS_HOTJOB_LIST_ONLY", "1")
+
+    jobs = crawler.fetch()
+
+    assert len(calls) == 1
+    assert len(jobs) == 1
+    assert details == []
+    assert jobs[0]["title"] == "软件开发工程师"
+    assert jobs[0]["jd_url"] == f"{ORIGIN}/pb/posDetail.html?postId=list-1&postType=campus"
+    assert crawler.pagination_complete is True
+    assert crawler.detail_expected_total == 1
+    assert crawler.detail_count == 0
+    assert crawler.detail_complete is False
+    assert crawler.completeness_evidence["detail_complete"] is False
+
+
+def test_direct_fetch_still_hydrates_hotjob_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawler = HotjobRecruitCrawler("测试公司", f"{ORIGIN}/pb/school.html")
+    _install_api(monkeypatch, crawler, {
+        1: {"totalPage": 1, "pageSize": 1, "dataCount": 1, "pageData": [_row("direct-1")]},
+    })
+    monkeypatch.delenv("RECRUITOPS_HOTJOB_LIST_ONLY", raising=False)
+
+    jobs = crawler.fetch()
+
+    assert jobs[0]["jd_raw"].startswith("职位描述")
+    assert crawler.detail_count == 1
+    assert crawler.detail_complete is True
+
+
+def test_list_only_remains_complete_at_company_listing_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    from packages.recruitment_core.runner import crawl_company_with_evidence
+
+    crawler = HotjobRecruitCrawler("测试公司", f"{ORIGIN}/pb/school.html")
+    _install_api(monkeypatch, crawler, {
+        1: {"totalPage": 1, "pageSize": 1, "dataCount": 1, "pageData": [_row("boundary-1")]},
+    })
+    monkeypatch.setenv("RECRUITOPS_HOTJOB_LIST_ONLY", "1")
+
+    result = crawl_company_with_evidence(
+        {"name": "测试公司", "crawler": "hotjob", "careers_url": f"{ORIGIN}/pb/school.html"},
+        crawler_map={"hotjob": HotjobRecruitCrawler},
+    )
+
+    assert len(result["jobs"]) == 1
+    assert result["source_runs"][0]["pagination_complete"] is True
+    assert result["source_runs"][0]["termination_reason"] == "api_total_pages_and_count_reached"
+    assert result["failures"] == []
+
+
+def test_mobile_source_renders_mobile_route_first_and_stays_partial(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawler = HotjobRecruitCrawler("测试公司", f"{ORIGIN}/mc/position/campus")
+    monkeypatch.setattr(crawler, "_fetch_new_pb_api", lambda: [])
+    rendered = []
+
+    def render(url, **kwargs):
+        rendered.append((url, kwargs["timeout_ms"]))
+        return """<div class='listItem'><span class='listItemRtTitCon'>算法工程师</span></div>"""
+
+    monkeypatch.setattr(hotjob_module, "render_page", render)
+    monkeypatch.setattr(crawler, "_remaining_seconds", lambda fallback: 4.0)
+
+    jobs = crawler.fetch()
+
+    assert len(jobs) == 1
+    assert rendered == [(f"{ORIGIN}/mc/position/campus", 4000)]
+    assert crawler.pagination_complete is False
+    assert crawler.pagination_termination_reason == "rendered_list_pagination_unverified"
+
+
+def test_api_rate_limit_records_partial_failure_without_browser_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawler = HotjobRecruitCrawler("测试公司", f"{ORIGIN}/pb/school.html")
+    response = requests.Response()
+    response.status_code = 429
+    monkeypatch.setattr(hotjob_module.requests, "post", lambda *_a, **_k: response)
+    rendered = []
+    monkeypatch.setattr(hotjob_module, "render_page", lambda url, **_k: rendered.append(url))
+
+    assert crawler.fetch() == []
+    assert rendered == []
+    assert crawler.api_rate_limited is True
+    assert crawler.crawl_error_code == "rate_limited"
+    assert crawler.fetch_failed is True
+    assert crawler.pagination_complete is False
+    assert crawler.pagination_termination_reason == "api_rate_limited_page_1"
+
+
+def test_rate_limit_reaches_entry_result_without_browser_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from packages.recruitment_core.entry_crawl import crawl_company_with_entry_discovery
+
+    response = requests.Response()
+    response.status_code = 429
+    monkeypatch.setattr(hotjob_module.requests, "post", lambda *_a, **_k: response)
+    rendered = []
+    monkeypatch.setattr(hotjob_module, "render_page", lambda url, **_k: rendered.append(url))
+
+    result = crawl_company_with_entry_discovery(
+        {"name": "测试公司", "crawler": "hotjob", "careers_url": f"{ORIGIN}/pb/school.html"},
+        crawler_map={"hotjob": HotjobRecruitCrawler},
+    )
+
+    assert result["jobs"] == []
+    assert result["raw_job_count"] == 0
+    assert result["error_code"] == "rate_limited"
+    assert result["pagination_complete"] is False
+    assert result["source_runs"][0]["error_code"] == "rate_limited"
+    assert result["source_runs"][0]["termination_reason"] == "api_rate_limited_page_1"
+    assert rendered == []
+
+
+def test_rendered_rows_preserve_prior_api_failure_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawler = HotjobRecruitCrawler("测试公司", f"{ORIGIN}/pb/school.html")
+
+    def failed_post(*_args, **_kwargs):
+        raise requests.ConnectionError("fixture connection reset")
+
+    monkeypatch.setattr(hotjob_module.requests, "post", failed_post)
+    monkeypatch.setattr(hotjob_module, "render_page", lambda *_a, **_k: """
+        <div class='list-row-item'>
+          <div class='list-cell pos-name'><span class='list-cell-span'>软件开发工程师</span></div>
+        </div>
+    """)
+
+    jobs = crawler.fetch()
+
+    assert len(jobs) == 1
+    assert crawler.pagination_complete is False
+    assert crawler.pagination_termination_reason == "rendered_list_pagination_unverified"
+    assert crawler.pagination_diagnostics == [{"reason": "api_request_failed_page_1"}]

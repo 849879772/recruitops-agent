@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from apps.api.daily_progress import task_progress
 from packages.discovery.company_registry import CompanySourceRecord
 from packages.orchestration import DailyRecruitmentSync
 from packages.repositories.postgres import PostgresRecruitmentRepository
@@ -16,7 +17,7 @@ from packages.scheduler import LocalTaskScheduler, TaskContext, TaskType
 from packages.scheduler.models import RunStatus
 from packages.scheduler.runtime import build_runtime_task_handlers
 from packages.storage import Storage
-from packages.storage.models import CompanySnapshot, JobSnapshot
+from packages.storage.models import CompanySnapshot, JobSnapshot, TaskRun
 from packages.storage.sync import AgentStateStore
 from packages.tools.operations import OperationalTaskRunInput, OperationalTaskRunner
 from packages.tools.typed import CompanyCoverageInput, company_coverage
@@ -47,7 +48,7 @@ def test_generic_handler_non_string_status_is_not_a_business_failure(tmp_path, s
     )
     assert result.status is RunStatus.SUCCESS
     assert result.attempts == 1
-    assert result.value is payload
+    assert result.value == {**payload, "execution_segments": 1}
 
 
 @pytest.mark.parametrize("payload", [
@@ -64,7 +65,7 @@ def test_business_failure_is_terminal_and_keeps_value(tmp_path, payload):
         max_retries=5, run_id="original-run",
     )
     assert result.status is RunStatus.FAILED
-    assert result.value is payload
+    assert result.value == {**payload, "execution_segments": 1}
     assert result.error
     assert result.attempts == 1
     assert calls == ["original-run"]
@@ -97,7 +98,7 @@ def test_operation_failure_envelope_keeps_daily_receipt(tmp_path):
     assert not response.success
     assert response.status == "failure"
     assert response.data.run_status == "failed"
-    assert response.data.result == payload
+    assert response.data.result == {**payload, "execution_segments": 1}
     assert response.data.error == "broken"
     assert calls == [response.data.run_id]
 
@@ -133,7 +134,7 @@ def test_background_failure_is_queryable_without_reexecution(tmp_path, monkeypat
         assert not thread.is_alive()
     status = runner.background_status(accepted.data.run_id)
     assert status["run_status"] == "failed"
-    assert status["result"] == payload
+    assert status["result"] == {**payload, "execution_segments": 1}
     assert calls == [accepted.data.run_id]
 
 
@@ -328,6 +329,22 @@ def test_runtime_persists_receipt_without_replacing_resume_state(storage, monkey
     status = restarted.background_status("original-run")
     assert status["run_status"] == "failed"
     assert status["result"] == result
+
+
+def test_active_company_count_is_projected_from_persisted_progress(storage):
+    store = AgentStateStore(storage)
+    store.save_task_state("running-companies", {
+        "current_step": "companies:7/20",
+        "progress": {"stage": "companies", "scope_total": 20,
+                     "attempted_unique": 7, "active_count": 4},
+    }, ensure_task_run=True)
+    with storage.write_transaction() as session:
+        session.get(TaskRun, "running-companies").status = "running"
+
+    projected = task_progress(storage)["run"]
+    assert projected["completed"] == 7
+    assert projected["total"] == 20
+    assert projected["progress"]["active_count"] == 4
 
 
 def test_dry_run_does_not_claim_historical_inventory_as_new_writes(storage):

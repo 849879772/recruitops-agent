@@ -707,11 +707,11 @@ def daily_recruitment_progress(request: Request) -> dict[str, object]:
 
 
 @app.get("/api/local-ui/tasks/progress", tags=["local-ui"])
-def current_task_progress(request: Request) -> dict[str, object]:
+def current_task_progress(request: Request, run_id: str | None = Query(default=None, min_length=8, max_length=128)) -> dict[str, object]:
     if not _is_same_origin_progress_get(request):
         raise HTTPException(403, "Local same-origin UI request required")
     # No history fallback: a new conversation never resurrects a finished card.
-    return task_progress(Storage(get_storage_engine()))
+    return task_progress(Storage(get_storage_engine()), run_id=run_id)
 
 
 class TaskControlRequest(BaseModel):

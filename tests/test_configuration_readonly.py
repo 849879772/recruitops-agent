@@ -39,7 +39,7 @@ def test_readonly_configuration_returns_full_schema_without_writes(owner, monkey
             "settings", "secrets", "profile", "model_connections",
             "active_model_connection_id", "configured_capabilities", "options",
             "onboarding", "bootstrap", "restart_required",
-            "module_readiness",
+            "module_readiness", "model_migration_required",
         }
         assert payload["bootstrap"] == {"companies_created": False, "profile_created": False}
         assert payload["model_connections"] and payload["options"]["industry_groups"]

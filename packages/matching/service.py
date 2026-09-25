@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .client import DeepSeekClientError
+from .client import DeepSeekClient, DeepSeekClientError
 from .models import (
     AnalysisDecision,
     AnalysisOutcome,
@@ -545,11 +545,15 @@ class MatchingService:
         input_tokens = output_tokens = 0
         for attempt in range(MAX_OUTPUT_ATTEMPTS):
             try:
-                response = self.client.complete(
-                    system_prompt=system_prompt + correction,
-                    user_prompt=user_prompt,
-                    max_tokens=self.max_tokens,
-                )
+                request = dict(system_prompt=system_prompt + correction,
+                               user_prompt=user_prompt,
+                               max_tokens=min(self.max_tokens * (2 ** attempt), 8000))
+                if isinstance(self.client, DeepSeekClient):
+                    response = self.client.complete_structured(
+                        **request, schema=DeepSeekMatchPayload.model_json_schema(),
+                        thinking_enabled=self.client.thinking_enabled)
+                else:
+                    response = self.client.complete(**request)
                 if isinstance(response, DeepSeekResponse):
                     input_tokens += response.input_tokens or 0
                     output_tokens += response.output_tokens or 0
@@ -562,7 +566,7 @@ class MatchingService:
                     })
                 return response, payload, refusal
             except DeepSeekClientError as exc:
-                if exc.code not in {"response_empty", "response_truncated"}:
+                if exc.code not in {"response_empty", "response_truncated", "structured_response_invalid", "response_invalid"}:
                     raise
                 issue = "response must contain one complete JSON object within the output budget"
             except (json.JSONDecodeError, TypeError):

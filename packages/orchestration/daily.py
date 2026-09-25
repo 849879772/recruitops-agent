@@ -34,6 +34,7 @@ class StageStatus(StrEnum):
     SKIPPED = "skipped"
     FAILED = "failed"
     PAUSED = "paused"
+    PARTIAL = "partial"
 
 
 class DailySyncStatus(StrEnum):
@@ -216,14 +217,20 @@ class DailyRecruitmentSync:
                     self.discovery(dry_run) if parameters else self.discovery()
                 )
                 outputs[DailySyncStage.DISCOVERY] = discovery_output
+                source_partial = isinstance(discovery_output, Mapping) and bool(
+                    discovery_output.get("partial")
+                    or discovery_output.get("complete") is False
+                )
+                if source_partial:
+                    warnings.append("来源读取部分完成；仅处理已确认来源，未完成部分保留待补查")
                 emit(
                     DailySyncStage.DISCOVERY,
-                    StageStatus.SUCCEEDED,
-                    "可信招聘来源同步完成",
+                    StageStatus.PARTIAL if source_partial else StageStatus.SUCCEEDED,
+                    "可信招聘来源部分同步，继续处理可用来源" if source_partial else "可信招聘来源同步完成",
                     value=discovery_output,
                 )
             except Exception as exc:
-                message = f"来源发现失败，继续抓取已配置公司：{type(exc).__name__}: {exc}"
+                message = f"来源发现失败；后续抓取仍须通过任务范围校验：{type(exc).__name__}: {exc}"
                 warnings.append(message)
                 emit(
                     DailySyncStage.DISCOVERY,
@@ -251,7 +258,7 @@ class DailyRecruitmentSync:
                     value=reconciliation_output,
                 )
             except Exception as exc:
-                message = f"公司对账失败，继续抓取已配置公司：{type(exc).__name__}: {exc}"
+                message = f"公司对账失败；后续抓取仍须通过任务范围校验：{type(exc).__name__}: {exc}"
                 warnings.append(message)
                 emit(
                     DailySyncStage.RECONCILIATION,
@@ -290,11 +297,17 @@ class DailyRecruitmentSync:
             )
 
         offline_output = None
-        if fatal_error is not None or paused or self.offline_reconcile is None:
+        source_incomplete = (
+            isinstance(discovery_output, Mapping)
+            and (discovery_output.get("partial") or discovery_output.get("complete") is False)
+        ) or (isinstance(pipeline_output, Mapping) and bool(pipeline_output.get("source_partial")))
+        if source_incomplete and not any("来源读取部分完成" in item for item in warnings):
+            warnings.append("来源读取部分完成；当前仅处理已冻结范围，不能视为全量完成")
+        if fatal_error is not None or paused or source_incomplete or self.offline_reconcile is None:
             emit(
                 DailySyncStage.OFFLINE_RECONCILIATION,
                 StageStatus.SKIPPED,
-                "抓取未完成或未配置岗位离线收口",
+                "来源不完整，禁止据此下架旧岗位" if source_incomplete else "抓取未完成或未配置岗位离线收口",
             )
         else:
             emit(

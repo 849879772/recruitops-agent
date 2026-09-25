@@ -257,7 +257,7 @@ def capability_files(root, *, marker=True, identity="fixture", **preferences):
     if marker:
         (root / "config/runtime-capabilities.json").write_text(json.dumps(
             {"schema": 1, "instance_id": identity, "first_run_complete": True}))
-    model = {"model_name": "synthetic-model", "model_api_base_url": "https://model.example.invalid",
+    model = {"model_name": "deepseek-flash", "model_api_base_url": "https://api.deepseek.com",
              "model_api_style": "anthropic"}
     (root / ".data/settings/preferences.json").write_text(json.dumps({**model, **preferences}))
 
@@ -401,5 +401,5 @@ def test_assistant_saved_model_invalid_is_disabled(tmp_path, monkeypatch, field,
 
 def test_saved_model_helper_strict_types_and_local_endpoint():
     assert not saved_model_configured([])
-    assert saved_model_configured({"llm_api_key": "synthetic", "model_name": "synthetic",
+    assert not saved_model_configured({"llm_api_key": "synthetic", "model_name": "deepseek-flash",
                                   "model_api_style": "openai", "model_api_base_url": "http://127.0.0.1:55003/v1"})

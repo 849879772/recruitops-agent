@@ -47,12 +47,14 @@ def test_parse_retries_missing_evidence_with_larger_budget(owner, monkeypatch):
     monkeypatch.setenv("RECRUITOPS_LLM_ENABLED", "true")
     get_settings.cache_clear()
     budgets = []
+    prompts = []
 
     class Client:
         def __init__(self, **kwargs):
             budgets.append(kwargs["max_tokens"])
 
         def complete_structured(self, **kwargs):
+            prompts.append(kwargs["system_prompt"])
             skill = {"value": "Python", "evidence": "使用 Python 开发机器人系统"}
             if len(budgets) == 1:
                 skill.pop("evidence")
@@ -64,7 +66,49 @@ def test_parse_retries_missing_evidence_with_larger_budget(owner, monkeypatch):
                            json={"text": "使用 Python 开发机器人系统，并负责多个项目的数据处理和接口实现。"})
     assert response.status_code == 200, response.text
     assert budgets == [4000, 8000]
+    assert "skills.0.evidence" in prompts[1]
+    assert "不得补造" in prompts[1]
     assert response.json()["draft"]["skills"][0]["evidence"] == "使用 Python 开发机器人系统"
+    assert not (root / ".data/settings/candidate_profile.yaml").exists()
+
+
+def test_absent_resume_facts_are_nullable_or_empty_not_schema_errors(owner, monkeypatch):
+    client, headers, root, _ = owner
+    monkeypatch.setenv("RECRUITOPS_LLM_ENABLED", "true")
+    get_settings.cache_clear()
+    def transport(endpoint, headers, payload, timeout):
+        schema = payload["text"]["format"]["schema"]
+        assert {"degree", "skills", "projects", "directions"} <= set(schema["properties"]["result"]["required"])
+        return {"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": json.dumps({"result": {
+                "degree": None, "skills": [], "supporting_skills": [], "projects": [],
+                "title_keywords": [], "directions": []}})}]}]}
+    monkeypatch.setattr("packages.matching.client._default_transport", transport)
+    response = client.post("/api/local-ui/configuration/resume/parse", headers=headers,
+                           json={"text": "这份资料没有注明学历、技能或项目，仅提供求职意向说明，供人工核实。"})
+    assert response.status_code == 200, response.text
+    assert response.json()["draft"]["degree"] is None
+    assert response.json()["draft"]["skills"] == []
+    assert not (root / ".data/settings/candidate_profile.yaml").exists()
+
+
+def test_twice_invalid_schema_keeps_saved_profile(owner, monkeypatch):
+    client, headers, root, _ = owner
+    monkeypatch.setenv("RECRUITOPS_LLM_ENABLED", "true")
+    get_settings.cache_clear()
+    path = root / "config/candidate_profile.yaml"
+    before = path.read_bytes()
+    calls = []
+    def transport(endpoint, headers, payload, timeout):
+        calls.append(payload)
+        return {"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": '{"result":{"skills":"wrong"}}'}]}]}
+    monkeypatch.setattr("packages.matching.client._default_transport", transport)
+    response = client.post("/api/local-ui/configuration/resume/parse", headers=headers,
+                           json={"text": "使用 Python 开发机器人系统，并负责多个项目的数据处理和接口实现。"})
+    assert response.status_code == 502
+    assert len(calls) == 2
+    assert path.read_bytes() == before
     assert not (root / ".data/settings/candidate_profile.yaml").exists()
 
 

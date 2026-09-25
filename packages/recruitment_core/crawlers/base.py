@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
+from ..resources import launch_limited_browser
+
 logger = logging.getLogger(__name__)
 
 CRAWL_TIMEOUT_ENV = "RECRUITOPS_CRAWL_TIMEOUT_SECONDS"
@@ -73,12 +75,12 @@ def launch_browser(playwright, **kwargs):
             raise RuntimeError("desktop_browser_executable_missing")
         kwargs.pop("channel", None)
         kwargs["executable_path"] = executable_path
-        return playwright.chromium.launch(**kwargs)
+        return launch_limited_browser(playwright, **kwargs)
     if executable_path:
         kwargs["executable_path"] = executable_path
     elif channel and channel.casefold() not in {"chromium", "bundled"}:
         kwargs["channel"] = channel
-    return playwright.chromium.launch(**kwargs)
+    return launch_limited_browser(playwright, **kwargs)
 
 
 def normalize_job_detail_url(url: str, link_kind: str) -> tuple[str, str]:

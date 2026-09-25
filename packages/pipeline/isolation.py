@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any, Mapping, Sequence
 
 
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKER_MODULE = "packages.recruitment_core.worker"
 CRAWL_TIMEOUT_ENV = "RECRUITOPS_CRAWL_TIMEOUT_SECONDS"
 _CRAWL_CLEANUP_RESERVE_SECONDS = 1.0
+_RESOURCE_WAIT_ALLOWANCE_SECONDS = 60.0
 
 
 class IsolatedOperationError(RuntimeError):
@@ -27,9 +29,11 @@ class IsolatedOperationTimeout(IsolatedOperationError):
 class IsolatedWorkerError(IsolatedOperationError):
     """Raised when the worker reports a typed operation failure."""
 
-    def __init__(self, message: str, *, error_type: str | None = None) -> None:
+    def __init__(self, message: str, *, error_type: str | None = None,
+                 resource_timing: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.error_type = error_type
+        self.resource_timing = dict(resource_timing or {})
 
 
 IsolatedCrawlerError = IsolatedOperationError
@@ -71,12 +75,23 @@ def _run_isolated(
     timeout_seconds: float,
     label: str,
     python_executable: str | None = None,
+    resource_root: Path | str | None = None,
+    browser_max_concurrency: int = 6,
 ) -> Mapping[str, Any]:
     if timeout_seconds <= 0:
         raise ValueError("operation timeout must be positive")
     environment = dict(os.environ)
     environment["PYTHONIOENCODING"] = "utf-8"
     environment["PYTHONUTF8"] = "1"
+    if type(browser_max_concurrency) is not int or not 1 <= browser_max_concurrency <= 6:
+        raise ValueError("browser_max_concurrency must be between 1 and 6")
+    if resource_root is not None:
+        environment["RECRUITOPS_CRAWL_RESOURCE_ROOT"] = str(Path(resource_root).resolve())
+    environment["RECRUITOPS_BROWSER_MAX_CONCURRENCY"] = str(browser_max_concurrency)
+    # A worker may wait for a shared browser/host slot before performing any
+    # network work. Bound that wait independently from the crawl work budget.
+    hard_timeout = timeout_seconds + _RESOURCE_WAIT_ALLOWANCE_SECONDS
+    environment["RECRUITOPS_CRAWL_RESOURCE_DEADLINE"] = str(time.monotonic() + hard_timeout)
     if request.get("operation") in {"crawl_company", "crawl_company_evidence"}:
         # Keep adapter-level waits inside the parent deadline and leave a small
         # margin for JSON transport and process-tree cleanup.
@@ -99,11 +114,11 @@ def _run_isolated(
     )
     cleanup_tree = False
     try:
-        stdout, stderr = process.communicate(encoded_request, timeout=timeout_seconds)
+        stdout, stderr = process.communicate(encoded_request, timeout=hard_timeout)
     except subprocess.TimeoutExpired as exc:
         cleanup_tree = True
         raise IsolatedOperationTimeout(
-            f"{label} exceeded hard timeout of {timeout_seconds:g}s"
+            f"{label} exceeded hard timeout of {hard_timeout:g}s"
         ) from exc
     except BaseException:
         cleanup_tree = True
@@ -126,7 +141,11 @@ def _run_isolated(
     if process.returncode != 0 or payload.get("ok") is not True:
         detail = str(payload.get("error") or stderr.strip() or "unknown worker error")
         error_type = str(payload.get("error_type") or "").strip() or None
-        raise IsolatedWorkerError(detail[-2_000:], error_type=error_type)
+        timing = payload.get("resource_timing")
+        raise IsolatedWorkerError(
+            detail[-2_000:], error_type=error_type,
+            resource_timing=timing if isinstance(timing, Mapping) else None,
+        )
     return payload
 
 
@@ -135,6 +154,8 @@ def crawl_company_isolated(
     *,
     timeout_seconds: float,
     python_executable: str | None = None,
+    resource_root: Path | str | None = None,
+    browser_max_concurrency: int = 6,
 ) -> Sequence[Any]:
     """Execute one crawler in a disposable child process."""
 
@@ -143,6 +164,8 @@ def crawl_company_isolated(
         timeout_seconds=timeout_seconds,
         label="crawler",
         python_executable=python_executable,
+        resource_root=resource_root,
+        browser_max_concurrency=browser_max_concurrency,
     )
     jobs = payload.get("jobs")
     if not isinstance(jobs, list):
@@ -155,6 +178,8 @@ def crawl_company_result_isolated(
     *,
     timeout_seconds: float,
     python_executable: str | None = None,
+    resource_root: Path | str | None = None,
+    browser_max_concurrency: int = 6,
 ) -> dict[str, Any]:
     """Crawl with entry discovery and retain partial rows and unmodified evidence.
 
@@ -167,6 +192,8 @@ def crawl_company_result_isolated(
         timeout_seconds=timeout_seconds,
         label="crawler evidence",
         python_executable=python_executable,
+        resource_root=resource_root,
+        browser_max_concurrency=browser_max_concurrency,
     )
     result = payload.get("result")
     if not isinstance(result, Mapping):
@@ -211,7 +238,11 @@ def crawl_company_result_isolated(
                     f"crawler evidence {location}.{field} must be a string or null"
                 )
 
-    return dict(result)
+    returned = dict(result)
+    timing = payload.get("resource_timing")
+    if isinstance(timing, Mapping):
+        returned["resource_timing"] = dict(timing)
+    return returned
 
 
 def fetch_job_detail_isolated(
@@ -219,6 +250,8 @@ def fetch_job_detail_isolated(
     *,
     timeout_seconds: float,
     python_executable: str | None = None,
+    resource_root: Path | str | None = None,
+    browser_max_concurrency: int = 6,
 ) -> str:
     """Hydrate one JD in a disposable child process using the legacy text API."""
 
@@ -227,6 +260,8 @@ def fetch_job_detail_isolated(
             job,
             timeout_seconds=timeout_seconds,
             python_executable=python_executable,
+            resource_root=resource_root,
+            browser_max_concurrency=browser_max_concurrency,
         ).get("detail")
         or ""
     )
@@ -237,6 +272,8 @@ def fetch_job_detail_result_isolated(
     *,
     timeout_seconds: float,
     python_executable: str | None = None,
+    resource_root: Path | str | None = None,
+    browser_max_concurrency: int = 6,
 ) -> dict[str, Any]:
     """Hydrate one JD and retain the worker's structured diagnostics."""
 
@@ -245,6 +282,8 @@ def fetch_job_detail_result_isolated(
         timeout_seconds=timeout_seconds,
         label="job detail",
         python_executable=python_executable,
+        resource_root=resource_root,
+        browser_max_concurrency=browser_max_concurrency,
     )
     hydration = payload.get("hydration")
     if isinstance(hydration, Mapping):
@@ -253,6 +292,9 @@ def fetch_job_detail_result_isolated(
         result["status"] = str(result.get("status") or "fetch_failed")
         attempts = result.get("attempts")
         result["attempts"] = list(attempts) if isinstance(attempts, (list, tuple)) else []
+        timing = payload.get("resource_timing")
+        if isinstance(timing, Mapping):
+            result["resource_timing"] = dict(timing)
         return result
 
     # Accept responses from older workers while deployments are rolling over.

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .models import DeepSeekResponse
+from packages.model_policy import DEEPSEEK_RESPONSES, official_endpoint, official_model
 
 
 DEFAULT_ENDPOINT = "https://api.deepseek.com/anthropic/v1/messages"
@@ -42,18 +43,68 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _validated_endpoint(value: str) -> str:
-    endpoint = value.strip().rstrip("/")
-    parsed = urlparse(endpoint)
-    local_http = parsed.scheme == "http" and parsed.hostname in {
-        "127.0.0.1",
-        "localhost",
-        "::1",
-    }
-    if parsed.scheme != "https" and not local_http:
-        raise ValueError("DeepSeek endpoint must use HTTPS or local HTTP")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError("DeepSeek endpoint cannot contain credentials, query, or fragment")
-    return endpoint
+    return official_endpoint(value)
+
+
+def _structured_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Require declared fields; retain nullable values and absolute $defs refs."""
+    schema = deepcopy(schema)
+    definitions = schema.pop("$defs", {})
+    wrapped = {"type": "object", "properties": {"result": schema},
+               "required": ["result"], "additionalProperties": False}
+    if definitions:
+        wrapped["$defs"] = definitions
+
+    def require_fields(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object" and "properties" in node:
+                node["required"] = list(node["properties"])
+                node["additionalProperties"] = False
+            node.pop("default", None)
+            for value in node.values():
+                require_fields(value)
+        elif isinstance(node, list):
+            for value in node:
+                require_fields(value)
+    require_fields(wrapped)
+    return wrapped
+
+
+def _structured_content(data: Mapping[str, Any]) -> str:
+    if data.get("status") == "incomplete":
+        details = data.get("incomplete_details") or {}
+        if not isinstance(details, Mapping):
+            raise DeepSeekClientError("response_invalid")
+        code = "response_truncated" if details.get("reason") == "max_output_tokens" else "response_refused"
+        raise DeepSeekClientError(code)
+    if data.get("status") != "completed" or data.get("error"):
+        raise DeepSeekClientError("response_invalid")
+    output = data.get("output")
+    if not isinstance(output, list):
+        raise DeepSeekClientError("response_invalid")
+    blocks = []
+    for item in output:
+        if not isinstance(item, Mapping) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list) or any(not isinstance(block, Mapping) for block in content):
+            raise DeepSeekClientError("response_invalid")
+        blocks.extend(content)
+    if any(block.get("type") == "refusal" for block in blocks):
+        raise DeepSeekClientError("response_refused")
+    texts = [block.get("text") for block in blocks if block.get("type") == "output_text"]
+    if any(not isinstance(text, str) for text in texts):
+        raise DeepSeekClientError("response_invalid")
+    content = "".join(texts)
+    if not content.strip():
+        raise DeepSeekClientError("response_empty")
+    try:
+        result = json.loads(content)
+        if not isinstance(result, dict) or set(result) != {"result"}:
+            raise ValueError("invalid structured envelope")
+        return json.dumps(result["result"], ensure_ascii=False)
+    except (ValueError, TypeError):
+        raise DeepSeekClientError("structured_response_invalid") from None
 
 
 def _default_transport(
@@ -128,12 +179,11 @@ class DeepSeekClient:
     ) -> None:
         if not api_key.strip():
             raise ValueError("DeepSeek API key is required")
-        if not model.strip():
-            raise ValueError("DeepSeek model is required")
+        official_model(model.strip())
         self.api_key = api_key.strip()
         self.model = model.strip()
-        if api_style not in {"anthropic", "openai"}:
-            raise ValueError("api_style must be anthropic or openai")
+        if api_style != "anthropic":
+            raise ValueError("Only the official DeepSeek provider is supported")
         self.api_style = api_style
         self.endpoint = _validated_endpoint(endpoint)
         self.timeout = max(1.0, min(float(timeout), 180.0))
@@ -141,7 +191,7 @@ class DeepSeekClient:
         if reasoning_effort not in {"low", "medium", "high", "max"}:
             raise ValueError("reasoning_effort must be low, medium, high, or max")
         self.thinking_enabled = bool(thinking_enabled)
-        self.reasoning_effort = reasoning_effort
+        self.reasoning_effort = "high" if reasoning_effort == "medium" else reasoning_effort
         self.transport = transport or _default_transport
         self.max_attempts = max(1, min(int(max_attempts), 4))
         self.retry_backoff_seconds = max(0.0, min(float(retry_backoff_seconds), 5.0))
@@ -177,9 +227,10 @@ class DeepSeekClient:
         )
 
     def complete_structured(self, *, system_prompt: str, user_prompt: str,
-                            schema: dict[str, Any], max_tokens: int | None = None) -> DeepSeekResponse:
+                            schema: dict[str, Any], max_tokens: int | None = None,
+                            thinking_enabled: bool = False) -> DeepSeekResponse:
         return self._complete(system_prompt=system_prompt, user_prompt=user_prompt,
-                              max_tokens=max_tokens, thinking_enabled=False, output_schema=schema)
+                              max_tokens=max_tokens, thinking_enabled=thinking_enabled, output_schema=schema)
 
     def _complete(
         self,
@@ -192,7 +243,7 @@ class DeepSeekClient:
     ) -> DeepSeekResponse:
         payload = {
             "model": self.model,
-            "max_tokens": max(128, min(int(max_tokens or self.max_tokens), self.max_tokens)),
+            "max_tokens": max(128, min(int(max_tokens or self.max_tokens), 8000)),
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
             "reasoning": {
@@ -203,77 +254,33 @@ class DeepSeekClient:
         }
         if thinking_enabled:
             payload["output_config"] = {"effort": self.reasoning_effort}
-        if output_schema is not None:
-            schema = dict(output_schema)
-            definitions = schema.pop("$defs", {})
-            payload["tools"] = [{"name": "submit_mail_analysis", "description": "Return structured mail evidence only; no external action.",
-                "input_schema": {"type": "object", "properties": {"result": schema},
-                                 "required": ["result"], "additionalProperties": False, "$defs": definitions}}]
-            payload["tool_choice"] = {"type": "tool", "name": "submit_mail_analysis"}
         headers = {
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
             "x-api-key": self.api_key,
         }
-        if self.api_style == "openai":
-            structured_prompt = system_prompt
-            if output_schema is not None:
-                structured_prompt += (
-                    "\nReturn one JSON object matching this complete schema. "
-                    "Include every required field and every value/evidence pair; use null or empty arrays "
-                    "only where the schema permits. Do not omit fields to save tokens. Schema: "
-                    + json.dumps(output_schema, ensure_ascii=False, separators=(",", ":"))
-                )
+        endpoint = self.endpoint
+        if output_schema is not None:
+            endpoint = DEEPSEEK_RESPONSES
             payload = {
                 "model": self.model,
-                "max_tokens": payload["max_tokens"],
-                "messages": [
-                    {"role": "system", "content": structured_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "response_format": {"type": "json_object"},
+                "instructions": system_prompt,
+                "input": user_prompt,
+                "reasoning": {"effort": self.reasoning_effort if thinking_enabled else "none"},
+                "max_output_tokens": payload["max_tokens"],
+                "text": {"format": {"type": "json_schema", "name": "recruitops_result",
+                                    "schema": _structured_schema(output_schema)}},
                 "stream": False,
             }
-            # Chat Completions uses DeepSeek's thinking toggle, not the
-            # Responses/Anthropic reasoning object. Also support named
-            # DeepSeek models behind compatible gateways without adding
-            # provider-specific fields to unrelated OpenAI-compatible models.
-            if (urlparse(self.endpoint).hostname == "api.deepseek.com"
-                    or self.model.casefold().split("/")[-1].startswith("deepseek-")):
-                payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
-                if thinking_enabled:
-                    payload["reasoning_effort"] = "max" if self.reasoning_effort == "max" else "high"
-            headers = {"Authorization": f"Bearer {self.api_key}",
-                       "content-type": "application/json"}
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         for attempt in range(1, self.max_attempts + 1):
             try:
-                data = self.transport(self.endpoint, headers, payload, self.timeout)
-                if self.api_style == "openai":
-                    choices = data.get("choices")
-                    choice = choices[0] if isinstance(choices, list) and choices else None
-                    if not isinstance(choice, Mapping):
-                        raise DeepSeekClientError("response_invalid")
-                    if choice.get("finish_reason") == "length":
-                        raise DeepSeekClientError("response_truncated")
-                    message = choice.get("message")
-                    content = message.get("content") if isinstance(message, Mapping) else None
-                    if not isinstance(content, str) or not content.strip():
-                        raise DeepSeekClientError("response_empty")
-                    return DeepSeekResponse(
-                        content=content.strip(), model=str(data.get("model") or self.model),
-                        input_tokens=_usage(data, "prompt_tokens"),
-                        output_tokens=_usage(data, "completion_tokens"),
-                    )
-                elif output_schema is not None:
-                    blocks = data.get("content")
-                    calls = [b for b in blocks if isinstance(b, Mapping) and b.get("type") == "tool_use"] if isinstance(blocks, list) else []
-                    if (data.get("stop_reason") == "max_tokens" or len(calls) != 1
-                            or calls[0].get("name") != "submit_mail_analysis"
-                            or not isinstance(calls[0].get("input"), Mapping)
-                            or set(calls[0]["input"]) != {"result"}):
-                        raise DeepSeekClientError("structured_response_invalid")
-                    content = json.dumps(calls[0]["input"]["result"], ensure_ascii=False)
+                data = self.transport(endpoint, headers, payload, self.timeout)
+                if output_schema is not None:
+                    content = _structured_content(data)
                 else:
+                    if data.get("stop_reason") == "max_tokens":
+                        raise DeepSeekClientError("response_truncated")
                     content = _text_content(data)
                 return DeepSeekResponse(
                     content=content,

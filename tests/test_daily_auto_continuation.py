@@ -156,7 +156,9 @@ def test_real_runtime_auto_resumes_saved_companies_without_rediscovery(tmp_path,
     monkeypatch.setattr(runtime, "DailyRecruitmentPipeline", Pipeline)
     monkeypatch.setattr(runtime, "build_reporting_summary", lambda *args, **kwargs: {})
     handlers = runtime.build_runtime_task_handlers(settings=settings)
-    task = replace(default_task_definitions()[task_id], timeout_seconds=0.7)
+    # Leave room for Windows/SQLite checkpoint IO before exercising the
+    # cooperative stop; the fixture crawler still waits 3s for that stop.
+    task = replace(default_task_definitions()[task_id], timeout_seconds=1.8)
     engine = LocalTaskScheduler(tasks={task_id: task}, lock_path=tmp_path / "scheduler.lock")
     now = datetime.now(timezone.utc)
     metadata = {"mode": "full", "company_ids": ["a", "b", "c"]}

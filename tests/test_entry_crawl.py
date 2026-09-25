@@ -84,6 +84,9 @@ def test_core_root_routes_to_feishu_and_retains_runner_evidence(monkeypatch):
         return f'<a href="{FEISHU}">Campus jobs</a>'
 
     monkeypatch.setattr(entry_crawl, "render_page", render)
+    monkeypatch.setattr(entry_crawl.requests, "get", lambda *_a, **_k: SimpleNamespace(
+        status_code=200, text="<main id='app'></main>", raise_for_status=lambda: None,
+    ))
     company = {
         "name": "Example", "careers_url": ROOT, "crawler": "render",
         "source_cohort": 2027, "source_cohort_source": job_cohorts.OC_TRUSTED_SOURCE,
@@ -157,7 +160,7 @@ def test_forms_invalid_and_login_entries_do_not_crawl(url, code):
     assert result["error_code"] == code
 
 
-def test_unresolved_root_renders_then_http_without_guessing(monkeypatch):
+def test_unresolved_root_uses_http_then_renders_without_guessing(monkeypatch):
     calls = []
 
     def render(url, **kwargs):
@@ -171,7 +174,7 @@ def test_unresolved_root_renders_then_http_without_guessing(monkeypatch):
     monkeypatch.setattr(entry_crawl, "render_page", render)
     monkeypatch.setattr(entry_crawl.requests, "get", http_get)
     result = entry_crawl.crawl_with_entry_discovery(ROOT, crawl=lambda *_: evidence())
-    assert [call[:2] for call in calls] == [("render", ROOT), ("http", ROOT)]
+    assert [call[:2] for call in calls] == [("http", ROOT), ("render", ROOT)]
     assert result["error_code"] == "recruitment_entry_discovery_required"
     assert result["discovered_entry_url"] is None
     assert result["completeness_known"] is False
@@ -182,8 +185,51 @@ def test_link_discovery_filters_before_five_entry_limit():
     links = ["/jobs", "/careers", "https://docs.qq.com/form/1", "http://localhost/jobs"]
     platforms = [f"https://acme{i}.jobs.feishu.cn/campus/position" for i in range(8)]
     html = "".join(f'<a href="{url}">Campus jobs</a>' for url in [*links, *platforms, platforms[0]])
-    found = entry_crawl.discover_recruitment_entries(ROOT, 20, render=lambda *_a, **_k: html)
+    found = entry_crawl.discover_recruitment_entries(
+        ROOT, 20,
+        render=lambda *_a, **_k: pytest.fail("Static links must not start a browser"),
+        http_get=lambda *_a, **_k: SimpleNamespace(
+            status_code=200, text=html, raise_for_status=lambda: None,
+        ),
+    )
     assert found == platforms[:5]
+
+
+def test_static_platform_link_skips_generic_render_and_runs_platform_adapter(monkeypatch):
+    calls = []
+    monkeypatch.setattr(entry_crawl.requests, "get", lambda *_a, **_k: SimpleNamespace(
+        status_code=200, text=f'<a href="{FEISHU}">2027 校园招聘</a>',
+        raise_for_status=lambda: None,
+    ))
+
+    def crawl(url, key, _remaining):
+        calls.append((url, key))
+        if key == "render":
+            pytest.fail("The generic browser crawler must not run for a verified static platform link")
+        return evidence([{"title": "Software Engineer", "jd_url": FEISHU + "/1"}])
+
+    result = entry_crawl.crawl_with_entry_discovery(ROOT, crawl=crawl)
+    assert calls == [(FEISHU, "feishu")]
+    assert result["jobs"][0]["title"] == "Software Engineer"
+    assert result["source_url"] == ROOT
+    assert result["crawl_source_url"] == FEISHU
+    assert result["effective_source_urls"] == [ROOT, FEISHU]
+    assert [attempt["source_url"] for attempt in result["entry_attempts"]] == [FEISHU]
+
+
+def test_http_shell_keeps_generic_render_crawl(monkeypatch):
+    monkeypatch.setattr(entry_crawl.requests, "get", lambda *_a, **_k: SimpleNamespace(
+        status_code=200, text="<main id='app'></main>", raise_for_status=lambda: None,
+    ))
+    calls = []
+
+    def crawl(url, key, _remaining):
+        calls.append((url, key))
+        return evidence([{"title": "Software Engineer", "jd_url": ROOT + "job/1"}])
+
+    result = entry_crawl.crawl_with_entry_discovery(ROOT, crawl=crawl)
+    assert calls == [(ROOT, "render")]
+    assert len(result["jobs"]) == 1
 
 
 def test_shared_helper_never_attempts_more_than_five_known_links():
@@ -246,28 +292,30 @@ def test_company_wrapper_passes_remaining_budget_to_current_attempt(monkeypatch)
     assert captured[0]["crawl_timeout_seconds"] == 3.25
 
 
-@pytest.mark.parametrize("render_elapsed", [4, 10])
-def test_http_fallback_uses_only_render_budget_remainder(monkeypatch, render_elapsed):
+@pytest.mark.parametrize("http_elapsed", [4, 10])
+def test_browser_fallback_uses_only_http_budget_remainder(monkeypatch, http_elapsed):
     now = [0.0]
     monkeypatch.setattr(entry_crawl, "perf_counter", lambda: now[0])
     http_calls = []
+    render_calls = []
 
     def render(_url, **kwargs):
-        assert kwargs["timeout_ms"] <= 10_000
-        now[0] += render_elapsed
-        raise TimeoutError("render timeout")
+        render_calls.append(kwargs["timeout_ms"])
+        return f'<a href="{FEISHU}">Jobs</a>'
 
     def http_get(_url, **kwargs):
         http_calls.append(kwargs["timeout"])
-        return SimpleNamespace(status_code=200, text=f'<a href="{FEISHU}">Jobs</a>', raise_for_status=lambda: None)
+        now[0] += http_elapsed
+        raise TimeoutError("http timeout")
 
-    if render_elapsed == 10:
+    if http_elapsed == 10:
         with pytest.raises(RuntimeError, match="deadline"):
             entry_crawl.discover_recruitment_entries(ROOT, 10, render=render, http_get=http_get)
-        assert http_calls == []
+        assert render_calls == []
     else:
         assert entry_crawl.discover_recruitment_entries(ROOT, 10, render=render, http_get=http_get) == [FEISHU]
-        assert http_calls == [6]
+        assert render_calls == [6_000]
+    assert http_calls == [4.0]
 
 
 @pytest.mark.parametrize("html", [
@@ -275,11 +323,14 @@ def test_http_fallback_uses_only_render_budget_remainder(monkeypatch, render_ela
     '<title>Security verification</title>',
     '<iframe src="/captcha/challenge"></iframe>',
 ])
-def test_access_controls_stop_discovery_and_http_fallback(monkeypatch, html):
-    monkeypatch.setattr(entry_crawl, "render_page", lambda *_a, **_k: html + f'<a href="{FEISHU}">Jobs</a>')
+def test_access_controls_stop_discovery_before_browser(monkeypatch, html):
+    monkeypatch.setattr(entry_crawl.requests, "get", lambda *_a, **_k: SimpleNamespace(
+        status_code=200, text=html + f'<a href="{FEISHU}">Jobs</a>',
+        raise_for_status=lambda: None,
+    ))
     result = entry_crawl.crawl_with_entry_discovery(ROOT, crawl=lambda *_: evidence())
     assert result["error_code"] in {"login_required", "captcha_required"}
-    assert len(result["entry_attempts"]) == 1
+    assert result["entry_attempts"] == []
 
 
 @pytest.mark.parametrize("html", [
@@ -291,7 +342,12 @@ def test_access_controls_stop_discovery_and_http_fallback(monkeypatch, html):
 ])
 def test_hidden_login_and_captcha_widgets_do_not_block_public_entry(html):
     found = entry_crawl.discover_recruitment_entries(
-        ROOT, 20, render=lambda *_a, **_k: html + f'<a href="{FEISHU}">Campus jobs</a>',
+        ROOT, 20,
+        render=lambda *_a, **_k: pytest.fail("Static links must not start a browser"),
+        http_get=lambda *_a, **_k: SimpleNamespace(
+            status_code=200, text=html + f'<a href="{FEISHU}">Campus jobs</a>',
+            raise_for_status=lambda: None,
+        ),
     )
     assert found == [FEISHU]
 
@@ -306,6 +362,64 @@ def test_http_redirect_to_form_is_not_followed():
     with pytest.raises(RuntimeError, match="form"):
         entry_crawl.discover_recruitment_entries(ROOT, 10, render=lambda *_a, **_k: None, http_get=http_get)
     assert calls == [ROOT]
+
+
+@pytest.mark.parametrize(("location", "code"), [
+    ("http://127.0.0.1/internal", "invalid_entry"),
+    ("https://example.test/#/login", "login_required"),
+    ("https://docs.qq.com/form/1", "form_application_only"),
+])
+def test_http_preflight_rejects_unsafe_redirect_without_browser(monkeypatch, location, code):
+    calls = []
+
+    def http_get(url, **kwargs):
+        calls.append((url, kwargs["allow_redirects"]))
+        return SimpleNamespace(status_code=302, headers={"Location": location})
+
+    monkeypatch.setattr(entry_crawl.requests, "get", http_get)
+    result = entry_crawl.crawl_with_entry_discovery(
+        ROOT, crawl=lambda *_: pytest.fail("Unsafe redirect must not be crawled"),
+    )
+    assert calls == [(ROOT, False)]
+    assert result["error_code"] == code
+    assert result["jobs"] == []
+
+
+def test_http_429_is_rate_limited_without_browser_or_crawl(monkeypatch):
+    calls = []
+
+    def http_get(url, **kwargs):
+        calls.append((url, kwargs["allow_redirects"]))
+        return SimpleNamespace(status_code=429)
+
+    monkeypatch.setattr(entry_crawl.requests, "get", http_get)
+    result = entry_crawl.crawl_with_entry_discovery(
+        ROOT, crawl=lambda *_: pytest.fail("Rate limiting must pause this entry"),
+    )
+    assert calls == [(ROOT, False)]
+    assert result["error_code"] == "rate_limited"
+    assert result["entry_attempts"] == []
+    assert result["jobs"] == []
+
+
+def test_http_redirect_to_public_dynamic_page_uses_final_base_url(monkeypatch):
+    redirect = "https://career.entry-example.test/portal/"
+    calls = []
+
+    def http_get(url, **kwargs):
+        calls.append(("http", url, kwargs["allow_redirects"]))
+        if url == ROOT:
+            return SimpleNamespace(status_code=302, headers={"Location": redirect})
+        return SimpleNamespace(status_code=200, text="<main id='app'></main>", raise_for_status=lambda: None)
+
+    def render(url, **_kwargs):
+        calls.append(("render", url))
+        return f'<a href="{FEISHU}">Campus jobs</a>'
+
+    monkeypatch.setattr(entry_crawl.requests, "get", http_get)
+    found = entry_crawl.discover_recruitment_entries(ROOT, 20, render=render)
+    assert found == [FEISHU]
+    assert calls == [("http", ROOT, False), ("http", redirect, False), ("render", redirect)]
 
 
 @pytest.mark.parametrize("partial_source", [ROOT, FEISHU])

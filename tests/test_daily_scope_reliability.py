@@ -302,7 +302,7 @@ def _application_state(storage: Storage) -> dict[str, Any]:
         }
 
 
-def test_daily_write_failure_rolls_back_all_rows_and_application_fields(
+def test_daily_write_failure_rolls_back_current_batch_and_preserves_admitted_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -380,6 +380,11 @@ def test_daily_write_failure_rolls_back_all_rows_and_application_fields(
     assert analysis_calls == 2
     assert _application_state(storage) == before
     with storage.session() as session:
-        assert session.scalar(select(func.count()).select_from(CompanySnapshot)) == 0
-        assert session.scalar(select(func.count()).select_from(JobSnapshot)) == 0
+        # Listing admission committed before hydration. The failed detail batch
+        # rolls back its two details/analyses while preserving those pending rows.
+        assert session.scalar(select(func.count()).select_from(CompanySnapshot)) == 1
+        rows = list(session.scalars(select(JobSnapshot)))
+        assert {row.id for row in rows} == {"first", "second"}
+        assert all(row.capture_status == "pending" for row in rows)
+        assert all(row.jd_raw is None and row.match_score is None for row in rows)
         assert session.scalar(select(func.count()).select_from(JobAnalysisSnapshot)) == 0

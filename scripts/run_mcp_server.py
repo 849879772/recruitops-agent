@@ -18,9 +18,7 @@ from packages.browser_bridge import BrowserBridgeStore  # noqa: E402
 from packages.rag import (  # noqa: E402
     DeterministicEmbeddingProvider,
     EvidenceGrounder,
-    OpenAICompatibleEmbeddingProvider,
     PgVectorDocumentStore,
-    SemanticPgVectorDocumentStore,
 )
 from packages.mcp import (  # noqa: E402
     MCP_AGENT_TOOL_NAMES,
@@ -50,16 +48,9 @@ from packages.tools.oc_candidates import OcCandidateRunner  # noqa: E402
 
 def _evidence_grounder(configured: Settings, storage: Storage) -> EvidenceGrounder:
     engine = storage.engine
-    if configured.embedding_endpoint:
-        provider = OpenAICompatibleEmbeddingProvider(
-            configured.embedding_endpoint,
-            model=configured.embedding_model,
-            api_key=configured.embedding_api_key or None,
-            dimension=configured.embedding_dimension,
-        )
-        store = SemanticPgVectorDocumentStore(engine, provider)
-    else:
-        store = PgVectorDocumentStore(engine, DeterministicEmbeddingProvider())
+    # Remote compatible embedding providers are retired. This is a separate
+    # local index; never rewrite old semantic vectors using another embedder.
+    store = PgVectorDocumentStore(engine, DeterministicEmbeddingProvider())
     store.ensure_schema()
     return EvidenceGrounder(store)
 

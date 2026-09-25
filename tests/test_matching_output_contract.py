@@ -38,7 +38,7 @@ def _valid_output() -> dict[str, Any]:
 def _analyze(
     responses: list[dict[str, Any] | str | DeepSeekClientError],
     *,
-    api_style: str = "anthropic",
+    model: str = "deepseek-flash",
     thinking_enabled: bool = False,
 ):
     calls: list[dict[str, Any]] = []
@@ -50,23 +50,17 @@ def _analyze(
             raise response
         content = response if isinstance(response, str) else json.dumps(response, ensure_ascii=False)
         usage = {"input_tokens": 10 + len(calls), "output_tokens": 5 + len(calls)}
-        if api_style == "openai":
-            return {
-                "model": "fixture-model",
-                "choices": [{"finish_reason": "stop", "message": {"content": content}}],
-                "usage": {"prompt_tokens": usage["input_tokens"], "completion_tokens": usage["output_tokens"]},
-            }
         return {
-            "model": "fixture-model",
-            "content": [{"type": "text", "text": content}],
+            "model": model, "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text",
+                       "text": '{"result":' + content + '}'}]}],
             "usage": usage,
         }
 
     client = DeepSeekClient(
         api_key="test-only",
-        model="fixture-model",
-        endpoint="https://example.test/model",
-        api_style=api_style,
+        model=model,
+
         thinking_enabled=thinking_enabled,
         transport=transport,
         max_attempts=1,
@@ -84,11 +78,11 @@ def _analyze(
 
 
 def _system(call: dict[str, Any]) -> str:
-    return call["system"] if "system" in call else call["messages"][0]["content"]
+    return call["instructions"]
 
 
-@pytest.mark.parametrize("api_style", ["anthropic", "openai"])
-def test_observed_alias_output_is_corrected_instead_of_becoming_38_points(api_style):
+@pytest.mark.parametrize("model", ["deepseek-flash", "deepseek-v4-pro"])
+def test_observed_alias_output_is_corrected_instead_of_becoming_38_points(model):
     observed = _valid_output()
     observed["score_breakdown"] = {
         "direction_match": 22,
@@ -97,7 +91,7 @@ def test_observed_alias_output_is_corrected_instead_of_becoming_38_points(api_st
     }
     observed["total"] = 83
 
-    result, calls = _analyze([observed, _valid_output()], api_style=api_style)
+    result, calls = _analyze([observed, _valid_output()], model=model)
 
     assert result.analysis_status is AnalysisStatus.COMPLETE
     assert result.match_score == 82
@@ -108,8 +102,8 @@ def test_observed_alias_output_is_corrected_instead_of_becoming_38_points(api_st
     correction = _system(calls[1])[len(_system(calls[0])):]
     assert "core_direction" in correction
     assert "required_skills" in correction
-    assert calls[0]["messages"][-1] == calls[1]["messages"][-1]
-    assert calls[0]["max_tokens"] == calls[1]["max_tokens"]
+    assert calls[0]["input"] == calls[1]["input"]
+    assert calls[0]["max_output_tokens"] < calls[1]["max_output_tokens"]
     assert result.input_tokens == 23
     assert result.output_tokens == 13
 
@@ -123,8 +117,8 @@ def test_correction_preserves_configured_thinking_mode(thinking_enabled):
 
     assert result.analysis_status is AnalysisStatus.COMPLETE
     assert len(calls) == 2
-    expected = "enabled" if thinking_enabled else "disabled"
-    assert [call["thinking"]["type"] for call in calls] == [expected, expected]
+    expected = "high" if thinking_enabled else "none"
+    assert [call["reasoning"]["effort"] for call in calls] == [expected, expected]
     assert calls[0]["reasoning"] == calls[1]["reasoning"]
 
 

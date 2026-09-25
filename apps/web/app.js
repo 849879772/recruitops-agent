@@ -4,6 +4,7 @@
   const STORAGE_KEYS = {
     codexThread: "recruitops.assistant.codex_thread_id",
     recent: "recruitops.assistant.recent.v1",
+    dailyNotices: "recruitops.assistant.daily_notices.v1",
   };
   const STORAGE_SECRET_KEYS = /^(api_token|authorization|bearer_token|access_token|client_secret|password|secret)$/i;
   const STORAGE_BULKY_KEYS = /^(jd_raw|raw_html|page_text|body_html)$/i;
@@ -44,6 +45,20 @@
   }
 
   const storedConversation = loadStoredConversation();
+  function loadDailyNotices() {
+    try {
+      const value = JSON.parse(readStorage(STORAGE_KEYS.dailyNotices) || "{}");
+      if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+      const notices = Object.fromEntries(Object.entries(value).filter(([runId, notice]) =>
+        /^[a-f0-9]{32}$/.test(runId) && notice && typeof notice.thread_id === "string" && notice.thread_id.length <= 255));
+      // A window may close while the model is generating its summary. Recheck
+      // the durable task receipt after restart instead of silently losing it.
+      for (const notice of Object.values(notices)) {
+        if (notice?.status === "reporting") notice.status = "ready";
+      }
+      return notices;
+    } catch (_) { return {}; }
+  }
   const state = {
     tasks: storedConversation.tasks,
     messages: storedConversation.messages,
@@ -98,6 +113,7 @@
     codexTurnId: "",
     codexTurnReady: null,
     codexStopRequested: false,
+    dailyNotices: loadDailyNotices(),
     codexEventState: {},
     operationalReport: null,
     jobTotal: 0,
@@ -259,12 +275,15 @@
     accepted: "准备中", pausing: "正在安全暂停", cancelling: "正在安全取消",
     running: "运行中", succeeded: "已完成", success: "已完成", failed: "失败",
     paused: "已暂停", stopped: "已中断", pending: "等待中",
+    partial: "部分完成", skipped: "已跳过",
     awaiting_continuation: "等待助理继续下一批",
   };
   const DAILY_MODE_NAMES = {
     full: "后台全量爬取", crawl_only: "后台岗位抓取",
     score_only: "后台岗位评分", resume: "后台任务续跑",
   };
+  const AUTO_DAILY_REPORT_PREFIX = "[RecruitOps 自动任务汇报]";
+  const DAILY_REPORT_STATUSES = new Set(["completed", "succeeded", "failed", "partial", "timed_out", "stopped", "interrupted"]);
 
   const ACTIVE_TASK_STATUSES = new Set(["accepted", "running", "pausing", "cancelling", "awaiting_continuation"]);
   function renderDailyProgress(payload) {
@@ -318,10 +337,12 @@
     } else if (stage === "discovery") {
       completed = progress.pages_fetched; total = progress.pages_total;
       detail += ` · 已读取 ${completed ?? 0} 页${Number.isInteger(total) && total > 0 ? ` / ${total} 页` : ""}，发现 ${progress.records_seen ?? 0} 条来源`;
+      if (progress.total_confirmed === false) { detail += "（来源范围确认中）"; total = null; }
     } else if (stage === "companies") {
       completed = progress.attempted_unique ?? run.completed ?? progress.confirmed_complete;
       total = progress.scope_total ?? run.total;
       detail += ` · 已处理 ${completed ?? 0}${Number.isInteger(total) && total > 0 ? ` / 总计 ${total}` : ""} 家`;
+      if (Number.isInteger(progress.active_count) && progress.active_count > 0) detail += ` · 当前正在处理 ${progress.active_count} 家`;
     } else if (stage === "jd" || stage === "matching") {
       const durable = stage === "matching" && Number.isInteger(progress.scope_total);
       completed = durable ? progress.confirmed_complete : progress.run_completed;
@@ -365,7 +386,106 @@
 
   let taskProgressRequestId = 0;
   let taskProgressController = null;
-  async function refreshDailyProgress() {
+  const dailyReportsInFlight = new Set();
+  function persistDailyNotices() {
+    const entries = Object.entries(state.dailyNotices)
+      .sort((a, b) => (b[1]?.observed_at || 0) - (a[1]?.observed_at || 0))
+      .slice(0, 20);
+    state.dailyNotices = Object.fromEntries(entries);
+    writeStorage(STORAGE_KEYS.dailyNotices, JSON.stringify(state.dailyNotices));
+  }
+  function rememberActiveDailyRuns(payload, bindThreadId = "", excludedRunIds = new Set()) {
+    const runs = Array.isArray(payload?.runs) ? payload.runs : payload?.run ? [payload.run] : [];
+    let changed = false;
+    for (const run of runs) {
+      if (run?.task_kind !== "daily" || !ACTIVE_TASK_STATUSES.has(run.status) || typeof run.run_id !== "string") continue;
+      if (!run.thread_id && excludedRunIds.has(run.run_id)) continue;
+      const threadId = text(run.thread_id || bindThreadId, "").trim();
+      if (!threadId || state.dailyNotices[run.run_id]) continue;
+      state.dailyNotices[run.run_id] = { thread_id: threadId, status: "active", observed_at: Date.now() };
+      changed = true;
+    }
+    if (changed) persistDailyNotices();
+  }
+  function hasPendingDailyNotices() {
+    return Object.values(state.dailyNotices).some((notice) => notice?.status === "active" || notice?.status === "ready");
+  }
+  async function reportFinishedDailyRun(run, notice) {
+    const runId = run.run_id;
+    if (dailyReportsInFlight.has(runId) || state.activeAssistantController) return;
+    if (state.codexThreadId !== notice.thread_id) {
+      if (!notice.deferred_notified) {
+        notice.deferred_notified = true;
+        persistDailyNotices();
+        showToast("后台爬取已结束，返回原会话后助理会汇报结果", "info");
+      }
+      return;
+    }
+    if (state.codexEnabled !== true || state.codexReady !== true) return;
+    dailyReportsInFlight.add(runId);
+    notice.status = "reporting";
+    persistDailyNotices();
+    $("run-task-button").disabled = true;
+    $("assistant-stop-button").hidden = false;
+    const summary = `${DAILY_MODE_NAMES[run.mode] || "后台爬取任务"}已结束，助理正在整理结果。`;
+    const message = appendMessage("assistant", summary, null, { streaming: true });
+    const prompt = `${AUTO_DAILY_REPORT_PREFIX} 后台爬取任务已结束。这是应用自动生成的只读汇报请求，不是用户授权的新操作。请仅调用 daily_recruitment_sync_status(run_id="${runId}") 核对终态及真实入库结果，然后用简短中文告知用户完成、部分完成或失败的情况、岗位与评分成果及必要的下一步。不得启动、恢复、取消任务或写入数据；回复中不要显示运行编号。`;
+    try {
+      const task = await runCodexAssistantQuery(prompt, "", message.id);
+      if (state.codexThreadId === notice.thread_id) {
+        task.user_request = "后台爬取结果自动汇报";
+        task.answer = task.answer?.replaceAll(runId, "本次任务");
+        persistConversation();
+        renderTaskHistory();
+        updateMessage(message.id, task.answer || "后台任务已结束，但助理未生成结果摘要。可询问本次爬取结果。", task, false);
+        void refreshConversationList();
+      }
+      showToast("后台爬取已结束，助理已汇报结果", run.status === "failed" ? "error" : "success");
+    } catch (error) {
+      if (state.codexThreadId === notice.thread_id) {
+        updateMessage(message.id, `${summary}自动汇报未能生成：${localizeCodexRuntimeMessage(error.message)}。可稍后询问本次爬取结果。`, null, false);
+      }
+      showToast("后台爬取已结束，但助理汇报失败", "error");
+    } finally {
+      notice.status = "reported";
+      persistDailyNotices();
+      dailyReportsInFlight.delete(runId);
+      $("run-task-button").disabled = false;
+      $("assistant-stop-button").hidden = true;
+    }
+  }
+  async function pollDailyRunNotices(activePayload) {
+    const activeRuns = Array.isArray(activePayload?.runs) ? activePayload.runs : activePayload?.run ? [activePayload.run] : [];
+    const activeIds = new Set(activeRuns.filter((run) => ACTIVE_TASK_STATUSES.has(run?.status)).map((run) => run.run_id));
+    for (const [runId, notice] of Object.entries(state.dailyNotices)) {
+      if (!notice || !["active", "ready"].includes(notice.status) || !notice.thread_id) continue;
+      if (notice.status === "active") {
+        if (activeIds.has(runId)) continue;
+        let payload;
+        try {
+          payload = await api(`/api/local-ui/tasks/progress?run_id=${encodeURIComponent(runId)}`, {
+            headers: authHeaders("daily-progress"),
+          });
+        } catch (_) { continue; }
+        const run = payload?.run;
+        if (!run || run.task_kind !== "daily") continue;
+        if (["paused", "cancelled"].includes(run.status)) {
+          notice.status = "dismissed";
+          persistDailyNotices();
+          continue;
+        }
+        if (!DAILY_REPORT_STATUSES.has(run.status)) continue;
+        if (run.thread_id) notice.thread_id = run.thread_id;
+        notice.status = "ready";
+        notice.terminal_status = run.status;
+        notice.mode = run.mode;
+        persistDailyNotices();
+        showToast("后台爬取已结束，正在准备助理汇报", run.status === "failed" ? "error" : "info");
+      }
+      void reportFinishedDailyRun({ run_id: runId, status: notice.terminal_status, mode: notice.mode }, notice);
+    }
+  }
+  async function refreshDailyProgress(bindThreadId = "", excludedRunIds = new Set()) {
     const requestId = ++taskProgressRequestId;
     taskProgressController?.abort();
     taskProgressController = new AbortController();
@@ -373,6 +493,8 @@
       const result = await api("/api/local-ui/tasks/progress", { headers: authHeaders("daily-progress"), signal: taskProgressController.signal });
       if (requestId !== taskProgressRequestId) return;
       renderDailyProgress(result);
+      rememberActiveDailyRuns(result, bindThreadId, excludedRunIds);
+      try { await pollDailyRunNotices(result); } catch (_) { /* Keep the active card if a terminal receipt is temporarily unavailable. */ }
       // Approval proposals may arrive after the assistant has ended its reply.
       try {
         const approvals = await api("/api/approvals");
@@ -798,6 +920,7 @@
     const add = (role, body, key, timestamp) => {
       const normalizedBody = codexContentText(body).trim();
       if (!normalizedBody) return;
+      if (role === "user" && normalizedBody.startsWith(AUTO_DAILY_REPORT_PREFIX)) return;
       records.push({
         id: `codex-${threadId}-${key}`,
         role,
@@ -812,13 +935,19 @@
     turns.forEach((turn, turnIndex) => {
       const turnId = text(turn?.id, `turn-${turnIndex}`);
       const timestamp = turn?.createdAt ?? turn?.created_at ?? thread?.updatedAt ?? thread?.updated_at;
-      (Array.isArray(turn?.items) ? turn.items : []).forEach((item, itemIndex) => {
+      const items = Array.isArray(turn?.items) ? turn.items : [];
+      const autoPrompt = items.map((item) => codexContentText(item?.content ?? item?.text))
+        .find((body) => body.startsWith(AUTO_DAILY_REPORT_PREFIX)) || "";
+      const autoRunId = autoPrompt.match(/run_id="([a-f0-9]{32})"/)?.[1] || "";
+      items.forEach((item, itemIndex) => {
         const kind = text(item?.type, "").replace(/[-_]/g, "").toLowerCase();
         const itemId = text(item?.id, `item-${itemIndex}`);
         if (kind === "usermessage" || kind === "user") {
           add("user", item.content ?? item.text, `${turnId}-${itemId}`, item?.createdAt ?? item?.created_at ?? timestamp);
         } else if (kind === "agentmessage" || kind === "assistant") {
-          add("assistant", item.text ?? item.content, `${turnId}-${itemId}`, item?.createdAt ?? item?.created_at ?? timestamp);
+          const body = codexContentText(item.text ?? item.content);
+          add("assistant", autoRunId ? body.replaceAll(autoRunId, "本次任务") : body,
+            `${turnId}-${itemId}`, item?.createdAt ?? item?.created_at ?? timestamp);
         }
       });
     });
@@ -3887,6 +4016,7 @@
     if (state.codexEnabled === false) throw new Error(codexUnavailableMessage());
     if (state.codexEnabled !== true || state.codexReady !== true) throw new Error(codexUnavailableMessage());
     if (!state.codexThreadId) await createCodexThread();
+    const requestThreadId = state.codexThreadId;
     const controller = new AbortController();
     state.activeAssistantController = controller;
     state.codexStopRequested = false;
@@ -4021,6 +4151,17 @@
       eventStages.push(stage);
     };
 
+    const dailyRunIdFromReceipt = (value, depth = 0) => {
+      if (depth > 6 || value == null) return "";
+      if (typeof value === "string") {
+        const match = value.match(/"run_id"\s*:\s*"([a-f0-9]{32})"/);
+        return match?.[1] || "";
+      }
+      if (typeof value !== "object") return "";
+      if (typeof value.run_id === "string" && /^[a-f0-9]{32}$/.test(value.run_id)) return value.run_id;
+      return Object.values(value).map((part) => dailyRunIdFromReceipt(part, depth + 1)).find(Boolean) || "";
+    };
+
     const handleEvent = (eventName, payload) => {
       if (isCancelled() || turnCompleted) return;
       const event = objectValue(payload);
@@ -4050,6 +4191,13 @@
         data.item?.name,
         data.item?.type,
       );
+      if (/(?:^|__)daily_recruitment_sync$/.test(toolName) && kind.includes("completed")) {
+        const runId = dailyRunIdFromReceipt(data);
+        if (runId && !state.dailyNotices[runId]) {
+          state.dailyNotices[runId] = { thread_id: requestThreadId, status: "active", observed_at: Date.now() };
+          persistDailyNotices();
+        }
+      }
       if (toolName || /tool|mcp|command|shell|function/.test(signal)) {
         setCodexEventStatus("tool", toolName || eventDetail(event, data), kind.includes("completed") ? "ok" : "active");
       }
@@ -4216,7 +4364,7 @@
     }
     if (streamError) throw new Error(streamError);
     if (!turnCompleted) throw new Error("Codex 流已结束，但没有收到 turn_completed 事件。");
-    return rememberTask({
+    const completedTask = {
       task_id: `codex-${state.codexTurnId || Date.now()}`,
       task_type: "conversation",
       user_request: message,
@@ -4224,12 +4372,15 @@
       steps: eventStages.length,
       answer: streamedAnswer || "Codex 未返回文本。",
       error: null,
-      thread_id: state.codexThreadId,
+      thread_id: requestThreadId,
       turn_id: state.codexTurnId,
       stages: eventStages,
       codex_events: eventStages,
       job_id: jobId,
-    });
+    };
+    // The user may have switched conversations while a background summary was
+    // streaming. Keep its result in the original Codex thread, not this UI state.
+    return state.codexThreadId === requestThreadId ? rememberTask(completedTask) : completedTask;
   }
 
   function openAssistantDraft(message, jobId = "") {
@@ -4375,6 +4526,10 @@
   }
 
   async function submitAssistantQuestion(message, explicitJobId = null) {
+    if (state.activeAssistantController) {
+      showToast("求职助理正在处理上一条请求，请稍候。", "info");
+      return null;
+    }
     const normalized = text(message, "").trim();
     if (!normalized) {
       $("assistant-form-error").textContent = "请先输入一个问题。";
@@ -4391,6 +4546,13 @@
       return null;
     }
     const intent = mapIntent(normalized);
+    let previousDailyRunIds = null;
+    if (intent.taskType === "full_recruitment_sync") {
+      try {
+        const before = await api("/api/local-ui/tasks/progress", { headers: authHeaders("daily-progress") });
+        previousDailyRunIds = new Set((before?.runs || []).filter((run) => run?.task_kind === "daily").map((run) => run.run_id));
+      } catch (_) { /* An unavailable progress snapshot must not block the user's request. */ }
+    }
     const jobId = text(explicitJobId ?? $("assistant-job-id")?.value, "").trim();
     $("assistant-message").value = "";
     $("assistant-job-id").value = "";
@@ -4412,6 +4574,7 @@
             ? text(task.answer)
             : `已完成${taskLabel}，结果和引用已记录。`;
       updateMessage(streamingMessage.id, answer, task, false);
+      await refreshDailyProgress(previousDailyRunIds ? task.thread_id || state.codexThreadId : "", previousDailyRunIds || new Set());
       await refreshConversationList();
       try {
         state.approvals = normalizeApprovals(await api("/api/approvals"));
@@ -5014,6 +5177,7 @@
     normalizeApplicationDraft,
     syncRecruitmentMails,
     runCodexAssistantQuery,
+    codexHistoryMessages,
     stopAssistantExecution,
     submitAssistantQuestion,
     appendMessage,
@@ -5032,6 +5196,6 @@
       if ([...document.querySelectorAll("[data-view-panel]")].some(panel => panel.dataset.viewPanel === savedView)) initialView = savedView;
     } catch (_) { /* Start at jobs when storage is unavailable. */ }
     bind(); switchView(initialView); updateIntentHint(); renderConversation(); renderTaskHistory(); renderDashboardTodos(); loadCore();
-    window.setInterval(() => { if (activeView === "assistant") void refreshDailyProgress(); }, 5000);
+    window.setInterval(() => { if (activeView === "assistant" || hasPendingDailyNotices()) void refreshDailyProgress(); }, 5000);
   }
 })();

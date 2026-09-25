@@ -37,37 +37,6 @@ def test_service_authentication_limits_and_protocol():
     assert client.post("/v1/embeddings", headers=headers, content=b"x" * 800001).status_code == 413
 
 
-def test_batched_client_orders_results_and_instructs_only_queries(monkeypatch):
-    requests = []
-
-    class Response:
-        def __init__(self, value):
-            self.value = value
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-        def read(self):
-            return json.dumps(self.value).encode()
-
-    def request(req, **kwargs):
-        value = json.loads(req.data)
-        requests.append(value)
-        return Response({"data": [{"index": i, "embedding": [float(i + 1), 1]} for i in reversed(range(len(value["input"])))]})
-
-    monkeypatch.setattr("packages.rag.embeddings.urlopen", request)
-    provider = OpenAICompatibleEmbeddingProvider("http://local.test/v1/embeddings", dimension=2, query_prefix=QWEN_QUERY_PREFIX)
-    assert len(provider.embed_many(["document"] * 18)) == 18
-    assert [len(r["input"]) for r in requests] == [16, 2]
-    assert provider.embed_many(["a", "b"]) == [[1., 1.], [2., 1.]]
-    provider.embed_query("question")
-    assert requests[-1]["input"] == [QWEN_QUERY_PREFIX + "question"]
-    assert requests[0]["input"][0] == "document"
-    assert provider.version != OpenAICompatibleEmbeddingProvider("http://local.test", dimension=2).version
-    for rows in ([], [{"index": 4, "embedding": [1, 1]}], [{"index": 0, "embedding": [0, 0]}]):
-        monkeypatch.setattr("packages.rag.embeddings.urlopen", lambda *a, **k: Response({"data": rows}))
-        with pytest.raises((RuntimeError, ValueError)):
-            provider.embed("bad")
+def test_retired_remote_embedding_provider_never_sends_data():
+    with pytest.raises(ValueError, match="retired"):
+        OpenAICompatibleEmbeddingProvider("https://old-provider.invalid/embeddings")

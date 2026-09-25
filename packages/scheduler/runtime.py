@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 from threading import Event
 from typing import Any, Mapping
+from uuid import uuid4
 
 import yaml
 from sqlalchemy import select
@@ -38,7 +39,12 @@ from packages.pipeline import (
     MatchingServiceAdapter,
     load_companies,
 )
-from packages.pipeline.daily import PipelineInterrupted
+from packages.pipeline.company_checkpoint import (
+    COMPACT_COMPANY_CHECKPOINT_MIN_SCOPE,
+    COMPACT_COMPANY_CHECKPOINT_VERSION,
+    company_checkpoint_progress,
+)
+from packages.pipeline.daily import PipelineInterrupted, _atomic_checkpoint, company_scope_digest
 from packages.pipeline.offline import reconcile_offline_jobs
 from packages.reporting import build_reporting_summary
 from packages.storage import Storage
@@ -71,50 +77,46 @@ def _company_checkpoint_progress(path: Path | str | None) -> dict[str, int] | No
 
     if path is None:
         return None
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError):
-        return None
+    checkpoint = Path(path)
+    payload = None
+    for candidate in (checkpoint, checkpoint.with_name(checkpoint.name + ".bak")):
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            break
+        except (OSError, UnicodeError, ValueError):
+            continue
     if not isinstance(payload, Mapping):
         return None
-    company_ids = payload.get("company_ids")
-    entries = payload.get("companies")
-    if not isinstance(company_ids, list) or not isinstance(entries, Mapping):
-        return None
-    scoped = set(str(value) for value in company_ids)
-    attempted = sum(1 for key in entries if str(key) in scoped)
-    complete = sum(
-        1 for key, value in entries.items()
-        if str(key) in scoped and isinstance(value, Mapping) and value.get("status") == "complete"
-    )
-    total = len(scoped)
-    return {
-        "scope_total": total,
-        "attempted_unique": attempted,
-        "confirmed_complete": complete,
-        "retry_pending": max(0, attempted - complete),
-        "not_started": max(0, total - attempted),
-        "remaining": max(0, total - complete),
-    }
+    return company_checkpoint_progress(payload)
 
 
-def _initialize_empty_company_checkpoint(path: Path, scope_path: Path) -> None:
+def _initialize_empty_company_checkpoint(
+    path: Path, scope_path: Path, company_ids: tuple[str, ...] = (),
+) -> None:
     """Make a frozen scope resumable even if the budget ends before first crawl."""
 
     if path.exists():
         return
+    requested = set(company_ids)
     selected = [
-        company.id for company in load_companies(scope_path)
+        company for company in load_companies(scope_path)
         if company.connected and company.crawler_key
+        and (not requested or company.id in requested)
     ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps({
-        "version": 1,
-        "company_ids": selected,
-        "companies": {},
-    }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    temporary.replace(path)
+    if len(selected) >= COMPACT_COMPANY_CHECKPOINT_MIN_SCOPE:
+        _atomic_checkpoint(path, {
+            "version": COMPACT_COMPANY_CHECKPOINT_VERSION,
+            "hydration_checkpoint_id": uuid4().hex,
+            "company_ids": [company.id for company in selected],
+            "scope_digest": company_scope_digest(selected),
+            "companies": {},
+        })
+    else:
+        _atomic_checkpoint(path, {
+            "version": 1,
+            "company_ids": [company.id for company in selected],
+            "companies": {},
+        })
 
 
 def _runtime_dir(settings: Settings) -> Path:
@@ -319,7 +321,8 @@ def _load_frozen_resume(
         "checkpoint_snapshot",
     )
     checkpoint_path = Path(str(checkpoint_ref)).expanduser() if checkpoint_ref else None
-    if checkpoint_path is not None and not checkpoint_path.is_file():
+    if (checkpoint_path is not None and not checkpoint_path.is_file()
+            and not checkpoint_path.with_name(checkpoint_path.name + ".bak").is_file()):
         raise ValueError(f"persisted resume checkpoint is missing: {checkpoint_path}")
     requested_mode = None
     for mode_key in ("effective_mode", "original_mode", "mode", "requested_mode"):
@@ -643,8 +646,11 @@ def build_runtime_task_handlers(
             matcher=None,
             profile=profile,
             max_concurrency=configured.crawl_max_concurrency,
+            detail_max_concurrency=int(getattr(configured, "detail_max_concurrency", 10)),
+            resource_root=Path(configured.agent_root) / ".data" / "crawl-resources",
+            browser_max_concurrency=int(getattr(configured, "browser_max_concurrency", 6)),
             company_timeout_seconds=configured.crawl_company_timeout_seconds,
-            match_max_concurrency=int(getattr(configured, "match_max_concurrency", 4)),
+            match_max_concurrency=int(getattr(configured, "match_max_concurrency", 6)),
             checkpoint_batch_size=int(
                 getattr(configured, "match_checkpoint_batch_size", 25)
             ),
@@ -780,7 +786,14 @@ def build_runtime_task_handlers(
         current_offerbiu_source_ids = tuple(persisted_source_record_ids)
         offerbiu_company_count = 0
         offerbiu_scope_attempted = False
+        offerbiu_scope_ready = False
         state_store = AgentStateStore(agent_storage) if agent_storage is not None else None
+        source_coverage: dict[str, Any] = {}
+        if resumed_from and state_store is not None:
+            previous_run = state_store.get_task_run(resumed_from) or {}
+            previous_coverage = _state_value(_state_sections(previous_run), "source_coverage")
+            if isinstance(previous_coverage, Mapping):
+                source_coverage = dict(previous_coverage)
         state: dict[str, Any] = {
             "mode": (
                 requested_mode
@@ -826,6 +839,7 @@ def build_runtime_task_handlers(
                 "checkpoint": {},
             },
             "steps": [],
+            "source_coverage": source_coverage,
         }
 
         def _scope_state() -> dict[str, Any]:
@@ -855,6 +869,7 @@ def build_runtime_task_handlers(
                     )
             metadata = state.setdefault("metadata", {})
             if isinstance(metadata, dict):
+                metadata["source_coverage"] = dict(source_coverage)
                 metadata["company_ids"] = list(effective_company_ids)
                 metadata["source_record_ids"] = list(current_offerbiu_source_ids)
                 if active_scope_path is not None:
@@ -888,7 +903,9 @@ def build_runtime_task_handlers(
             ):
                 checkpoint_path = _runtime_dir(configured) / f"daily-checkpoint-{run_id}.json"
             if checkpoint_path is not None and not resume_from_checkpoint:
-                _initialize_empty_company_checkpoint(Path(checkpoint_path), active_scope_path)
+                _initialize_empty_company_checkpoint(
+                    Path(checkpoint_path), active_scope_path, effective_company_ids,
+                )
             persist_state("scope_frozen", append_step=True)
 
         if active_scope_path is not None:
@@ -901,23 +918,32 @@ def build_runtime_task_handlers(
             persist_state("scope_pending", append_step=True)
 
         def progress(stage: str, completed: int, total: int) -> None:
-            value = f"{stage}:{completed}/{total}"
             if stage == "companies":
-                durable = _company_checkpoint_progress(checkpoint_path)
-                if durable is not None:
-                    state["progress"] = {"stage": stage, **durable}
-                else:
-                    state["progress"] = {
-                        "stage": stage,
-                        "scope_total": total,
-                        "confirmed_complete": completed,
-                    }
+                previous = state.get("progress")
+                previously_attempted = (
+                    previous.get("attempted_unique", 0)
+                    if isinstance(previous, Mapping) and previous.get("stage") == stage else 0
+                )
+                attempted = min(total, max(completed, previously_attempted))
+                confirmed = min(attempted, max(0, int(getattr(pipeline, "complete_company_count", 0))))
+                state["progress"] = {
+                    "stage": stage,
+                    "scope_total": total,
+                    "attempted_unique": attempted,
+                    "confirmed_complete": confirmed,
+                    "retry_pending": attempted - confirmed,
+                    "not_started": max(0, total - attempted),
+                    "remaining": max(0, total - confirmed),
+                    "active_count": max(0, int(getattr(pipeline, "active_company_count", 0))),
+                }
+                value = f"{stage}:{attempted}/{total}"
             else:
                 state["progress"] = {
                     "stage": stage,
                     "run_completed": completed,
                     "run_total": total,
                 }
+                value = f"{stage}:{completed}/{total}"
             state["progress_updated_at"] = datetime.now(timezone.utc).isoformat()
             if state_store is not None and run_id is not None:
                 state_store.update_task_progress(run_id, value)
@@ -940,7 +966,7 @@ def build_runtime_task_handlers(
 
         def discover(dry_run: bool = False):
             nonlocal current_offerbiu_source_ids, offerbiu_company_count, pipeline
-            nonlocal offerbiu_scope_attempted
+            nonlocal offerbiu_scope_attempted, offerbiu_scope_ready
             if effective_company_ids:
                 return {"source": "offerbiu", "status": "skipped_scoped_run"}
             if not getattr(configured, "discovery_enabled", False):
@@ -969,6 +995,17 @@ def build_runtime_task_handlers(
                 page_size=int(getattr(configured, "offerbiu_page_size", 50)),
                 delay_seconds=float(getattr(configured, "offerbiu_delay_seconds", 0.05)),
             )
+            if not dry_run and "checkpoint_path" in inspect.signature(service.refresh).parameters:
+                scope_key = hashlib.sha256(json.dumps({
+                    "seasonYear": 2027,
+                    "recruitType": "秋招",
+                    "industry_groups": sorted((configured_scope or {}).get(
+                        "industry_groups", DEFAULT_OFFERBIU_INDUSTRY_GROUPS)),
+                    "page_size": refresh_kwargs["page_size"],
+                }, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+                source_checkpoint = _runtime_dir(configured) / f"offerbiu-discovery-{scope_key}.json"
+                refresh_kwargs["checkpoint_path"] = source_checkpoint
+                state["metadata"]["source_checkpoint_ref"] = str(source_checkpoint)
             if "progress_callback" in inspect.signature(service.refresh).parameters:
                 def discovery_progress(pages: int, total: int, records: int) -> None:
                     state["progress"] = {
@@ -976,12 +1013,23 @@ def build_runtime_task_handlers(
                         "pages_fetched": pages,
                         "pages_total": total,
                         "records_seen": records,
+                        "total_confirmed": False,
                     }
                     state["progress_updated_at"] = datetime.now(timezone.utc).isoformat()
                     persist_state(f"discovery:{pages}/{total}")
                 refresh_kwargs["progress_callback"] = discovery_progress
             result = service.refresh(**refresh_kwargs)
-            if not result.get("complete"):
+            usable_partial = bool(result.get("partial") and result.get("usable")
+                                  and (dry_run or result.get("applied")))
+            source_coverage.update({
+                "complete": bool(result.get("complete")),
+                "partial": bool(result.get("partial") or not result.get("complete")),
+                "stop_reason": result.get("stop_reason"),
+                "records_seen": result.get("records_seen", 0),
+                "registered_entries": result.get("registered_entries", 0),
+            })
+            persist_state()
+            if not result.get("complete") and not usable_partial:
                 raise RuntimeError(
                     f"OfferBiu source refresh incomplete: {result.get('stop_reason') or result.get('error') or 'unknown error'}"
                 )
@@ -998,9 +1046,10 @@ def build_runtime_task_handlers(
                 )
                 set_scope(full_scope_path, scope_ids, current_offerbiu_source_ids)
                 pipeline = build_pipeline()
+                offerbiu_scope_ready = True
             return {
                 "source": "offerbiu",
-                "status": "preview" if dry_run else "registered",
+                "status": "preview" if dry_run else "partial" if usable_partial else "registered",
                 "industry_groups": (
                     list(configured_scope["industry_groups"])
                     if configured_scope
@@ -1095,7 +1144,7 @@ def build_runtime_task_handlers(
                 profile,
                 service,
                 pending_jobs,
-                concurrency=int(getattr(configured, "match_max_concurrency", 1)),
+                concurrency=int(getattr(configured, "match_max_concurrency", 6)),
                 progress=matching_progress,
                 stop_requested=stop_requested,
             )
@@ -1118,8 +1167,15 @@ def build_runtime_task_handlers(
             nonlocal checkpoint_path, offerbiu_company_count
             if stop_requested is not None and stop_requested.is_set():
                 raise PipelineInterrupted("time budget reached; saved work can be resumed")
+            if offerbiu_scope_attempted and not offerbiu_scope_ready:
+                # Scope/file/DB setup can fail after mutating local variables.
+                # Never execute the original configured pipeline in that case.
+                raise ValueError(
+                    "OfferBiu selected industry scope is not ready or returned zero crawlable sources; "
+                    "refusing legacy companies fallback"
+                )
             if mode == "score_only":
-                return score_existing(dry_run)
+                return {**score_existing(dry_run), "source_partial": bool(source_coverage.get("partial"))}
             active_pipeline = pipeline
             if (
                 not effective_company_ids
@@ -1158,6 +1214,8 @@ def build_runtime_task_handlers(
             payload = converter() if callable(converter) else result
             if isinstance(payload, dict):
                 payload = dict(payload)
+                payload["source_partial"] = bool(source_coverage.get("partial"))
+                payload["source_coverage"] = dict(source_coverage)
                 if offerbiu_company_count:
                     payload["offerbiu_companies_queued"] = offerbiu_company_count
                 payload.setdefault("written", bool(getattr(result, "written", False)))
@@ -1184,9 +1242,15 @@ def build_runtime_task_handlers(
             )
             payload["company_reconciliation"] = reconciliation_result
             payload["offline_reconciliation"] = offline_result
+            if source_coverage.get("partial"):
+                payload["source_partial"] = True
+                payload["source_coverage"] = dict(source_coverage)
+                payload["status"] = "partial"
             return payload
 
         def offline_reconcile(pipeline_result, dry_run: bool):
+            if source_coverage.get("partial"):
+                return {"status": "skipped_incomplete_sources", "written": False}
             if not getattr(configured, "offline_reconciliation_enabled", False):
                 return {"status": "disabled", "written": False}
             if agent_storage is None:
@@ -1368,9 +1432,12 @@ def build_runtime_task_handlers(
                 "status": (
                     "failed" if result.status is DailySyncStatus.FAILED
                     or _business_failure(pipeline_metrics) else
-                    "paused" if result.status is DailySyncStatus.PAUSED else "completed"
+                    "paused" if result.status is DailySyncStatus.PAUSED else
+                    "partial" if result.status is DailySyncStatus.DEGRADED else "completed"
                 ),
                 "sync_status": result.status.value,
+                "source_partial": bool(discovery_metrics.get("partial") or pipeline_metrics.get("source_partial")),
+                "warnings": list(result.warnings),
                 "daily_sync": payload,
                 "error": payload.get("error") or _business_failure(pipeline_metrics),
                 "agent_write_performed": any((

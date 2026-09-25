@@ -405,7 +405,7 @@ def test_deepseek_client_uses_injected_transport_without_real_api() -> None:
 
     client = DeepSeekClient(
         api_key="fake-key",
-        model="deepseek-test",
+        model="deepseek-flash",
         transport=transport,
     )
     response = client.complete(system_prompt="system", user_prompt="user")
@@ -433,7 +433,7 @@ def test_deepseek_client_enables_high_effort_thinking_for_matching() -> None:
 
     client = DeepSeekClient(
         api_key="fake-key",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         thinking_enabled=True,
         reasoning_effort="high",
         transport=transport,
@@ -459,7 +459,7 @@ def test_deepseek_client_retries_empty_transient_response() -> None:
 
     client = DeepSeekClient(
         api_key="fake-key",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         transport=transport,
         retry_backoff_seconds=0,
     )
@@ -499,12 +499,13 @@ def test_matching_does_not_enable_thinking_when_disabled() -> None:
         text = "not-json" if len(calls) == 1 else json.dumps(_model_result(), ensure_ascii=False)
         return {
             "model": "deepseek-v4-flash",
-            "content": [{"type": "text", "text": text}],
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"result":' + text + '}'}]}],
         }
 
     client = DeepSeekClient(
         api_key="fake-key",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         thinking_enabled=False,
         transport=transport,
         max_attempts=1,
@@ -514,7 +515,7 @@ def test_matching_does_not_enable_thinking_when_disabled() -> None:
     assert result.result.analysis_status is AnalysisStatus.COMPLETE
     assert len(calls) == 2
     assert all(call["reasoning"] == {"effort": "none"} for call in calls)
-    assert all(call["thinking"] == {"type": "disabled"} for call in calls)
+    assert all(call["text"]["format"]["type"] == "json_schema" for call in calls)
 
 
 def test_deepseek_client_reports_thinking_only_token_exhaustion_as_truncated() -> None:

@@ -16,7 +16,7 @@ _STAGES = ("discovery", "reconciliation", "crawl", "offline_reconciliation", "re
 _PHASES = {*_STAGES, "companies", "jd", "matching"}
 _PROGRESS_FIELDS = {
     "discovery": ("pages_fetched", "pages_total", "records_seen"),
-    "companies": ("scope_total", "attempted_unique", "confirmed_complete", "retry_pending", "not_started", "remaining"),
+    "companies": ("scope_total", "attempted_unique", "confirmed_complete", "retry_pending", "not_started", "remaining", "active_count"),
     "jd": ("run_completed", "run_total"),
     "matching": ("run_completed", "run_attempted", "run_total", "confirmed_complete", "scope_total", "retry_pending"),
 }
@@ -67,6 +67,8 @@ def _daily_projection(storage, row):
     result = state.get("result")
     business_error = _business_failure(result)
     status = "failed" if business_error else "paused" if _business_paused(result) else str(record["run_status"])
+    if isinstance(result, Mapping) and result.get("status") == "partial" and not business_error:
+        status = "partial"
     step = str(record.get("current_step") or state.get("current_step") or "")
     if step.startswith("recoverable:"):
         step = step.removeprefix("recoverable:")
@@ -75,7 +77,7 @@ def _daily_projection(storage, row):
     stages = {
         stage: raw_stages[stage]
         for stage in _STAGES
-        if isinstance(raw_stages, Mapping) and raw_stages.get(stage) in {"running", "succeeded", "failed", "skipped", "paused"}
+        if isinstance(raw_stages, Mapping) and raw_stages.get(stage) in {"running", "succeeded", "failed", "skipped", "paused", "partial"}
     }
     if phase not in _PHASES:
         phase = next((stage for stage in reversed(_STAGES) if stage in stages), "starting")
@@ -85,6 +87,8 @@ def _daily_projection(storage, row):
         stage = raw_progress.get("stage")
         if isinstance(stage, str) and stage in _PROGRESS_FIELDS and (stage == phase or phase == "crawl" and stage in {"companies", "jd", "matching"}):
             progress = {"stage": stage}
+            if stage == "discovery" and isinstance(raw_progress.get("total_confirmed"), bool):
+                progress["total_confirmed"] = raw_progress["total_confirmed"]
             for field in _PROGRESS_FIELDS[stage]:
                 value = raw_progress.get(field)
                 if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000_000:
