@@ -39,7 +39,7 @@
 
 - [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.7)
 - [Gitee v0.1.7 更新说明](https://gitee.com/zs-k/recruitops-agent/blob/main/docs/RELEASE_v0.1.7.md)
-- 123 云盘下载链接：上传完成后同步。
+- [123 云盘（永久分享，安装包与校验文件）](https://1835739780.share.123pan.cn/123pan/QbN4Td-ixbXd)
 
 下载完成后可按需核对 SHA-256：
 

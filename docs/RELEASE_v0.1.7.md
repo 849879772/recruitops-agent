@@ -8,7 +8,7 @@
 - SHA-256 校验文件：`RecruitOps-v0.1.7.zip.sha256.txt`
 - [GitHub 发布页](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.7)
 - [Gitee 更新说明](https://gitee.com/zs-k/recruitops-agent/blob/main/docs/RELEASE_v0.1.7.md)
-- 123 云盘：上传完成后同步下载链接。
+- [123 云盘（永久分享，安装包与校验文件）](https://1835739780.share.123pan.cn/123pan/QbN4Td-ixbXd)
 - ZIP 大小：738,771,245 字节（约 704.5 MiB）。
 - ZIP SHA-256：`6045928839A2D31B56F8AD1B32868B14C675321A0935937F374522350EFEE030`。
 
