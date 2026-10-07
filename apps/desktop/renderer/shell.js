@@ -600,14 +600,20 @@ function renderApplications(f) {
 }
 function render(state) {
   currentState=state;
-  const stages = {resources:'正在校验本地运行资源',preflight:'正在准备本地服务',instance:'正在打开当前用户数据',initdb:'正在初始化本地数据库',database:'正在连接本地数据库',migration:'正在检查数据结构',backup:'正在备份本地数据',api:'正在启动工作台服务',runtime:'工作台服务已就绪'};
+  const stages = {resources:'正在校验本地运行资源',preflight:'正在准备本地服务',instance:'正在打开当前用户数据',initdb:'正在初始化本地数据库',database:'正在连接本地数据库',migration_check:'正在检查是否需要升级数据库',migration:'正在升级数据库结构',backup:'正在备份本地数据',backup_verify:'正在验证数据库备份',api:'正在启动工作台服务',runtime:'工作台服务已就绪'};
+  const elapsed = state.runtime.elapsedSeconds;
+  const elapsedText = typeof elapsed === 'number' && Number.isFinite(elapsed) && elapsed >= 0 ? `（已用时 ${Math.floor(elapsed)} 秒）` : '';
+  const stageMessage = `${stages[state.runtime.stage] || '正在启动本地服务'}${elapsedText}`;
+  const startupErrors = {backup_timeout:'数据库备份超时，升级尚未执行。请查看启动日志后重试。',backup_failed:'数据库备份未完成，升级尚未执行。请查看启动日志。',backup_verify_failed:'数据库备份验证失败，升级尚未执行。请查看启动日志。',backup_verify_timeout:'数据库备份验证超时，升级尚未执行。请查看启动日志后重试。',migration_check_failed:'无法检查数据库升级状态，请查看启动日志。',migration_check_timeout:'检查数据库升级状态超时，请查看启动日志后重试。',migration_failed:'数据库结构升级未完成，请查看启动日志。',migration_timeout:'数据库结构升级超时，请查看启动日志。'};
+  const startupCode = state.runtime.code || state.configurationError || '';
+  const startupFailure = startupErrors[startupCode] ? `${startupErrors[startupCode]}（${startupCode}）` : startupCode;
   const diagnostics = state.active === null && !state.workbenchRequested;
   const failed = state.runtime.status === 'failed' || !!state.configurationError || state.workbenchError;
   const pending = !diagnostics && !failed && (state.active === null || state.active === 'workbench') && (state.workbenchLoading || (state.workbenchRequested && state.runtime.status !== 'ready'));
   $('workbench-progress').hidden = !pending;
   $('startup-error').hidden = diagnostics || !failed || typeof state.active === 'number';
-  $('startup-error-message').textContent = state.workbenchError ? (state.notice || '工作台加载失败，请查看启动状态后重试。') : `工作台暂时无法启动，请查看启动状态。${state.runtime.code || state.configurationError || ''}`;
-  $('startup-message').textContent = state.workbenchLoading ? '正在加载工作台，请稍候…' : `${stages[state.runtime.stage] || '正在启动本地服务'}，就绪后自动进入。`;
+  $('startup-error-message').textContent = state.workbenchError ? (state.notice || '工作台加载失败，请查看启动状态后重试。') : `工作台暂时无法启动，请查看启动状态。${startupFailure}`;
+  $('startup-message').textContent = state.workbenchLoading ? '正在加载工作台，请稍候…' : `${stageMessage}，就绪后自动进入。`;
   $('workbench').title = pending ? '启动完成后自动进入工作台，无需重复点击' : '打开工作台';
   $('home-page').hidden = !diagnostics;
   $('tabs').replaceChildren();
@@ -624,7 +630,7 @@ function render(state) {
   $('clear-site').disabled = !selected;
   $('loading').textContent = selected?.loading ? '加载中' : selected?.error ? '加载失败' : selected?.resourceWarning ? '资源提示' : '';
   $('loading').title = selected?.error || selected?.resourceWarning || '';
-  $('api-status').textContent = failed ? `启动失败：${state.runtime.code || state.configurationError}` : state.runtime.status === 'stopping' ? '正在停止当前服务' : stages[state.runtime.stage] || '尚未启动';
+  $('api-status').textContent = failed ? `启动失败：${startupFailure}` : state.runtime.status === 'stopping' ? '正在停止当前服务' : stages[state.runtime.stage] ? stageMessage : '尚未启动';
   $('runtime-instance').textContent = state.runtime.instanceId || '未创建';
   $('browser-status').textContent = state.browser.connected ? '已连接 / 顶层页面证据' : '不可用';
   $('writes-status').textContent = state.writesEnabled ? '已对当前实例显式开启' : '关闭';

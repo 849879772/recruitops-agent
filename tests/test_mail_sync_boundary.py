@@ -18,6 +18,28 @@ def test_sync_success_is_valid_typed_output(monkeypatch):
     assert result.read_only is False
 
 
+def test_manual_api_sync_bypasses_ttl_but_background_reads_keep_cache(monkeypatch):
+    from apps.api import main as api
+    from packages.recruitment_mail import freshness
+
+    calls = []
+    monkeypatch.setattr(api, "get_settings", lambda: SimpleNamespace(mail_enabled=True))
+    monkeypatch.setattr(api, "recruitment_mail_store", lambda: object())
+    monkeypatch.setattr(freshness, "ensure_mail_fresh", lambda *a, **kwargs:
+                        calls.append(kwargs) or {"status": "synced"})
+    assert api.sync_recruitment_mails(limit=100)["status"] == "synced"
+    api._run_recruitment_mail_sync()
+    assert calls == [{"limit": 100, "force": True}, {"limit": 100, "force": False}]
+
+
+def test_explicit_assistant_sync_also_bypasses_cache(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "_sync_mail_before_read", lambda *a, **kwargs:
+                        calls.append(kwargs) or {"status": "synced", "sync": {}})
+    assert server._mail_sync_operation(RecruitmentMailSyncInput(), object()).success
+    assert calls[0]["force"] is True
+
+
 def test_successful_refresh_records_a_timestamp(monkeypatch):
     monkeypatch.setattr(server, "_sync_mail_before_read", lambda *a, **k: {
         "status": "synced", "sync": {"fetched": 0, "inserted": 0},

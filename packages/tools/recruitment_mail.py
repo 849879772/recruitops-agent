@@ -54,6 +54,8 @@ class RecruitmentMailSummary(ToolModel):
     processing_status: str
     requires_confirmation: bool
     application_id: str | None = None
+    application_ids: list[str] = Field(default_factory=list)
+    applications: list[dict[str, Any]] = Field(default_factory=list)
     company_name: str | None = None
     job_title: str | None = None
     event_times: list[str] = Field(default_factory=list)
@@ -78,6 +80,8 @@ class RecruitmentMailDetailData(ToolModel):
     message: ParsedRecruitmentEmail
     processing_status: str
     application_id: str | None = None
+    application_ids: list[str] = Field(default_factory=list)
+    applications: list[dict[str, Any]] = Field(default_factory=list)
     job_id: str | None = None
     company_id: str | None = None
 
@@ -91,6 +95,8 @@ class RecruitmentMailReviewData(ToolModel):
     freshness: dict[str, Any] | None = None
     record_id: str
     association: RecruitmentMailAssociation
+    application_ids: list[str] = Field(default_factory=list)
+    applications: list[dict[str, Any]] = Field(default_factory=list)
     approval_previews: list[ApprovalPreview] = Field(default_factory=list)
 
 
@@ -110,11 +116,13 @@ class RecruitmentMailBindingCandidatesInput(ToolInput):
     record_id: str = Field(min_length=1, max_length=128)
     query: str = Field(default="", max_length=500)
     limit: int = Field(default=20, ge=1, le=50)
+    offset: int = Field(default=0, ge=0)
 
 
 class RecruitmentMailBindingProposeInput(ToolInput):
     record_id: str = Field(min_length=1, max_length=128)
     application_id: str | None = Field(default=None, max_length=255)
+    application_ids: list[str] | None = Field(default=None, max_length=50)
     action: Literal["bind", "unbind", "correct"] = "bind"
     content_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     binding_revision: int = Field(ge=0)
@@ -131,7 +139,7 @@ class RecruitmentMailBindingCandidatesResponse(ToolResponse[dict[str, Any]]):
 def recruitment_mail_binding_candidates(request: RecruitmentMailBindingCandidatesInput,
                                         store: RecruitmentMailStore) -> RecruitmentMailBindingCandidatesResponse:
     from packages.recruitment_mail.binding import binding_candidates
-    result = binding_candidates(store, request.record_id, query=request.query, limit=request.limit)
+    result = binding_candidates(store, request.record_id, query=request.query, limit=request.limit, offset=request.offset)
     return RecruitmentMailBindingCandidatesResponse(tool_name="recruitment_mail_binding_candidates", status=ToolStatus.SUCCESS,
                         success=True, data=result, read_only=True, timeout_ms=request.timeout_ms, elapsed_ms=0,
                         evidence=[EvidenceSource(source="recruitment_mail", source_ref=request.record_id)])
@@ -141,6 +149,7 @@ def recruitment_mail_binding_propose(request: RecruitmentMailBindingProposeInput
                                      store: RecruitmentMailStore, registry) -> ToolResponse[dict[str, Any]]:
     from packages.recruitment_mail.binding import binding_preview
     preview = binding_preview(store, request.record_id, application_id=request.application_id,
+                              application_ids=request.application_ids,
                               action=request.action, expected_digest=request.content_digest,
                               expected_revision=request.binding_revision)
     decision = registry.issue(preview)
@@ -175,6 +184,7 @@ def _elapsed(started: float) -> int:
 def _summary(record) -> RecruitmentMailSummary:
     parsed = parsed_record(record)
     from packages.recruitment_mail.presentation import mail_semantics
+    from packages.recruitment_mail.binding import bound_application_ids, BINDING_KEY
     return RecruitmentMailSummary(
         id=record.id,
         subject=record.subject,
@@ -185,6 +195,8 @@ def _summary(record) -> RecruitmentMailSummary:
         processing_status=record.processing_status,
         requires_confirmation=record.requires_confirmation,
         application_id=record.application_id,
+        application_ids=bound_application_ids(record),
+        applications=(record.raw_metadata or {}).get(BINDING_KEY, {}).get("applications", []),
         company_name=(
             parsed.company_candidates[0].value if parsed.company_candidates else None
         ),
@@ -238,6 +250,7 @@ def search_recruitment_mail(request: RecruitmentMailSearchInput, store: Recruitm
 
 
 def get_recruitment_mail(request: RecruitmentMailDetailInput, store: RecruitmentMailStore) -> RecruitmentMailDetailResponse:
+    from packages.recruitment_mail.binding import bound_application_ids, BINDING_KEY
     started = perf_counter()
     record = store.get(record_id=request.record_id)
     evidence = [EvidenceSource(source="agent_database", source_ref=request.record_id)]
@@ -255,6 +268,8 @@ def get_recruitment_mail(request: RecruitmentMailDetailInput, store: Recruitment
             message=parsed_record(record),
             processing_status=record.processing_status,
             application_id=record.application_id, job_id=record.job_id, company_id=record.company_id,
+            application_ids=bound_application_ids(record),
+            applications=(record.raw_metadata or {}).get(BINDING_KEY, {}).get("applications", []),
         ),
         evidence=evidence, timeout_ms=request.timeout_ms, elapsed_ms=_elapsed(started),
     )
@@ -380,6 +395,27 @@ def review_recruitment_mail(request: RecruitmentMailReviewInput, store: Recruitm
         schedule_events=schedule_events,
         record_id=record.id,
     )
+    from packages.recruitment_mail.binding import bound_application_ids, _validate_group
+    from packages.recruitment_mail.analysis_binding import model_application_matches
+    bound_ids = bound_application_ids(record)
+    confirmed_group = [application for application in applications if application.id in bound_ids]
+    if len(bound_ids) > 1 and len(confirmed_group) == len(bound_ids) and all(
+            model_application_matches(record, analysis["payload"], application) for application in confirmed_group):
+        from packages.recruitment_mail.association import ApplicationMatch
+        by_id = {application.id: application for application in confirmed_group}
+        confirmed_group = [by_id[identifier] for identifier in bound_ids]
+        try:
+            _validate_group(record, confirmed_group, analysis["payload"])
+        except ValueError:
+            association = association.model_copy(update={"status": "review_required", "requires_confirmation": True,
+                "match": None, "stage_draft": None, "schedule_drafts": [],
+                "review_reasons": ["multi_binding_event_scope_invalid"]})
+        else:
+            association = association.model_copy(update={"status": "matched_group", "requires_confirmation": False,
+                "match": None, "stage_draft": None, "schedule_drafts": [], "review_reasons": [],
+                "candidates": [ApplicationMatch(application_id=application.id, company_name=application.company_name,
+                    job_title=application.job_title, confidence=1, reasons=["human_confirmed_binding"])
+                    for application in confirmed_group]})
     if schedule_source_error:
         association = association.model_copy(
             update={
@@ -394,6 +430,9 @@ def review_recruitment_mail(request: RecruitmentMailReviewInput, store: Recruitm
         tool_name="recruitment_mail_review", status=ToolStatus.SUCCESS, success=True,
         data=RecruitmentMailReviewData(
             record_id=record.id, association=association,
+            application_ids=bound_ids,
+            applications=[{"application_id": application.id, "company_name": application.company_name,
+                           "job_title": application.job_title, "stage": application.stage.value} for application in confirmed_group],
             approval_previews=_approval_previews(record.id, association, applications),
         ),
         evidence=evidence, timeout_ms=request.timeout_ms, elapsed_ms=_elapsed(started),

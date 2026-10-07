@@ -265,7 +265,11 @@ def test_sync_uses_persisted_evidence_updates_once_and_never_accepts_stage(isola
         assert session.get(ApplicationSnapshot, body["application_id"]).stage_history == history
 
 
-def test_desktop_local_observation_is_persisted_then_verified_without_stage_input(isolated):
+@pytest.mark.parametrize("context,expected_stage", [
+    ("Platform Engineer 笔试中", "written"),
+    ("笔试中", "applied"),
+])
+def test_desktop_local_observation_is_persisted_then_verified_without_stage_input(isolated, context, expected_stage):
     from datetime import datetime, timezone
     client, storage, headers, _ = isolated
     application_id = client.post(BASE + "/application", headers=headers, json=REGISTRATION).json()["application_id"]
@@ -274,7 +278,7 @@ def test_desktop_local_observation_is_persisted_then_verified_without_stage_inpu
         "application_id": application_id, "application_ids": [application_id],
         "page_url": REGISTRATION["record_url"], "captured_at": datetime.now(timezone.utc).isoformat(),
         "application_records": [{"title": REGISTRATION["title"], "status": "written", "label": "笔试中",
-                                  "evidence": "Platform Engineer 笔试中", "context": "笔试中", "confidence": 0.99}],
+                                  "evidence": "Platform Engineer 笔试中", "context": context, "confidence": 0.99}],
     }
     body = {"application_id": application_id, "page_url": REGISTRATION["record_url"],
             "observation": {"protocol_version": 1, "type": "result", "operation_id": "desktop-local-one",
@@ -282,8 +286,13 @@ def test_desktop_local_observation_is_persisted_then_verified_without_stage_inpu
     assert client.post(BASE + "/sync-local-observation", headers=headers, json={**body, "stage": "offer"}).status_code == 422
     response = client.post(BASE + "/sync-local-observation", headers=headers, json=body)
     assert response.status_code == 200, response.text
+    if expected_stage == "applied":
+        assert response.json()["success"] is False
+        assert response.json()["error_code"] == "evidence_not_in_observation"
+    else:
+        assert response.json()["success"] is True
     with storage.session() as session:
-        assert session.get(ApplicationSnapshot, application_id).stage == "written"
+        assert session.get(ApplicationSnapshot, application_id).stage == expected_stage
 
 
 def test_desktop_batch_observation_syncs_distinct_confirmed_records_once(isolated):

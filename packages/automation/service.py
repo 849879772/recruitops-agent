@@ -6,9 +6,9 @@ from hashlib import sha256
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
-from packages.storage import AutomationExecution, AutomationSchedule, Storage
+from packages.storage import AutomationExecution, AutomationSchedule, Storage, TaskRun
 
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
@@ -60,6 +60,16 @@ def automation_blocked_message(reason: str) -> str:
     return _BLOCKED_MESSAGES.get(reason, "计划所需能力当前不可用。")
 
 
+def _finish_direct_task_run(session, execution, schedule) -> None:
+    if schedule is None or schedule.task_id not in {"daily_recruitment_intelligence", "crawler_health"}:
+        return
+    run = session.get(TaskRun, execution.id)
+    if run is not None:
+        run.status = "success" if execution.status == "succeeded" else "failed"
+        run.error_code = None if execution.status == "succeeded" else f"automation_{execution.status}"
+        run.updated_at = execution.completed_at
+
+
 @dataclass(frozen=True)
 class ClaimedAutomation:
     execution_id: str
@@ -70,6 +80,10 @@ class ClaimedAutomation:
     target_id: str | None
     target_label: str | None
     scheduled_for: datetime
+
+
+class AutomationRunningError(RuntimeError):
+    """A schedule with an in-flight execution cannot be deleted safely."""
 
 
 class AutomationStore:
@@ -158,6 +172,30 @@ class AutomationStore:
             session.flush()
             session.refresh(row)
             return row
+
+    def delete(self, schedule_id: str) -> int | None:
+        """Delete a schedule and completed execution history, but never an active run."""
+        with self.storage.transaction(write=True) as session:
+            statement = select(AutomationSchedule).where(AutomationSchedule.id == schedule_id)
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            row = session.scalar(statement)
+            if row is None:
+                return None
+            running = session.scalar(
+                select(AutomationExecution.id).where(
+                    AutomationExecution.schedule_id == schedule_id,
+                    AutomationExecution.status == "running",
+                ).limit(1)
+            )
+            if running is not None:
+                raise AutomationRunningError("Automation is running; wait for it to finish before deleting.")
+            result = session.execute(
+                delete(AutomationExecution).where(AutomationExecution.schedule_id == schedule_id)
+            )
+            session.delete(row)
+            session.flush()
+            return max(0, result.rowcount or 0)
 
     def skip_missed_occurrences(self, *, now: datetime | None = None) -> int:
         """Advance overdue schedules at worker startup without replaying them."""
@@ -260,26 +298,40 @@ class AutomationStore:
         error: str | None = None,
         thread_id: str | None = None,
         turn_id: str | None = None,
+        result_details: dict | None = None,
         now: datetime | None = None,
     ) -> AutomationExecution:
         if status not in {"succeeded", "failed", "blocked"}:
             raise ValueError("invalid terminal automation status")
         timestamp = _utc(now)
         with self.storage.transaction(write=True) as session:
-            execution = session.get(AutomationExecution, execution_id)
+            statement = select(AutomationExecution).where(AutomationExecution.id == execution_id)
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            execution = session.scalar(statement)
             if execution is None:
                 raise KeyError(f"automation execution not found: {execution_id}")
+            if execution.status != "running":
+                return execution
+            execution.thread_id = thread_id or execution.thread_id
+            if not execution.thread_id:
+                schedule = session.get(AutomationSchedule, execution.schedule_id)
+                self._ensure_task_conversation(session, execution, direct=bool(schedule and
+                    schedule.task_id in {"daily_recruitment_intelligence", "crawler_health"}))
             execution.status = status
             execution.result_summary = result_summary
             execution.error = error
-            execution.thread_id = thread_id
-            execution.turn_id = turn_id
+            execution.thread_id = thread_id or execution.thread_id
+            execution.turn_id = turn_id or execution.turn_id
             execution.completed_at = timestamp
             schedule = session.get(AutomationSchedule, execution.schedule_id)
             if schedule is not None:
                 schedule.last_status = status
                 schedule.last_error = error
                 schedule.updated_at = timestamp
+            _finish_direct_task_run(session, execution, schedule)
+            from .conversations import record_completed
+            record_completed(session, execution, details=result_details)
             session.flush()
             session.refresh(execution)
             return execution
@@ -289,7 +341,8 @@ class AutomationStore:
         execution_id: str,
         *,
         thread_id: str,
-        turn_id: str,
+        turn_id: str | None = None,
+        direct: bool | None = None,
     ) -> None:
         with self.storage.transaction(write=True) as session:
             execution = session.get(AutomationExecution, execution_id)
@@ -298,7 +351,67 @@ class AutomationStore:
             if execution.status != "running":
                 return
             execution.thread_id = thread_id
-            execution.turn_id = turn_id
+            execution.turn_id = turn_id or execution.turn_id
+            if direct is not None:
+                schedule = session.get(AutomationSchedule, execution.schedule_id)
+                if schedule is not None:
+                    from .conversations import record_started
+                    record_started(session, execution, schedule, direct=direct)
+
+    @staticmethod
+    def _ensure_task_conversation(session, execution, *, direct: bool) -> str:
+        from .conversations import record_started, record_completed
+
+        local_only = not execution.thread_id
+        if local_only:
+            execution.thread_id = f"automation-thread-{execution.id}"
+        schedule = session.get(AutomationSchedule, execution.schedule_id)
+        if schedule is None:
+            raise KeyError(f"automation schedule not found: {execution.schedule_id}")
+        record_started(session, execution, schedule, direct=direct, local_only=local_only)
+        if execution.status != "running":
+            record_completed(session, execution)
+        return execution.thread_id
+
+    def ensure_task_conversation(self, execution_id: str, *, direct: bool) -> str:
+        """Create the durable task report without depending on MCP/model startup."""
+        with self.storage.transaction(write=True) as session:
+            statement = select(AutomationExecution).where(AutomationExecution.id == execution_id)
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            execution = session.scalar(statement)
+            if execution is None:
+                raise KeyError(f"automation execution not found: {execution_id}")
+            return self._ensure_task_conversation(session, execution, direct=direct)
+
+    def claim_execution_start(self, execution_id: str) -> bool:
+        """Only one worker may start this occurrence, including concurrent callbacks."""
+        with self.storage.transaction(write=True) as session:
+            result = session.execute(update(AutomationExecution).where(
+                AutomationExecution.id == execution_id,
+                AutomationExecution.status == "running",
+                AutomationExecution.thread_id.is_(None),
+                AutomationExecution.result_summary.is_(None),
+            ).values(result_summary="正在准备执行定时任务…"))
+            return result.rowcount == 1
+
+    def record_startup_retry(self, execution_id: str, *, attempt: int, max_attempts: int, error: str) -> None:
+        with self.storage.transaction(write=True) as session:
+            execution = session.get(AutomationExecution, execution_id)
+            if execution is None:
+                raise KeyError(f"automation execution not found: {execution_id}")
+            if execution.status != "running":
+                return
+            from .conversations import record_startup_retry
+            record_startup_retry(session, execution, attempt=attempt, max_attempts=max_attempts, error=error)
+            schedule = session.get(AutomationSchedule, execution.schedule_id)
+            if schedule is not None:
+                schedule.last_error = execution.error
+                schedule.updated_at = _utc()
+
+    def execution(self, execution_id: str) -> AutomationExecution | None:
+        with self.storage.session() as session:
+            return session.get(AutomationExecution, execution_id)
 
     def executions(self, schedule_id: str, *, limit: int = 20) -> list[AutomationExecution]:
         with self.storage.session() as session:
@@ -325,6 +438,10 @@ class AutomationStore:
                 )
             )
             for execution in rows:
+                if not execution.thread_id:
+                    schedule = session.get(AutomationSchedule, execution.schedule_id)
+                    self._ensure_task_conversation(session, execution, direct=bool(schedule and
+                        schedule.task_id in {"daily_recruitment_intelligence", "crawler_health"}))
                 execution.status = "failed"
                 execution.error = "local API restarted before automation completed"
                 execution.completed_at = timestamp
@@ -333,11 +450,15 @@ class AutomationStore:
                     schedule.last_status = "failed"
                     schedule.last_error = execution.error
                     schedule.updated_at = timestamp
+                _finish_direct_task_run(session, execution, schedule)
+                from .conversations import record_completed
+                record_completed(session, execution)
                 recovered += 1
         return recovered
 
 
 __all__ = [
+    "AutomationRunningError",
     "AutomationStore",
     "ClaimedAutomation",
     "DEFAULT_TIMEZONE",

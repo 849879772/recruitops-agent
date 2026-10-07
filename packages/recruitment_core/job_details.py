@@ -78,6 +78,12 @@ _ERROR_PAGE_HEADING_RE = re.compile(
         |page\s+not\s+found(?:\s*[-:：|丨].*)?
         |嗯\s*[.…\.]{1,3}\s*无法访问此页面
         |无法访问此页面
+        |无法访问此网站
+        |此网站无法提供安全连接
+        |this\s+site\s+can(?:not|['’]t)\s+be\s+reached
+        |hmm+[.…\.\s]*can(?:not|['’]t)\s+reach\s+this\s+page
+        |ERR_[A-Z_]+(?:\s.*)?
+        |DNS_PROBE_[A-Z_]+(?:\s.*)?
         |页面不存在
         |找不到页面
         |请求失败
@@ -434,11 +440,27 @@ def _is_error_page_heading(value: object) -> bool:
     return bool(text and _ERROR_PAGE_HEADING_RE.fullmatch(text))
 
 
+def _page_error_status(html: str) -> str:
+    """Classify an observed browser error before interpreting job headings."""
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    for node in soup.select("title, h1, h2, #main-message, .error-code"):
+        if _is_hidden_control(node):
+            continue
+        heading = " ".join(node.get_text(" ", strip=True).split())
+        if not _is_error_page_heading(heading):
+            continue
+        return "job_offline" if re.search(r"^404\b|not\s+found|页面不存在|找不到页面", heading, re.I) else "render_failed"
+    return ""
+
+
 def _url_job_id(url: str) -> str:
     parsed = urlsplit(url)
     for query in (parsed.query, parsed.fragment.partition("?")[2]):
         for name, value in parse_qsl(query):
-            if name.casefold() in {"id", "jobid", "jobadid", "postid", "positionid", "advertisementid"}:
+            if name.casefold() in {"id", "jobid", "jobadid", "postid", "positionid", "advertisementid", "jobunionid"}:
+                return value
+            if name.casefold() == "pid" and parsed.hostname == "apply.careers.microsoft.com" and parsed.path.rstrip("/") == "/careers":
                 return value
     for path in (parsed.fragment.partition("?")[0], parsed.path):
         match = re.search(r"/(?:job|jobs|position|posts)/(?!list(?:/|$)|detail(?:/|$))([^/]+)", path, re.I)
@@ -652,6 +674,17 @@ def _beisen_bound_identity(identity: Mapping) -> bool:
     )
 
 
+def _is_beisen_detail_host(host: str) -> bool:
+    host = str(host or "").casefold()
+    if host.endswith(".zhiye.com"):
+        return True
+    # Several verified Beisen tenants use their own official host. Reuse the
+    # existing entry registry instead of guessing from arbitrary custom URLs.
+    from .entry import _COMPANIES_YAML_HOST_MAP
+
+    return _COMPANIES_YAML_HOST_MAP.get(host) in {"beisen", "beisen_mobile"}
+
+
 def _beisen_host_binding(url: str, identity: Mapping) -> tuple[str, tuple[str, ...]]:
     detail_host = (urlparse(url).hostname or "").casefold().rstrip(".")
     evidence = [f"detail_host:{detail_host}"] if detail_host else []
@@ -706,13 +739,15 @@ def _beisen_identity_check(
         return "identity_mismatch", (*evidence, "reason:beisen_job_ad_id_conflict")
 
     if request_namespace == "job_ad_id":
+        if not job_ad_values:
+            return "content_incomplete", (*evidence, "reason:beisen_job_ad_id_missing")
         if len(job_ad_values) != 1 or request_norm not in job_ad_values:
             return "identity_mismatch", (*evidence, "reason:beisen_request_job_ad_id_mismatch")
     elif route_values:
         if len(route_values) != 1 or request_norm not in route_values:
             return "identity_mismatch", (*evidence, "reason:beisen_request_id_mismatch")
     elif bound:
-        return "identity_mismatch", (*evidence, "reason:beisen_request_id_missing")
+        return "content_incomplete", (*evidence, "reason:beisen_request_id_missing")
 
     bound_ids: list[tuple[str, str]] = []
     native_id = str(identity.get("native_job_id") or "")
@@ -754,7 +789,7 @@ def _beisen_identity_check(
     title_values = _beisen_field_values(observed, _TITLE_FIELDS)
     if identity.get("title"):
         if not title_values and bound:
-            return "identity_mismatch", (*evidence, "reason:beisen_title_missing")
+            return "content_incomplete", (*evidence, "reason:beisen_title_missing")
         if title_values and any(
             _identity_key(value) != _identity_key(identity.get("title"))
             for _, value in title_values
@@ -768,6 +803,8 @@ def _beisen_identity_check(
     evidence.extend(f"tenant:{field}:{value}" for field, value in observed_tenant)
     if len(observed_tenant_values) > 1:
         return "identity_mismatch", (*evidence, "reason:beisen_tenant_conflict")
+    if expected_tenant_values and not observed_tenant_values:
+        return "content_incomplete", (*evidence, "reason:beisen_tenant_missing")
     if expected_tenant_values and observed_tenant_values != expected_tenant_values:
         return "identity_mismatch", (*evidence, "reason:beisen_tenant_mismatch")
 
@@ -814,6 +851,114 @@ def _clean_api_text(value: object) -> str:
     return "\n".join(
         line.strip() for line in soup.get_text("\n").splitlines() if line.strip()
     )
+
+
+def _meituan_city_tokens(value: object) -> set[str]:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    tokens = {
+        _identity_key(part).removesuffix("市")
+        for part in re.split(r"[\s、，,;/；|]+", text)
+        if part.strip()
+    }
+    return tokens - {
+        "", "—", "-", "--", "未知", "暂无", "全国", "不限", "不限制",
+        "海外", "国外", "remote", "anywhere",
+    }
+
+
+def fetch_meituan_job_description_status(url: str, *, identity: Mapping | None = None) -> tuple[str, str]:
+    """Read an exact official ID, or resolve an old campus-list row uniquely."""
+
+    from .crawlers.meituan import MeituanCrawler
+
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    is_list = MeituanCrawler.supports(url)
+    is_detail = host == MeituanCrawler.HOST and parsed.path.rstrip("/") == "/web/position/detail"
+    if not is_list and not is_detail:
+        return "", "not_applicable"
+    requested = dict(identity or {})
+    route_id = _url_job_id(url)
+    source_url = url
+    if is_list:
+        title = str(requested.get("title") or "").strip()
+        if not title:
+            return _DetailStatus("", "list_url", detail_url=url)
+        crawler = MeituanCrawler(str(requested.get("company") or "美团"), url)
+        candidates = crawler.fetch(keywords=title)
+        if not crawler.pagination_complete:
+            status = "timeout" if crawler.crawl_error_code == "timeout" else "fetch_failed" if crawler.fetch_failed else "content_incomplete"
+            return _DetailStatus("", status, detail_url=url, error_type=crawler.crawl_error_code)
+        exact = [item for item in candidates if _identity_key(item["title"]) == _identity_key(title)]
+        wanted_id = _requested_id(requested)
+        if wanted_id:
+            exact = [item for item in exact if _identity_key(item["source_job_id"]) == _identity_key(wanted_id)]
+        elif exact and (saved_cities := _meituan_city_tokens(requested.get("city"))):
+            unknown_city = [item for item in exact if not _meituan_city_tokens(item.get("city"))]
+            matching_city = [item for item in exact if saved_cities & _meituan_city_tokens(item.get("city"))]
+            if unknown_city:
+                return _DetailStatus(
+                    "", "content_incomplete", detail_url=url, identity_status="unverified",
+                    identity_evidence=("reason:meituan_legacy_city_unverified",),
+                )
+            if not matching_city:
+                return _DetailStatus(
+                    "", "identity_mismatch", detail_url=url,
+                    identity_evidence=(
+                        "reason:meituan_legacy_city_mismatch",
+                        *(f"native_id:{item['source_job_id']}" for item in exact),
+                        *(f"city:{item['city']}" for item in exact),
+                    ),
+                )
+            exact = matching_city
+        if len(exact) != 1:
+            return _DetailStatus(
+                "", "identity_ambiguous" if len(exact) > 1 else "official_unavailable", detail_url=url,
+                identity_evidence=tuple(f"native_id:{item['source_job_id']}" for item in exact),
+            )
+        route_id = exact[0]["source_job_id"]
+        url = exact[0]["jd_url"]
+    if not route_id:
+        return _DetailStatus("", "no_detail_url", detail_url=url)
+    if _requested_id(requested) and _identity_key(_requested_id(requested)) != _identity_key(route_id):
+        return _DetailStatus(
+            "", "identity_mismatch", detail_url=url,
+            identity_evidence=(f"request_bound_id:{route_id}", "reason:meituan_requested_id_route_conflict"),
+        )
+    try:
+        response = requests.post(
+            MeituanCrawler.DETAIL_API,
+            json={"jobUnionId": route_id, "jobShareType": "1"},
+            headers=MeituanCrawler.headers(source_url), timeout=25, allow_redirects=False,
+        )
+        if not MeituanCrawler.is_official_api_response(response):
+            return _DetailStatus("", "fetch_failed", detail_url=url, error_type="official_origin_changed", identity_status="unverified")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, Mapping) or payload.get("status") not in {1, "1"}:
+            return _DetailStatus("", "official_unavailable", detail_url=url)
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return _DetailStatus("", "api_variant_unsupported", detail_url=url)
+        conflict, evidence = _check_identity(
+            requested, data, requested_id=route_id,
+            id_fields=("jobUnionId",), title_fields=("name",),
+        )
+        if conflict:
+            return _DetailStatus("", conflict, detail_url=url, identity_evidence=evidence)
+        # A detail shell or an API schema change must not become a full JD.
+        if not data.get("jobUnionId") or not data.get("name"):
+            return _DetailStatus("", "content_incomplete", detail_url=url, identity_status="unverified", identity_evidence=evidence)
+        duty = _clean_api_text(data.get("jobDuty"))
+        requirement = _clean_api_text(data.get("jobRequirement"))
+        detail = "\n".join(["岗位职责", duty, "任职要求", requirement]).strip() if duty or requirement else ""
+        complete = bool(duty and requirement)
+        return _DetailStatus(
+            detail, "complete" if complete else "content_incomplete", detail_url=url,
+            identity_status="matched", identity_evidence=evidence,
+        )
+    except Exception as exc:
+        return _api_failure(exc)
 
 
 def fetch_feishu_job_description_status(url: str, *, identity: Mapping | None = None) -> tuple[str, str]:
@@ -1710,7 +1855,7 @@ def fetch_huawei_job_description_status(url: str, *, identity: Mapping | None = 
 def fetch_beisen_job_description_status(url: str, *, identity: Mapping | None = None) -> tuple[str, str]:
     """Fetch the detail payload exposed by modern Beisen campus portals."""
     parsed = urlparse(url)
-    if not parsed.netloc.casefold().endswith(".zhiye.com"):
+    if not _is_beisen_detail_host(parsed.netloc):
         return "", "not_applicable"
     mobile_params = dict(parse_qsl(parsed.fragment.partition("?")[2], keep_blank_values=True))
     is_mobile = parsed.netloc.casefold().endswith(".m.zhiye.com") and bool(mobile_params.get("id"))
@@ -1789,7 +1934,7 @@ def fetch_beisen_job_description_status(url: str, *, identity: Mapping | None = 
         if conflict:
             return _DetailStatus(
                 "", conflict, detail_url=url,
-                identity_status=conflict.removeprefix("identity_"),
+                identity_status=conflict.removeprefix("identity_") if conflict in _IDENTITY_FAILURES else "unverified",
                 identity_evidence=identity_evidence,
             )
         duty = _clean_api_text(data.get("DutyStr") if is_mobile else data.get("Duty"))
@@ -2344,6 +2489,12 @@ def _extract_scoped_jd(
     captured_final_url = str(capture_meta.get("final_url") or "").strip()
     if captured_final_url.startswith(("http://", "https://")):
         detail_url = captured_final_url
+    page_error = _page_error_status(html)
+    if page_error:
+        return _detail_result(
+            dict(job), "", page_error, source=source, detail_url=detail_url,
+            load_state="not_found" if page_error == "job_offline" else "request_failed",
+        )
     scripts = list(soup.find_all("script"))
     script_rows = []
     pattern = re.compile(r"name\s*:\s*'((?:\\.|[^'])*)'\s*,\s*value\s*:\s*'((?:\\.|[^'])*)'", re.S)
@@ -2859,6 +3010,10 @@ def fetch_full_job_description_result(job: dict) -> JobDetailHydrationResult:
                 detail_url=url,
                 capture_evidence=dict(job.get("capture_evidence") or {}),
             )
+        if (urlsplit(url).hostname or "").casefold() in {"zhaopin.meituan.com", "campus.meituan.com"}:
+            outcome = fetch_meituan_job_description_status(url, identity=job)
+            if outcome[1] != "not_applicable":
+                return api_result(outcome, "meituan_official_api")
         if job.get("link_kind") == "list" or (not url and any(job.get(name) for name in ("careers_url", "campaign_url", "source_url", "list_url"))):
             return fetch_configured_page_job_description_result(job)
         if not url:
@@ -2869,11 +3024,15 @@ def fetch_full_job_description_result(job: dict) -> JobDetailHydrationResult:
         host = urlparse(url).netloc.casefold()
         if (
             host != _LENOVO_HOST
+            and not _is_beisen_detail_host(host)
             and _requested_id(job)
             and route_id
             and _identity_key(_requested_id(job)) != _identity_key(route_id)
         ):
-            return _detail_result(job, "", "identity_mismatch", source="request", detail_url=url)
+            return _detail_result(
+                job, "", "identity_mismatch", source="request", detail_url=url,
+                identity_evidence=(f"request_bound_id:{route_id}", "reason:requested_id_route_conflict"),
+            )
 
         if host == "hotjob.cn" or host.endswith(".hotjob.cn"):
             source = "hotjob_api"
@@ -2950,7 +3109,7 @@ def fetch_full_job_description_result(job: dict) -> JobDetailHydrationResult:
         if host == "career.huawei.com":
             source = "huawei_api"
             return api_result(fetch_huawei_job_description_status(url, identity=job), source)
-        if host.endswith(".zhiye.com"):
+        if _is_beisen_detail_host(host):
             from .beisen_legacy_detail import (
                 is_beisen_legacy_detail_url,
                 parse_beisen_legacy_detail,

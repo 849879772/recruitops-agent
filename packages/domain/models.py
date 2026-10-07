@@ -142,6 +142,7 @@ class Application(AuditFields):
     source_stage: str | None = None
     source_status: str | None = None
     source_status_synced_at: datetime | None = None
+    last_review: dict[str, Any] | None = None
 
 
 class ScheduleEvent(AuditFields):
@@ -158,6 +159,8 @@ class ScheduleEvent(AuditFields):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     application_id: str | None = None
+    application_ids: list[str] = Field(default_factory=list)
+    associated_jobs: list[dict[str, Any]] = Field(default_factory=list)
     location_or_link: str | None = None
     note: str | None = None
 

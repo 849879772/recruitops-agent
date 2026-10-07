@@ -7,7 +7,7 @@ import hashlib
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import and_, case, insert, or_, select, update
+from sqlalchemy import and_, case, insert, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -219,7 +219,9 @@ def upsert_job_snapshot(
     availability_status: str | None = None,
     title_key: str | None = None,
     preserve_existing_score: bool = False,
-) -> None:
+    return_inserted: bool = False,
+    preserve_existing_identity: bool = False,
+) -> bool | None:
     values = {
         **_audit_values(job),
         "id": job.id,
@@ -273,7 +275,50 @@ def upsert_job_snapshot(
                 (table.c.match_score.between(0, 100), table.c.match_score), else_=None
             )
         }
+    if preserve_existing_identity:
+        overrides = dict(overrides or {})
+        for name in (
+            "company_id", "title", "city", "organization_id", "recruitment_unit_id",
+            "recruitment_campaign_id", "source_platform", "source_tenant", "native_job_id",
+            "normalized_detail_url", "business_key", "first_seen_at", "source", "source_ref",
+        ):
+            overrides[name] = table.c[name]
+        for name in (
+            "source_platform", "source_tenant", "native_job_id", "normalized_detail_url", "business_key",
+        ):
+            overrides[name] = case(
+                (or_(table.c[name].is_(None), table.c[name] == ""),
+                 literal(values[name], type_=table.c[name].type)),
+                else_=table.c[name],
+            )
+        # A complete concurrent capture may commit between the pipeline's
+        # SELECT and INSERT. Protect it in the conflict update itself.
+        if values.get("capture_status") != "complete":
+            for name in (
+                "jd_raw", "detail_url", "capture_evidence", "updated_at",
+                "capture_status", "capture_failure_reason",
+            ):
+                if name in values:
+                    overrides[name] = case(
+                        (table.c.capture_status == "complete", table.c[name]),
+                        else_=literal(values[name], type_=table.c[name].type),
+                    )
+    if return_inserted:
+        # The insert itself arbitrates concurrent writers. A pre-write SELECT
+        # cannot establish which run actually created a row.
+        dialect = session.get_bind().dialect.name
+        if dialect in {"postgresql", "sqlite"}:
+            factory = postgresql_insert if dialect == "postgresql" else sqlite_insert
+            statement = factory(table).values(**values).on_conflict_do_nothing(
+                index_elements=["id"],
+            ).returning(table.c.id)
+            if session.execute(statement).scalar_one_or_none() is not None:
+                return True
+            _upsert(session, table, values, conflict_columns=("id",), update_overrides=overrides)
+            return False
+        raise NotImplementedError("insert receipts require PostgreSQL or SQLite")
     _upsert(session, table, values, conflict_columns=("id",), update_overrides=overrides)
+    return None
 
 
 def upsert_job_analysis_snapshot(

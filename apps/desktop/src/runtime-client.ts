@@ -4,7 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
 
-export type RuntimeState = { status: string; stage: string; code?: string; instanceId?: string; writes: boolean; websocket: boolean };
+export type RuntimeState = { status: string; stage: string; code?: string; instanceId?: string; elapsedSeconds?: number; writes: boolean; websocket: boolean };
 export type RuntimeActivity = { activeTasks: { runId: string; currentStep: string }[] };
 export type Launch = { executable: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; expectedInstance?: string; desktop?: boolean };
 
@@ -44,10 +44,13 @@ export class OwnedRuntime {
   private ended = false;
   private stopPromise?: Promise<void>;
   private startupTimer?: NodeJS.Timeout;
+  private startupStartedAt = 0;
+  private backupBudgetExtended = false;
   constructor(private changed: () => void, private launch: Launch) {}
   start() {
     if (this.child) throw new Error('runtime_already_started');
     this.state.status = 'starting'; this.changed();
+    this.startupStartedAt = performance.now();
     this.child = spawn(this.launch.executable, this.launch.args, { cwd: this.launch.cwd,
       env: { ...this.launch.env, RECRUITOPS_DESKTOP_SHELL_TOKEN: this.token }, windowsHide: true, shell: false, stdio: 'pipe' });
     this.startupTimer = setTimeout(() => this.fail('runtime_startup_timeout'), 300000);
@@ -87,7 +90,20 @@ export class OwnedRuntime {
       this.state.instanceId = event.instance_id;
     } else if (this.state.instanceId) throw new Error('missing_identity');
     this.sequence = Number(event.sequence);
-    this.state.stage = /^[a-z_]{1,40}$/.test(event.stage) ? event.stage : 'runtime';
+    if (event.elapsed_seconds !== undefined && (typeof event.elapsed_seconds !== 'number' ||
+        !Number.isFinite(event.elapsed_seconds) || event.elapsed_seconds < 0 || event.elapsed_seconds > Number.MAX_SAFE_INTEGER)) throw new Error('elapsed');
+    const stage = /^[a-z_]{1,40}$/.test(event.stage) ? event.stage : 'runtime';
+    if (stage !== this.state.stage) delete this.state.elapsedSeconds;
+    this.state.stage = stage;
+    if (typeof event.elapsed_seconds === 'number') this.state.elapsedSeconds = event.elapsed_seconds;
+    // A migration backup may take ten minutes. Extend only once, bounded from
+    // launch time; progress events must never keep a stuck startup alive forever.
+    if (this.state.status === 'starting' && stage === 'backup' && !this.backupBudgetExtended &&
+        ['starting', 'progress', 'completed'].includes(event.event)) {
+      this.backupBudgetExtended = true;
+      clearTimeout(this.startupTimer);
+      this.startupTimer = setTimeout(() => this.fail('runtime_startup_timeout'), Math.max(1, 900000 - (performance.now() - this.startupStartedAt)));
+    }
     if (event.event === 'failed') return this.fail(typeof event.code === 'string' && /^[a-z0-9_]{1,100}$/.test(event.code) ? event.code : 'runtime_failed');
     if (event.event === 'ready' && event.stage === 'runtime') {
       if (typeof event.instance_id !== 'string') throw new Error('missing_identity');

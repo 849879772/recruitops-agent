@@ -456,7 +456,7 @@ def test_browser_bridge_waits_for_spa_content_and_uses_vision_after_dom_only_obs
     assert "visibleMediaCount" in background
     assert "normalizeVisionResponse" in background
     assert 'typeof body.text !== "string"' in background
-    assert 'document.body.innerText || ""' in content
+    assert 'return visibleText(document.body)' in content
     assert 'redactSensitiveText(element.innerText || "")' in content
     assert "visibleTextLength" in content
     assert "sender?.tab?.id" not in content

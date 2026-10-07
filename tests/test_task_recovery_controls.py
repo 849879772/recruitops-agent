@@ -212,6 +212,7 @@ def test_restart_reclaims_prior_boot_but_old_claim_cannot_write(tmp_path, monkey
 
 
 def test_foreground_continuation_respects_pause_until_explicit_resume(tmp_path, monkeypatch):
+    monkeypatch.setattr(review, "_WAVE_PAGES", 10)
     repo = repository(tmp_path, 12)
     visited = []
     async def observe(request, *_):
@@ -235,6 +236,7 @@ def test_foreground_continuation_respects_pause_until_explicit_resume(tmp_path, 
 
 
 def test_foreground_continuation_window_is_not_a_worker_lease(tmp_path, monkeypatch):
+    monkeypatch.setattr(review, "_WAVE_PAGES", 10)
     from packages.tools import application_review_tasks as tasks
     repo = repository(tmp_path, 12)
     async def observe(request, *_):

@@ -288,7 +288,9 @@ def _stored_event_fields(row: ScheduleEventSnapshot) -> dict[str, Any]:
     }
 
 
-def _event_from_row(row: ScheduleEventSnapshot) -> ScheduleEvent:
+def _event_from_row(row: ScheduleEventSnapshot, session=None) -> ScheduleEvent:
+    from packages.recruitment_mail.scheduling import mail_schedule_associations
+    associations = mail_schedule_associations(session, [row]).get(row.source_ref, {}) if session is not None else {}
     return ScheduleEvent(
         id=row.id,
         title=row.title,
@@ -306,6 +308,8 @@ def _event_from_row(row: ScheduleEventSnapshot) -> ScheduleEvent:
         starts_at=row.starts_at,
         ends_at=row.ends_at,
         application_id=row.application_id,
+        application_ids=associations.get("application_ids", [row.application_id] if row.application_id else []),
+        associated_jobs=associations.get("associated_jobs", []),
         location_or_link=row.location_or_link,
         note=row.note,
         created_at=row.created_at,
@@ -359,7 +363,7 @@ class ScheduleManager:
                     )
                 if existing is not None:
                     self._assert_same_request(existing, values)
-                    return ScheduleManageData(event=_event_from_row(existing), created=False)
+                    return ScheduleManageData(event=_event_from_row(existing, session), created=False)
 
                 event = ScheduleEventSnapshot(
                     id="schedule-" + uuid4().hex,
@@ -382,14 +386,14 @@ class ScheduleManager:
                 )
                 session.add(event)
                 session.flush()
-                return ScheduleManageData(event=_event_from_row(event), created=True)
+                return ScheduleManageData(event=_event_from_row(event, session), created=True)
         except IntegrityError:
             # The unique source pair is the idempotency guard under concurrent creates.
             existing = self._existing(source, source_ref)
             if existing is None:
                 raise
             self._assert_same_request(existing, values)
-            return ScheduleManageData(event=_event_from_row(existing), created=False)
+            return ScheduleManageData(event=_event_from_row(existing, session), created=False)
 
     def update(
         self,
@@ -414,6 +418,11 @@ class ScheduleManager:
                 raise ScheduleConflictError("schedule event changed; refresh before updating")
 
             supplied = fields.model_fields_set & _PATCH_FIELDS
+            from packages.recruitment_mail.scheduling import mail_schedule_associations
+            association = mail_schedule_associations(session, [event]).get(event.source_ref, {})
+            shared_mail = len(association.get("application_ids", [])) > 1
+            if shared_mail and supplied & {"application_id", "company_name", "job_title"}:
+                raise ScheduleValidationError("Shared mail event associations must be changed through mail binding confirmation")
             next_application_id = (
                 fields.application_id
                 if "application_id" in supplied
@@ -430,7 +439,15 @@ class ScheduleManager:
                 else event.job_title
             ) or ""
             application = self._application(session, next_application_id)
-            if application is not None:
+            if application is not None and not shared_mail:
+                # An unchanged binding is identified by its stable application ID.
+                # Old display labels may predate an application edit or a mail import;
+                # validate only names explicitly supplied by this update in that case.
+                if next_application_id == event.application_id:
+                    if "company_name" not in supplied:
+                        next_company_name = application.company_name
+                    if "job_title" not in supplied:
+                        next_job_title = application.job_title or ""
                 next_company_name, next_job_title = self._bound_values(
                     application,
                     company_name=next_company_name,
@@ -481,7 +498,7 @@ class ScheduleManager:
                 event.ends_at = None
             event.updated_at = _now()
             session.flush()
-            return ScheduleManageData(event=_event_from_row(event), updated=True)
+            return ScheduleManageData(event=_event_from_row(event, session), updated=True)
 
     @staticmethod
     def _assert_same_request(row: ScheduleEventSnapshot, values: dict[str, Any]) -> None:

@@ -87,6 +87,22 @@ def test_mail_start_and_control_forward_current_thread_and_frozen_run(boundary, 
                      ("wait", "mail-1", {"timeout_seconds": 20})]
 
 
+def test_explicit_failed_mail_retry_requires_selected_ids_and_forwards_once(boundary, monkeypatch):
+    from pydantic import ValidationError
+    for values in ({"retry_failed": True}, {"retry_failed": True, "record_ids": ["x"] * 51}):
+        with pytest.raises(ValidationError):
+            task_tools.RecruitmentMailRunStartInput(**values)
+    calls = []
+    service = SimpleNamespace(start=lambda **kwargs: calls.append(kwargs) or {"run_id": "retry", "status": "accepted"})
+    monkeypatch.setattr(task_tools, "mail_run_service", lambda _deps: service)
+    server, _, _, _ = boundary
+    result = call(server, "recruitment_mail_run_start", {
+        "record_ids": ["failed-mail"], "thread_id": "thread-a", "retry_failed": True, "refresh": False, "wait_ms": 0})
+    assert result.success and result.data["continuation_required"]
+    assert len(calls) == 1 and calls[0]["retry_failed"] is True
+    assert calls[0]["record_ids"] == ["failed-mail"] and calls[0]["refresh"] is False
+
+
 def test_mail_status_waits_without_constructing_service_and_requests_current_turn_continuation(boundary, monkeypatch):
     server, _, store, _ = boundary
     captured = []

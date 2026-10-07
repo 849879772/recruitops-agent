@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 .venv/
+.venv-desktop-tests/
 venv/
 
 # Local configuration and secrets
@@ -40,6 +41,12 @@ backups/
 *.dump
 *.log
 *.zip
+test-results/
+generatedlogs/
+
+# Private local documentation captures (keep locally, never publish)
+/docs/assets/applications.png
+/docs/assets/schedule.png
 
 # Browser and account state
 playwright/.auth/

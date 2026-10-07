@@ -37,17 +37,22 @@ def _jobs(repository, titles):
         ])
 
 
-def test_title_policy_applies_before_sql_page_and_total(repository):
+def test_browse_keeps_persisted_titles_before_sql_page_and_total(repository, monkeypatch):
     titles = ["销售专员"] * 220 + ["C++ 软件工程师", "AI 工程师", "AI实习生", "AI博士", "AI工程师（博士优先）", "Sailing工程师"]
     _jobs(repository, titles)
+    monkeypatch.setattr("packages.matching.title_policy.screen_title_job", lambda *_: pytest.fail("browse must not rescreen persisted titles"))
     page = repository.browse_jobs(limit=1, include_summary=False)
-    assert page.total == 3
+    assert page.total == len(titles)
     assert len(page.items) == 1
     assert page.stats is page.facets is None
     assert not page.summary_included
     assert page.featured == []
-    pages = [repository.browse_jobs(limit=1, offset=i, include_summary=False).items[0].id for i in range(3)]
-    assert len(set(pages)) == 3
+    pages = [repository.browse_jobs(limit=1, offset=i, include_summary=False).items[0].id for i in range(len(titles))]
+    assert len(set(pages)) == len(titles)
+    summary = repository.browse_jobs(query="销售", limit=1)
+    assert summary.total == 220
+    assert summary.stats.jobs == len(titles)
+    assert sum(company.job_count for company in summary.facets.companies) == len(titles)
 
 
 @pytest.mark.parametrize("sort", ["score", "newest", "company"])
@@ -98,7 +103,7 @@ def test_warm_page_does_not_rebuild_summary_or_load_all_analysis_text(repository
     assert not any("SELECT DISTINCT job_snapshots.title" in sql for sql in statements)
 
 
-def test_scores_jobs_company_and_profile_changes_invalidate_summary(repository, tmp_path):
+def test_scores_jobs_and_company_changes_invalidate_summary(repository):
     _jobs(repository, ["C++ 软件工程师", "AI 工程师"])
     assert repository.browse_jobs().stats.high_match == 0
     with repository.storage.write_transaction() as session:
@@ -107,13 +112,49 @@ def test_scores_jobs_company_and_profile_changes_invalidate_summary(repository, 
     with repository.storage.write_transaction() as session:
         session.get(CompanySnapshot, "a").name = "Renamed"
     assert any(company.name == "Renamed" for company in repository.browse_jobs().facets.companies)
-    (tmp_path / "profile.yaml").write_text("profile:\n  matching:\n    title_keywords: [AI]\n", encoding="utf-8")
-    assert repository.browse_jobs().total == 1
-    (tmp_path / "profile.yaml").write_text("profile:\n  matching:\n    title_keywords: [C++]\n", encoding="utf-8")
-    assert repository.browse_jobs().items[0].id == "job-0000"
     with repository.storage.write_transaction() as session:
         session.delete(session.get(JobSnapshot, "job-0000"))
-    assert repository.browse_jobs().total == 0
+    assert repository.browse_jobs().total == 1
+
+
+def test_keyword_changes_do_not_hide_history_or_change_crawl_screening(repository, tmp_path, monkeypatch):
+    from packages.candidate_profile.loader import load_candidate_profile
+    from packages.matching.title_policy import screen_title_job
+
+    _jobs(repository, ["C++ 软件工程师", "AI 工程师"])
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text("profile:\n  matching:\n    title_keywords: [AI]\n", encoding="utf-8")
+    assert repository.browse_jobs().total == 2
+    profile_path.write_text("profile:\n  matching:\n    title_keywords: [C++]\n    excluded_title_keywords: [AI]\n", encoding="utf-8")
+    profile = load_candidate_profile(profile_path)
+    assert screen_title_job({"title": "C++ 软件工程师"}, profile).eligible
+    assert not screen_title_job({"title": "AI 工程师"}, profile).eligible
+    assert repository.browse_jobs().total == 2
+    # A cold/expired cache must also ignore the current profile, not just reuse
+    # an earlier unfiltered result.
+    cache = job_browse._cache_for(repository.storage.engine)
+    monkeypatch.setattr(job_browse, "monotonic", lambda: cache.created + 16)
+    monkeypatch.setattr("packages.config.get_settings", lambda: pytest.fail("browse must not read candidate profile"))
+    page = repository.browse_jobs(limit=10)
+    assert page.total == page.stats.jobs == 2
+    assert {item.id for item in page.items} == {"job-0000", "job-0001"}
+    assert repository.browse_jobs(query="AI").total == 1
+
+
+def test_browse_retains_campus_scope_and_matches_assistant_search(repository):
+    from packages.domain.models import RecruitmentBatch
+
+    _jobs(repository, ["销售专员", "C++ 工程师", "AI 工程师", "机器人", "测试开发", "软件开发"])
+    with repository.storage.write_transaction() as session:
+        session.get(JobSnapshot, "job-0000").batch = "early"
+        session.get(JobSnapshot, "job-0002").cohort = 2026
+        session.get(JobSnapshot, "job-0003").cohort_status = "unconfirmed"
+        session.get(JobSnapshot, "job-0004").batch = "unknown"
+        session.get(JobSnapshot, "job-0005").source_ref = "recruitops-offline:v1:inactive:fixture"
+    page = repository.browse_jobs()
+    assistant = repository.search_jobs(cohort=2027, cohort_status="confirmed", batches=(RecruitmentBatch.FORMAL, RecruitmentBatch.EARLY))
+    assert page.total == page.stats.jobs == assistant.total == 2
+    assert {item.id for item in page.items} == {item.id for item in assistant.items} == {"job-0000", "job-0001"}
 
 
 def test_cache_ttl_covers_external_updates_with_preserved_timestamps(repository, monkeypatch):

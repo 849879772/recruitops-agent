@@ -12,6 +12,7 @@ from pydantic import Field
 from sqlalchemy import select, text
 
 from packages.storage.models import TaskRun, ToolCall, utc_now
+from packages.storage.task_identity import task_identity
 from .typed import EvidenceSource, ToolErrorCode, ToolInput, ToolResponse, ToolStatus
 
 STATE_TOOL = "application_review_checkpoint"
@@ -77,9 +78,10 @@ def review_summary(run_id: str, state: dict, status: str | None = None) -> dict:
         saved["interruption_reason"] = "worker_heartbeat_lost"
     result = dict(_response(run_id, saved, perf_counter(), busy=lease_active(saved)).summary)
     metadata = saved.get("metadata") or {}
-    result.update(task_kind="application_review", thread_id=metadata.get("thread_id"))
+    result.update(task_identity(run_id, metadata, task_id="application_status_review"))
+    result["task_kind"] = "application_review"
     result["can_resume"] = (
-        result["remaining_count"] > 0 and not result["in_progress"]
+        not saved.get("details_expired") and result["remaining_count"] > 0 and not result["in_progress"]
         and result["run_status"] not in {"cancelled", "cancelling", "pausing"}
         and result.get("control_request") != "cancel"
     )
@@ -90,7 +92,7 @@ def review_summary(run_id: str, state: dict, status: str | None = None) -> dict:
 
 
 def review_runs(storage, *, run_id: str | None = None, thread_id: str | None = None,
-                statuses: set[str] | None = None) -> list[dict]:
+                statuses: set[str] | None = None, limit: int | None = None) -> list[dict]:
     with storage.session() as session:
         statement = select(TaskRun, ToolCall).join(ToolCall, ToolCall.task_id == TaskRun.id).where(
             TaskRun.task_type == "application_status_review", ToolCall.tool_name == STATE_TOOL,
@@ -100,7 +102,12 @@ def review_runs(storage, *, run_id: str | None = None, thread_id: str | None = N
         else:
             allowed = ACTIVE_STATUSES | RECOVERABLE_STATUSES if statuses is None else statuses
             statement = statement.where(TaskRun.status.in_(allowed))
-        rows = session.execute(statement.order_by(TaskRun.updated_at.desc())).all()
+        if thread_id:
+            statement = statement.where(ToolCall.arguments["metadata"]["thread_id"].as_string() == thread_id)
+        statement = statement.order_by(TaskRun.updated_at.desc(), TaskRun.id.desc())
+        if limit is not None:
+            statement = statement.limit(limit)
+        rows = session.execute(statement).all()
         runs = []
         for task, checkpoint in rows:
             state = dict(checkpoint.arguments or {})
@@ -112,8 +119,9 @@ def review_runs(storage, *, run_id: str | None = None, thread_id: str | None = N
         return runs
 
 
-def application_review_status(request: ApplicationReviewStatusInput, repository) -> ApplicationReviewStatusResponse:
+def application_review_status(request: ApplicationReviewStatusInput, repository, *, _recoverable_only=False) -> ApplicationReviewStatusResponse:
     from .batch_browser_operations import _storage
+    from .application_review_results import compact_summary
 
     storage = _storage(repository)
     if storage is None:
@@ -122,6 +130,11 @@ def application_review_status(request: ApplicationReviewStatusInput, repository)
             error_code=ToolErrorCode.SOURCE_UNAVAILABLE, error_message="投递记录存储不可用。",
         )
     runs = review_runs(storage, run_id=request.run_id, thread_id=request.thread_id)
+    if not runs and not request.run_id and not _recoverable_only:
+        # Result discovery may include terminal history. Control discovery must
+        # retain the old active/recoverable-only selection boundary.
+        runs = review_runs(storage, thread_id=request.thread_id, statuses={"completed", "cancelled"}, limit=1)
+    runs = [compact_summary(run) for run in runs]
     return ApplicationReviewStatusResponse(
         tool_name="application_review_status",
         status=ToolStatus.SUCCESS if len(runs) == 1 else ToolStatus.AMBIGUOUS if runs else ToolStatus.NO_RESULTS,
@@ -137,9 +150,11 @@ def application_review_status(request: ApplicationReviewStatusInput, repository)
 async def control_application_review(request: ApplicationReviewControlInput, bridge, repository) -> ApplicationReviewControlResponse:
     from .batch_browser_operations import BatchObserveApplicationStatusInput, _storage
     from .application_review_run import continue_application_review
+    from .application_review_results import compact_summary
 
     selection = application_review_status(
         ApplicationReviewStatusInput(run_id=request.run_id, thread_id=None if request.run_id else request.thread_id), repository,
+        _recoverable_only=True,
     )
     if not selection.success:
         return ApplicationReviewControlResponse(**{
@@ -162,7 +177,7 @@ async def control_application_review(request: ApplicationReviewControlInput, bri
         )
         return ApplicationReviewControlResponse(
             tool_name="application_review_control", status=result.status, success=result.success,
-            data={"run": result.summary, "runs": [result.summary]}, read_only=False,
+            data={"run": compact_summary(result.summary), "runs": [compact_summary(result.summary)]}, read_only=False,
             error_code=result.error_code, error_message=result.error_message,
             timeout_ms=result.timeout_ms, elapsed_ms=result.elapsed_ms, timed_out=result.timed_out,
         )
@@ -192,7 +207,7 @@ async def control_application_review(request: ApplicationReviewControlInput, bri
             state["lease_until"] = 0
         row.arguments = state
         row.updated_at = task.updated_at = utc_now()
-        summary = review_summary(run_id, state, task.status)
+        summary = compact_summary(review_summary(run_id, state, task.status))
     return ApplicationReviewControlResponse(
         tool_name="application_review_control", status=ToolStatus.SUCCESS, success=True,
         data={"run": summary, "runs": [summary]}, read_only=False,
@@ -213,3 +228,17 @@ def review_write_guard():
         ).with_for_update())
         state = dict(row.arguments or {}) if row is not None else {}
         yield state.get("claim") == claim and lease_active(state)
+
+
+def review_dispatch_allowed() -> bool:
+    """Do not start a new browser/model follow-up after cooperative pause/cancel."""
+    owner = REVIEW_CONTEXT.get()
+    if owner is None:
+        return True
+    storage, run_id, claim = owner
+    with storage.session() as session:
+        row = session.scalar(select(ToolCall).where(
+            ToolCall.task_id == run_id, ToolCall.tool_name == STATE_TOOL,
+        ))
+        state = dict(row.arguments or {}) if row is not None else {}
+        return state.get("claim") == claim and lease_active(state) and not state.get("control_request")

@@ -116,3 +116,26 @@ def test_mail_read_does_not_sync_and_binding_requires_real_approval(local_api, m
     # A stale or forged follow-up does not silently overwrite this binding.
     assert client.post(f"/api/recruitment-mails/{record.id}/binding-proposals", json=body, headers=headers).status_code == 409
     assert client.post(f"/api/recruitment-mails/{record.id}/binding-proposals", json={**body, "confirmed": True}, headers=headers).status_code == 422
+
+
+@pytest.mark.parametrize(("reason", "message"), [
+    ("mail_event_requires_single_application", "公司通用笔试或测评"),
+    ("mail_event_has_specific_job_evidence", "明确指定岗位"),
+    ("multi_binding_company_mismatch", "同一家公司的投递"),
+    ("invalid_binding_targets", "最多关联 50 条"),
+    ("binding_targets_conflict", "选择不一致"),
+    ("unknown-private-reason", "邮件或投递记录已变化"),
+])
+def test_binding_scope_error_explains_selection_not_stale_refresh(local_api, monkeypatch, reason, message):
+    client, store, _ = local_api
+    def reject(*_args):
+        raise ValueError(reason)
+    monkeypatch.setattr(api, "recruitment_mail_binding_propose", reject)
+    response = client.post("/api/recruitment-mails/mail-synthetic/binding-proposals",
+        json={"record_id": "mail-synthetic", "application_ids": ["a", "b"], "action": "bind",
+              "content_digest": "b" * 64, "binding_revision": 0},
+        headers={"Authorization": "Bearer fixture-token"})
+    assert response.status_code == 409
+    assert message in response.json()["detail"]
+    assert reason not in response.json()["detail"]
+    assert store.count() == 0

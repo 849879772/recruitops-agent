@@ -3331,6 +3331,29 @@ h3 {
   background: rgba(23, 37, 35, 0.34);
 }
 
+.mail-binding-candidates { border: 0; padding: 0; margin: 18px 0; min-width: 0; }
+.mail-binding-candidates legend { margin-bottom: 10px; font-weight: 650; }
+.mail-binding-option { display: flex; align-items: flex-start; gap: 12px; padding: 14px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
+.mail-binding-option:has(input:checked) { border-color: var(--primary, #2762ee); background: #f2f6ff; }
+.mail-binding-option input { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 2px; }
+.mail-binding-option span { min-width: 0; overflow-wrap: anywhere; }
+.mail-binding-option small { display: block; margin-top: 5px; color: var(--muted); }
+.mail-binding-excerpt pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font: inherit; }
+.mail-binding-summary h3 { overflow-wrap: anywhere; }
+.mail-binding-selection { margin: 14px 0; }
+.mail-binding-selected { padding: 0; margin: 8px 0; list-style: none; }
+.mail-binding-selected li { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 6px; }
+.mail-binding-selected li span { min-width: 0; overflow-wrap: anywhere; }
+.mail-binding-selected li button { flex: 0 0 auto; }
+.review-result-row { padding: 16px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.review-result-row p { margin: 6px 0; }
+.review-result-row small { color: var(--muted); }
+.review-login-group { padding: 16px; margin: 10px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel, #fff); }
+.review-login-jobs { margin: 12px 0; padding-left: 22px; }
+.review-login-jobs li { margin: 6px 0; }
+.review-login-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.review-login-note { color: var(--muted); font-size: 14px; }
+
 .company-detail-dialog { padding: 16px; overflow-y: auto; }
 .company-detail-dialog > button { display: block; margin-left: auto; }
 .company-detail-dialog .company-source-detail { border-left: 0; padding: 12px 0; }
@@ -3407,6 +3430,30 @@ h3 {
   font: inherit;
 }
 .application-filter-bar label { font-size: 13px; color: var(--muted); }
+.application-channel-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-bottom: 18px;
+}
+.application-channel-filter { display: flex; flex-wrap: wrap; }
+.application-channel-tag {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: var(--surface-subtle);
+  color: var(--accent-ink);
+  font-size: 10px;
+}
+.application-channel-tag--mail_only { color: var(--muted); }
+.application-channel-note {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
 .application-summary {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -4389,6 +4436,16 @@ body {
   gap: 4px;
 }
 
+.identity-queue-panel { margin-bottom: 24px; }
+.identity-queue-card { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(280px, 2fr); gap: 24px; padding: 20px 0; border-top: 1px solid var(--line); }
+.identity-queue-local, .identity-queue-official { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.identity-queue-choice { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.identity-queue-choice input { margin-top: 4px; flex: 0 0 auto; }
+.identity-queue-choice span { display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
+.identity-queue-choice small { color: var(--muted); }
+.identity-queue-choice:has(input:checked) { border-color: var(--accent); }
+@media (max-width: 760px) { .identity-queue-card { grid-template-columns: 1fr; gap: 16px; } }
+
 .application-card-identity strong {
   display: -webkit-box;
   overflow: hidden;
@@ -4540,12 +4597,16 @@ body {
   background: var(--muted-light);
 }
 
-.mail-sync-status[data-state="syncing"] {
+.mail-sync-status[data-state="syncing"],
+.mail-sync-status[data-state="in-progress"],
+.mail-freshness-note[data-state="syncing"] {
   border-color: #bddbd5;
   background: var(--surface-teal);
 }
 
-.mail-sync-status[data-state="syncing"] .mail-status-indicator {
+.mail-sync-status[data-state="syncing"] .mail-status-indicator,
+.mail-sync-status[data-state="in-progress"] .mail-status-indicator,
+.mail-freshness-note[data-state="syncing"] .mail-status-indicator {
   background: var(--accent);
   animation: mail-sync-pulse 1s ease-in-out infinite;
 }
@@ -4561,6 +4622,7 @@ body {
 }
 
 .mail-sync-status[data-state="no-new"],
+.mail-sync-status[data-state="cached"],
 .mail-freshness-note[data-state="cached"],
 .mail-freshness-note[data-state="disabled"] {
   border-color: #ead8b6;
@@ -4568,6 +4630,7 @@ body {
 }
 
 .mail-sync-status[data-state="no-new"] .mail-status-indicator,
+.mail-sync-status[data-state="cached"] .mail-status-indicator,
 .mail-freshness-note[data-state="cached"] .mail-status-indicator,
 .mail-freshness-note[data-state="disabled"] .mail-status-indicator {
   background: var(--amber);
@@ -4770,6 +4833,13 @@ body {
 }
 /* Keep the original application's inline editor inside its own card. */
 .application-editor[hidden] { display: none; }
+.application-edit-dialog { width: min(680px, calc(100vw - 32px)); }
+.application-edit-dialog #application-edit-body { overflow-y: auto; min-height: 0; }
+.application-edit-dialog .application-editor { border-top: 0; margin-top: 0; padding: 0 24px 24px; }
+.application-edit-dialog .application-editor form { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.application-edit-dialog .application-editor form:last-child { border-bottom: 0; }
+.application-edit-dialog #application-edit-heading { overflow-wrap: anywhere; }
+.application-board-empty { grid-column: 1 / -1; }
 .application-editor { border-top: 1px solid #dce4e8; margin-top: 12px; padding: 12px; }
 .application-editor form { display: grid; gap: 8px; margin-bottom: 12px; }
 .application-editor-field { display: grid; gap: 4px; font-size: 12px; }

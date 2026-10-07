@@ -4,6 +4,7 @@ from .binding import BINDING_KEY
 
 
 def mail_semantics(record):
+    from .processing import retry_status
     metadata = record.raw_metadata or {}
     analysis = metadata.get("model_analysis", {})
     valid_analysis = bool(analysis and analysis.get("digest") == record.content_digest)
@@ -25,12 +26,13 @@ def mail_semantics(record):
     status_labels = {
         "pending": "待分析", "processed_updated": "已更新投递阶段", "processed_unchanged": "已核对，状态未变化",
         "processed": "已处理", "irrelevant": "非招聘邮件", "pending_association": "待关联",
-        "ambiguous_application": "待确认投递", "needs_auth_metadata": "发件人待核验",
+        "ambiguous_application": "待确认投递", "needs_auth_metadata": "待重新处理",
         "failed_terminal": "分析或核验失败", "failed": "处理失败", "ignored": "已忽略",
     }
+    retry = retry_status(record)
     return {"analysis_state": analysis_state, "binding_state": binding_state,
             "association_required": not no_association, "event_type": event,
-            "processing_label": status_labels.get(state, "待确认"),
+            "processing_label": "分析失败，可稍后重试" if failed and retry["retryable"] else status_labels.get(state, "待确认"),
             "confidence": None, "legacy_confidence": record.confidence,
             "confidence_kind": "not_evaluated", "binding_revision": int(binding.get("revision", 0)),
             "content_digest": record.content_digest}

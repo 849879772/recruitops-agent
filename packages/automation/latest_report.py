@@ -37,7 +37,9 @@ def _redact_diagnostic(value: str | None, settings) -> str | None:
 
 def summarize(result: dict, execution_id: str, *, settings=None) -> dict:
     daily = result.get("daily_sync") or {}
-    pipeline = daily.get("pipeline") or {}
+    raw_pipeline = daily.get("pipeline") or {}
+    # The runtime may replace crawl-only scoring totals after scoring saved JDs.
+    pipeline = {**raw_pipeline, **result}
     discovery = daily.get("discovery") or {}
     companies = pipeline.get("companies") or []
     counts = Counter()
@@ -47,17 +49,33 @@ def summarize(result: dict, execution_id: str, *, settings=None) -> dict:
         if status == "complete" and company.get("detail_failure_count", 0):
             status = "partial"
         counts[status] += 1
-    succeeded = result.get("status") == "completed"
-    partial = counts["partial"] or counts["failed"] or pipeline.get("scoring_failed", 0)
+    statuses = {
+        receipt.get(key)
+        for receipt in (result, daily, raw_pipeline)
+        for key in ("status", "sync_status")
+        if isinstance(receipt.get(key), str)
+    }
+    fatal_status = next((status for status in ("failed", "failure", "blocked", "configuration_required")
+                         if status in statuses), None)
+    succeeded = result.get("status") in {"completed", "partial", "degraded"} and not fatal_status
+    partial = (
+        statuses & {"partial", "degraded"}
+        or counts["partial"] or counts["failed"]
+        or pipeline.get("scoring_failed", 0) or pipeline.get("failed_jobs", 0)
+        or pipeline.get("source_partial", False)
+    )
+    warnings = list(dict.fromkeys([*(daily.get("warnings") or []), *(result.get("warnings") or [])]))
+    write_statistics = result.get("write_statistics") or {}
+    job_writes = pipeline.get("job_write_statistics") or {}
     # Early guards return diagnostics before a daily_sync payload exists.
-    error = daily.get("error") or result.get("error")
+    error = daily.get("error") or result.get("error") or raw_pipeline.get("error")
     if not succeeded:
-        error = error or result.get("message") or f"全量任务执行失败（状态：{result.get('status') or 'unknown'}）"
+        error = error or result.get("message") or f"全量任务执行失败（状态：{fatal_status or result.get('status') or 'unknown'}）"
         if result.get("missing"):
             error = f"{error}\n缺少配置项：{'、'.join(result['missing'])}"
     return {
         "execution_id": execution_id,
-        "status": ("partial" if partial or result.get("sync_status") == "degraded" else "succeeded") if succeeded else "failed",
+        "status": ("partial" if partial else "succeeded") if succeeded else "failed",
         "source_status": result.get("status"),
         "message": _redact_diagnostic(result.get("message"), settings),
         "missing": result.get("missing", []),
@@ -79,11 +97,15 @@ def summarize(result: dict, execution_id: str, *, settings=None) -> dict:
         "filtered_jobs": pipeline.get("filtered"),
         "new_jobs": pipeline.get("new"),
         "reused_jobs": pipeline.get("reused"),
+        "updated_jobs": write_statistics.get("job_snapshot_update_count", job_writes.get("updated_count")),
         "detail_success": sum(c.get("detail_success_count", 0) for c in companies),
         "detail_failed": sum(c.get("detail_failure_count", 0) for c in companies),
+        "failed_jobs": pipeline.get("failed_jobs"),
+        "scoring_candidates": pipeline.get("scoring_candidates"),
         "scored_jobs": pipeline.get("scored"),
         "scoring_failed": pipeline.get("scoring_failed"),
         "unscored_jobs": pipeline.get("unscored"),
         "failure_reasons": pipeline.get("failure_reasons", {}),
+        "warnings": [_redact_diagnostic(warning, settings) for warning in warnings],
         "error": _redact_diagnostic(error, settings),
     }

@@ -21,12 +21,11 @@ def _single_observation(**overrides: object) -> ObserveApplicationStatusPageInpu
     return ObserveApplicationStatusPageInput(**values)
 
 
-def test_batch_status_review_is_dom_only() -> None:
+def test_batch_status_review_allows_bounded_fallback_and_explicit_opt_out() -> None:
     request = BatchObserveApplicationStatusInput(application_ids=["24"])
 
-    assert request.include_vision is False
-    with pytest.raises(ValidationError):
-        BatchObserveApplicationStatusInput(application_ids=["24"], include_vision=True)
+    assert request.include_vision is True
+    assert BatchObserveApplicationStatusInput(application_ids=["24"], include_vision=False).include_vision is False
 
 
 def test_individual_vision_requires_an_explicit_fallback_judgment() -> None:
@@ -57,16 +56,16 @@ def test_individual_vision_uses_a_cumulative_default_timeout() -> None:
     assert _single_observation().timeout_ms == 45_000
 
 
-def test_scheduled_application_review_explicitly_prohibits_vision() -> None:
+def test_scheduled_application_review_uses_bounded_service_fallback() -> None:
     prompt = CodexAutomationExecutor._prompt(SimpleNamespace(
         task_id="application_progress",
         target_id="24",
         target_label="示例公司 / 软件开发工程师",
     ))
 
-    assert "include_vision=false" in prompt
-    assert "禁止调用视觉分析" in prompt
-    assert "include_vision=true" not in prompt
+    assert "有界文本和截图兜底" in prompt
+    assert "登录墙、验证码、空白页不截图" in prompt
+    assert "不要另外反复调用模型或截图" in prompt
 
 
 def test_mcp_descriptions_expose_the_two_step_vision_policy() -> None:
@@ -74,4 +73,4 @@ def test_mcp_descriptions_expose_the_two_step_vision_policy() -> None:
 
     assert "Start with include_vision=false" in definitions["observe_application_status_page"].description
     assert "vision_fallback_reason" in definitions["observe_application_status_page"].description
-    assert "never starts vision analysis" in definitions["batch_observe_application_status"].description
+    assert "optional visual fallback" in definitions["batch_observe_application_status"].description

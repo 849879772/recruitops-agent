@@ -69,7 +69,8 @@ def test_failed_refresh_does_not_replace_a_successful_cache(monkeypatch) -> None
     assert calls == [1, 1]
 
 
-def test_competing_refresh_returns_bounded_explicit_failure(monkeypatch) -> None:
+@pytest.mark.parametrize("force", [False, True])
+def test_competing_refresh_returns_bounded_explicit_failure(monkeypatch, force) -> None:
     freshness.clear_freshness_cache()
     started = Event()
     release = Event()
@@ -93,7 +94,7 @@ def test_competing_refresh_returns_bounded_explicit_failure(monkeypatch) -> None
     assert started.wait(timeout=1)
 
     began = monotonic()
-    competing = freshness.ensure_mail_fresh(settings, store)
+    competing = freshness.ensure_mail_fresh(settings, store, force=force)
     elapsed = monotonic() - began
 
     assert elapsed < 0.25

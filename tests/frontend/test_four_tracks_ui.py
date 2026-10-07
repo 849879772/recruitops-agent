@@ -10,6 +10,7 @@ from playwright.sync_api import expect, sync_playwright
 
 
 WEB = Path(__file__).resolve().parents[2] / "apps" / "web"
+THREAD = "four-tracks-fixture-chat"
 
 
 @pytest.mark.parametrize("width", [1440, 390])
@@ -27,11 +28,16 @@ def test_application_browse_progress_and_human_mail_binding(width, tmp_path):
         "application_id": None, "received_at": "2026-09-24T00:00:00Z"}
     progress = {"runs": [
         {"run_id": "mail-run-fixture", "task_kind": "recruitment_mail", "status": "running",
+         "thread_id": THREAD, "turn_id": "mail-turn-fixture",
          "phase": "analysis", "completed": 2, "total": 5, "failed": 1, "blocked": 0, "unit": "封"},
         {"run_id": "review-run-fixture", "task_kind": "application_review", "status": "running",
+         "thread_id": THREAD, "turn_id": "review-turn-fixture",
          "phase": "reviewing", "completed": 3, "total": 53, "failed": 0, "blocked": 2, "unit": "条"},
         {"run_id": "old-completed-fixture", "task_kind": "recruitment_mail", "status": "completed",
+         "thread_id": THREAD, "turn_id": "completed-turn-fixture",
          "phase": "completed", "completed": 999, "total": 999, "unit": "封"},
+        {"run_id": "unowned-running-fixture", "task_kind": "application_review", "status": "running",
+         "phase": "reviewing", "completed": 123, "total": 234, "unit": "条"},
     ]}
     configuration = {"settings": {"llm_enabled": False, "codex_runtime_enabled": False,
             "mail_enabled": False, "mail_imap_port": 993, "mail_imap_mailbox": "INBOX"},
@@ -76,13 +82,14 @@ def test_application_browse_progress_and_human_mail_binding(width, tmp_path):
             return route.fulfill(json={"items": [mail], "total": 1, "freshness": {"status": "cached"}})
         if url.path == "/api/recruitment-mails/mail-fixture/binding-candidates":
             return route.fulfill(json={"record_id": mail["id"], "content_digest": mail["content_digest"],
+                "subject": mail["subject"], "excerpt": "合成面试通知内容，用于离线关联测试。",
                 "binding_revision": mail["binding_revision"], "current_application_id": mail["application_id"],
                 "requires_user_confirmation": True, "candidates": [{"application_id": "app-52",
                     "company_name": "合成公司052", "job_title": "离线岗位052", "reason": "manual_selection"}], "total": 1})
         if url.path == "/api/recruitment-mails/mail-fixture/binding-proposals":
             assert request.method == "POST" and request.headers["x-recruitops-local-ui"] == "1"
             body = json.loads(request.post_data)
-            assert body == {"record_id": "mail-fixture", "application_id": "app-52", "action": "bind",
+            assert body == {"record_id": "mail-fixture", "application_id": "app-52", "application_ids": ["app-52"], "action": "bind",
                             "content_digest": "a" * 64, "binding_revision": 0}
             preview = {"before": {"subject": mail["subject"], "sender": mail["sender"]},
                        "after": {"action": "bind", "company_name": "合成公司052", "job_title": "离线岗位052"}}
@@ -113,6 +120,9 @@ def test_application_browse_progress_and_human_mail_binding(width, tmp_path):
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(channel=os.environ.get("RECRUITOPS_TEST_BROWSER_CHANNEL") or None)
         context = browser.new_context(viewport={"width": width, "height": 1000}, service_workers="block")
+        # A persisted selected chat remains identifiable while the runtime is
+        # offline. Global unowned receipts must not be claimed by this chat.
+        context.add_init_script(f"localStorage.setItem('recruitops.assistant.codex_thread_id', {json.dumps(THREAD)})")
         context.route("**/*", route_request)
         page = context.new_page()
         page.on("pageerror", lambda error: errors.append(str(error)))
@@ -125,14 +135,11 @@ def test_application_browse_progress_and_human_mail_binding(width, tmp_path):
 
         navigate("applications")
         expect(page.locator("#application-stage-filter")).to_have_count(0)
-        expect(page.locator(".application-card")).to_have_count(74)
-        expect(page.locator("#application-page-description")).to_have_text("共 106 条 · 已显示 74 条")
+        expect(page.locator(".application-card")).to_have_count(106)
+        expect(page.locator("#application-page-description")).to_have_text("共 106 条 · 已显示 106 条")
         expect(page.locator(".kanban-column--written .application-card")).to_have_count(3)
         expect(page.locator(".kanban-column--interview .application-card")).to_have_count(1)
         expect(page.locator(".kanban-column--closed .application-card")).to_have_count(20)
-        page.locator('[data-application-more="applied"]').click()
-        expect(page.locator(".application-card")).to_have_count(106)
-        expect(page.locator("#application-page-description")).to_have_text("共 106 条 · 已显示 106 条")
         expect(page.locator('[data-application-more="applied"]')).to_have_count(0)
         page.locator("#application-search").fill("离线岗位052")
         expect(page.locator(".application-card")).to_have_count(1)
@@ -142,7 +149,7 @@ def test_application_browse_progress_and_human_mail_binding(width, tmp_path):
         page.locator("#application-search").fill("没有此岗位")
         expect(page.locator("#application-kanban")).to_contain_text("没有匹配的投递记录")
         page.locator('#application-filter-form button[type="reset"]').click()
-        expect(page.locator(".application-card")).to_have_count(74)
+        expect(page.locator(".application-card")).to_have_count(106)
         expect(page.locator(".kanban-column--written .application-card")).to_have_count(3)
         expect(page.locator(".kanban-column--interview .application-card")).to_have_count(1)
         expect(page.locator(".kanban-column--closed .application-card")).to_have_count(20)
@@ -156,11 +163,14 @@ def test_application_browse_progress_and_human_mail_binding(width, tmp_path):
         expect(page.locator("#assistant-more-task-progress")).to_contain_text("官网投递状态复核")
         expect(page.locator("#assistant-more-task-progress")).to_contain_text("已处理 3 / 53 条")
         expect(page.locator("#assistant-more-task-progress .assistant-task-progress")).to_have_count(1)
+        expect(page.locator("#assistant-task-progress")).to_have_attribute("data-thread-id", THREAD)
+        expect(page.locator("#assistant-more-task-progress .assistant-task-progress")).to_have_attribute("data-thread-id", THREAD)
         expect(page.locator("#assistant-view")).not_to_contain_text("999")
+        expect(page.locator("#assistant-view")).not_to_contain_text("123 / 234")
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         progress_capture = tmp_path / f"task-progress-{width}.png"
         page.screenshot(path=str(progress_capture), animations="disabled")
-        progress["runs"] = [progress["runs"][2]]
+        progress["runs"] = [progress["runs"][2], progress["runs"][3]]
         navigate("applications")
         navigate("assistant")
         expect(page.locator("#assistant-task-progress")).to_be_hidden()
@@ -170,13 +180,12 @@ def test_application_browse_progress_and_human_mail_binding(width, tmp_path):
         expect(page.locator("#mail-list")).to_contain_text("待确认投递")
         expect(page.locator("#mail-list")).not_to_contain_text("0%")
         page.get_by_role("button", name="关联投递", exact=True).click()
-        expect(page.locator("#job-detail-dialog")).to_be_visible()
-        page.get_by_role("button", name="选择并查看确认预览", exact=True).click()
-        dialog = page.locator("#job-detail-dialog")
-        expect(dialog).to_contain_text("邮件：合成面试邀请")
-        expect(dialog).to_contain_text("发件人：fixture@example.test")
-        expect(dialog).to_contain_text("关联到：合成公司052 · 离线岗位052")
-        expect(dialog).to_contain_text("不会直接更改投递阶段")
+        dialog = page.locator("#mail-binding-dialog")
+        expect(dialog).to_be_visible()
+        expect(dialog).to_contain_text("合成面试邀请")
+        expect(dialog).to_contain_text("合成公司052 · 离线岗位052")
+        dialog.get_by_role("radio").first.check()
+        expect(dialog).to_contain_text("仅保存这封邮件与投递的对应关系")
         assert not any(path.endswith(("/approve", "/execute")) for _, path, _, _ in calls)
         assert mail["application_id"] is None
         binding_capture = tmp_path / f"mail-binding-{width}.png"

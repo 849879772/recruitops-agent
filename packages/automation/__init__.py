@@ -1,4 +1,5 @@
 from .service import (
+    AutomationRunningError,
     AutomationStore,
     ClaimedAutomation,
     DEFAULT_TIMEZONE,
@@ -9,6 +10,7 @@ from .service import (
 from .worker import AutomationRunResult, LocalAutomationWorker
 
 __all__ = [
+    "AutomationRunningError",
     "AutomationRunResult",
     "AutomationStore",
     "ClaimedAutomation",

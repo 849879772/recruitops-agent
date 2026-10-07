@@ -32,7 +32,12 @@ async function launch(extra = {}) {
   // Deliberately do not inherit credentials or application configuration.
   const env = Object.fromEntries(['SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'COMSPEC', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE'].filter(key => process.env[key]).map(key => [key, process.env[key]]));
   desktop = await electron.launch({ args: [path.resolve(__dirname, '..')], env: { ...env, RECRUITOPS_DESKTOP_DATA_DIR: profile, RECRUITOPS_DESKTOP_TEST: '1', RECRUITOPS_DESKTOP_FIXTURE_ORIGIN: origin, ...extra } });
-  const shell = await desktop.firstWindow(); await shell.waitForLoadState(); return shell;
+  const shell = await desktop.firstWindow(); await shell.waitForLoadState();
+  // firstWindow may observe the initial about:blank before async session
+  // recovery finishes. The real shell is loaded only after recovery and IPC.
+  await shell.waitForURL(require('node:url').pathToFileURL(path.resolve(__dirname,'../renderer/index.html')).href);
+  await shell.waitForFunction(() => typeof window.desktop?.state === 'function');
+  return shell;
 }
 async function invoke(shell, value) { return shell.evaluate(value => window.desktop.command(value), value); }
 async function sitePage() {
@@ -62,6 +67,27 @@ async function rendererWindow(width=1280,height=720,zoom=1) {
   await expect.poll(()=>page.evaluate(()=>innerWidth)).toBeGreaterThanOrEqual(Math.floor(width/zoom)-1);return page;
 }
 async function updateRenderer(page,change) {await page.evaluate(change);await page.evaluate(()=>window.fixtureRender(structuredClone(window.fixtureState)));}
+
+test('startup explains migration checks, timed backups, verification and backup failures',async()=>{
+  const page=await rendererWindow();
+  await updateRenderer(page,()=>{
+    window.fixtureState.active=null;window.fixtureState.workbenchRequested=true;
+    window.fixtureState.runtime={status:'starting',stage:'migration_check'};
+  });
+  await expect(page.locator('#startup-message')).toContainText('正在检查是否需要升级数据库');
+  await updateRenderer(page,()=>{window.fixtureState.runtime={status:'starting',stage:'backup',elapsedSeconds:65.8};});
+  await expect(page.locator('#startup-message')).toContainText('正在备份本地数据（已用时 65 秒）');
+  await expect(page.locator('#api-status')).toHaveText('正在备份本地数据（已用时 65 秒）');
+  await updateRenderer(page,()=>{window.fixtureState.runtime={status:'starting',stage:'backup_verify'};});
+  await expect(page.locator('#startup-message')).toContainText('正在验证数据库备份');
+  await expect(page.locator('#startup-message')).not.toContainText('65 秒');
+  await updateRenderer(page,()=>{window.fixtureState.runtime={status:'failed',stage:'backup',code:'backup_timeout',elapsedSeconds:600};});
+  await expect(page.locator('#startup-error')).toBeVisible();
+  await expect(page.locator('#startup-error-message')).toContainText('数据库备份超时，升级尚未执行');
+  await expect(page.locator('#api-status')).toContainText('backup_timeout');
+  await updateRenderer(page,()=>{window.fixtureState.runtime={status:'failed',stage:'backup_verify',code:'backup_verify_failed'};});
+  await expect(page.locator('#startup-error-message')).toContainText('数据库备份验证失败，升级尚未执行');
+});
 
 test('T07 renderer preserves full profile, dirty edits and save failures with versioned payload',async()=>{
   const page=await rendererWindow();
@@ -331,15 +357,27 @@ test('real window, isolated tabs, navigation, popup, upload and non-stealing bac
 });
 test('persistent dedicated login, local-network blocking and renderer IPC isolation', async () => {
   let shell = await launch();
+  expect((await shell.evaluate(() => window.desktop.state())).browser.sessionPersistence.code).toBe('ready');
   await invoke(shell, { action: 'open', url: origin + '/jobs' });
   let page = await sitePage(); await page.waitForLoadState();
   await page.evaluate(() => localStorage.setItem('fixture-login', 'anonymous'));
-  await desktop.evaluate(async ({ session }) => { const s = session.fromPartition('persist:recruitment'); s.flushStorageData(); await s.cookies.flushStore(); });
+  // No test-side flush: exercising the production exit/recovery path is the
+  // regression for session cookies disappearing across real app processes.
+  await desktop.evaluate(async ({ session }, origin) => {
+    const s = session.fromPartition('persist:recruitment');
+    await s.cookies.set({ url: origin, name: 'restart-session', value: 'synthetic-only', httpOnly: true, sameSite: 'strict' });
+    await s.cookies.set({ url: origin, name: 'restart-persistent', value: 'native', expirationDate: Date.now()/1000+600 });
+  }, origin);
   await desktop.close(); desktop = undefined;
   shell = await launch();
   await invoke(shell, { action: 'open', url: origin + '/jobs' });
   const site = await sitePage(); await site.waitForLoadState();
   expect(await site.evaluate(() => localStorage.getItem('fixture-login'))).toBe('anonymous');
+  const restoredCookies = await desktop.evaluate(({session})=>session.fromPartition('persist:recruitment').cookies.get({}));
+  expect(restoredCookies.find(c=>c.name==='restart-session')).toMatchObject({value:'synthetic-only',session:true,httpOnly:true,sameSite:'strict'});
+  expect(restoredCookies.find(c=>c.name==='restart-persistent')).toMatchObject({value:'native',session:false});
+  const encrypted = readFileSync(path.join(profile,'recruitment-session/state.bin'));
+  expect(encrypted.includes(Buffer.from('synthetic-only'))).toBe(false);
   await expect(invoke(shell, { action: 'open', url: 'http://127.0.0.1:8012' })).rejects.toThrow();
   const requestResult = await site.evaluate(async () => { try { await fetch('http://127.0.0.1:5433'); return 'allowed'; } catch { return 'blocked'; } });
   expect(requestResult).toBe('blocked');
@@ -358,12 +396,54 @@ test('persistent dedicated login, local-network blocking and renderer IPC isolat
   expect(cookies.some(cookie => cookie.name === 'unrelated')).toBe(true);
   await invoke(shell, { action: 'close', id: 1 });
   expect((await shell.evaluate(() => window.desktop.state())).tabs).toHaveLength(0);
+  await desktop.close();desktop=undefined;
+  shell=await launch();
+  const afterLogout=await desktop.evaluate(({session})=>session.fromPartition('persist:recruitment').cookies.get({}));
+  expect(afterLogout.some(c=>['nested','restart-session','restart-persistent'].includes(c.name))).toBe(false);
+  expect(afterLogout.some(c=>c.name==='unrelated')).toBe(true);
 });
 test('invalid API configuration stays offline and load failure is explicit', async () => {
   const shell = await launch({ RECRUITOPS_DESKTOP_API_ORIGIN: 'http://127.0.0.1:8012' });
   await expect(shell.locator('#configuration-error')).toContainText('Only an owned runtime');
   await invoke(shell, { action: 'open', url: origin + '/offline' });
   await expect.poll(async () => (await shell.evaluate(() => window.desktop.state())).tabs[0].error).toContain('Page load failed');
+});
+
+test('debounced session recovery survives an abrupt process exit without a quit flush', async () => {
+  const shell = await launch();
+  expect((await shell.evaluate(() => window.desktop.state())).browser.sessionPersistence.code).toBe('ready');
+  await desktop.evaluate(async({session},origin)=>{
+    await session.fromPartition('persist:recruitment').cookies.set({url:origin,name:'abrupt-session',value:'anonymous-crash-fixture',httpOnly:true});
+  },origin);
+  // start() writes an empty recovery file, so existence and a fixed delay do
+  // not prove this new entry survived debounce. Read only our anonymous
+  // fixture through native encryption and return a boolean, never its value.
+  await expect.poll(async()=>{
+    let bytes;
+    try {
+      bytes=Array.from(readFileSync(path.join(profile,'recruitment-session/state.bin')));
+    } catch (error) { if(error.code==='ENOENT') return false; throw error; }
+    return await desktop.evaluate(({safeStorage},bytes)=>{
+      try {
+        const entries=JSON.parse(safeStorage.decryptString(Buffer.from(bytes))).cookies;
+        return entries.some(entry=>entry.cookie.name==='abrupt-session');
+      } catch { throw new Error('fixture_session_recovery_decode_failed'); }
+    },bytes);
+  }).toBe(true);
+  const {pid,directory}=await desktop.evaluate(({app})=>({pid:process.pid,directory:app.getPath('userData')}));
+  expect(path.resolve(directory)).toBe(path.resolve(profile));
+  const launcher=desktop.process();
+  const exited=new Promise(resolve=>launcher.once('exit',resolve));
+  if(os.platform()==='win32') {
+    // Playwright uses a cmd launcher on Windows. Killing that shell alone
+    // leaves Electron holding the profile lock; kill this verified fixture PID.
+    const {execFile}=require('node:child_process');
+    await new Promise((resolve,reject)=>execFile('taskkill',['/PID',String(pid),'/T','/F'],{windowsHide:true},error=>error?reject(error):resolve()));
+  } else global.process.kill(pid,'SIGKILL');
+  await exited;desktop=undefined;
+  await launch();
+  const recovered=await desktop.evaluate(({session})=>session.fromPartition('persist:recruitment').cookies.get({}));
+  expect(recovered.find(c=>c.name==='abrupt-session')).toMatchObject({value:'anonymous-crash-fixture',httpOnly:true,session:true});
 });
 
 test('single instance and close-to-tray preserve the first window', async () => {

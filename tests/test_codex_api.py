@@ -58,7 +58,8 @@ class FakeCodexService:
 
     async def turn_start(self, thread_id: str, text: str):
         assert thread_id == "thread-1"
-        assert text == "hello"
+        assert text.startswith("hello\n\n[本轮页面上下文")
+        assert '"thread_id": "thread-1"' in text
         return {"id": "turn-1"}
 
     async def turn_interrupt(self, thread_id: str, turn_id: str):
@@ -174,7 +175,7 @@ def test_codex_thread_read_retries_unmaterialized_thread_without_turns(monkeypat
         response = client.get("/api/codex/threads/thread-1")
 
     assert response.status_code == 200
-    assert response.json() == {"id": "thread-1"}
+    assert response.json() == {"id": "thread-1", "turns": [], "history_status": "not_materialized"}
     assert service.include_turns_calls == [True, False]
 
 

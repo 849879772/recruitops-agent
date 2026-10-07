@@ -53,7 +53,7 @@ def _application(
     )
 
 
-def test_review_plan_deduplicates_pages_and_reports_missing_urls() -> None:
+def test_review_plan_deduplicates_pages_and_excludes_mail_only() -> None:
     repository = ApplicationRepository(
         [
             _application("1", "C++ 开发工程师"),
@@ -73,7 +73,22 @@ def test_review_plan_deduplicates_pages_and_reports_missing_urls() -> None:
     assert response.data.pages_total == 1
     assert len(response.data.targets[0].applications) == 2
     assert response.data.targets[0].normalized_url == "https://ats.example.com/applications"
-    assert response.data.unresolved[0].reason == "record_url_missing_or_invalid"
+    assert response.data.unresolved == []
+    assert response.data.excluded_mail_only == 1
+    assert response.data.excluded[0].application_id == "3"
+
+
+def test_review_plan_all_mail_only_is_a_successful_skip_not_a_failure() -> None:
+    applications = [_application("1", "软件工程师", record_url=None),
+                    _application("2", "算法工程师", record_url="mailto:jobs@example.test")]
+    response = application_status_review(
+        ApplicationStatusReviewInput(review_id="mail-only"), ApplicationRepository(applications)
+    )
+    assert response.success and response.error_code is None
+    assert response.data.targets == [] and response.data.pages_total == 0
+    assert response.data.excluded_mail_only == 2
+    assert response.data.unresolved == [] and response.data.proposals == []
+    assert all(application.stage == ApplicationStage.APPLIED for application in applications)
 
 
 def test_review_reconciles_multi_job_page_and_builds_forward_only_preview() -> None:

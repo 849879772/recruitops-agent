@@ -255,11 +255,14 @@
       const scoringReady = payload.module_readiness?.job_scoring?.ready === true;
       const mailConfigured = mailboxConfigured();
       const scheduledReady = payload.module_readiness?.scheduled_tasks?.ready === true;
+      const visionRequested = payload.configured_capabilities?.vision_enabled ?? payload.settings.vision_enabled;
+      const visionStatus = payload.settings.llm_enabled && payload.settings.vision_enabled
+        ? "已启用" : visionRequested ? "已保存，尚未生效（请应用配置或重启）" : "未启用";
       $("configuration-analysis-status").textContent = scoringReady ? "已开启" : "未就绪";
       $("configuration-mail-status").textContent = mailConfigured ? "已配置" : "可选，未配置";
       $("configuration-runtime-status").textContent = [
         ["定时任务", scheduledReady ? "已开启" : "未就绪"],
-        ["浏览器截图识别", payload.settings.llm_enabled && payload.settings.vision_enabled],
+        ["浏览器截图识别", visionStatus],
         ["邮箱", mailConfigured ? "启动时自动同步" : "未配置（可选）"],
       ].map(([label, state]) => `${label}：${typeof state === "boolean" ? state ? "已启用" : "未启用" : state}`).join(" · ");
       message("");

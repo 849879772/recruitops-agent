@@ -12,6 +12,8 @@ from dataclasses import asdict, is_dataclass
 import json
 from typing import Any
 
+from packages.domain.crawl_outcome import crawl_completion_gaps
+
 
 REPORT_SCHEMA_VERSION = "recruitops.reporting.v1"
 DEFAULT_QUANTITY_CHANGE_THRESHOLD = 0.5
@@ -301,10 +303,16 @@ def daily_pipeline_summary(pipeline_result: Any = None) -> dict[str, Any]:
         "failed_companies": failed_companies,
         "failed_jobs": failed_jobs,
         "filtered": _metric(result, "filtered", "filtered_count"),
+        "scored": _metric(result, "scored"),
+        "scoring_failed": _metric(result, "scoring_failed"),
+        "unscored": _metric(result, "unscored"),
     }
     status = _text(result.get("status"))
     if not status:
         status = "dry_run" if result.get("dry_run") is True else "completed"
+    gaps = crawl_completion_gaps(result)
+    if gaps and status in {"completed", "succeeded", "success"}:
+        status = "partial"
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "report_type": "daily_pipeline_summary",
@@ -314,6 +322,8 @@ def daily_pipeline_summary(pipeline_result: Any = None) -> dict[str, Any]:
         "dry_run": bool(result.get("dry_run", False)),
         "written": bool(result.get("written", False)),
         "counts": counts,
+        "completion_warnings": gaps,
+        "job_write_statistics": dict(result.get("job_write_statistics") or {}),
         "skipped_companies": sorted(
             _text(item) for item in (result.get("skipped_companies") or []) if _text(item)
         ),

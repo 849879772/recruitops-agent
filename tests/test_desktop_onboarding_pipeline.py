@@ -300,7 +300,8 @@ def test_explicit_completion_does_not_hot_activate_or_auto_complete(owner, monke
         "schema": 1, "instance_id": instance, "first_run_complete": True}
     assert helper_calls == ["validate", "complete"]
     read = client.post(url + "/read", headers=headers).json()
-    assert read["configured_capabilities"]["llm_enabled"] is False
+    # Saved form choices are separate from the still-masked running capability.
+    assert read["configured_capabilities"]["llm_enabled"] is True
     assert read["settings"]["llm_enabled"] is False and read["restart_required"]
     monkeypatch.setenv("RECRUITOPS_DESKTOP_CAPABILITIES", '{"llm_enabled":true}')
     get_settings.cache_clear()  # Simulates new owned child environment, no actual restart.

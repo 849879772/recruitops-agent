@@ -91,15 +91,14 @@ def test_human_binding_overrides_names_and_model_target_but_never_applies_to_b()
         assert session.get(ApplicationSnapshot, "b").stage == "applied"
 
 
-def test_confirmation_does_not_skip_sender_authentication():
+def test_confirmed_binding_can_update_without_sender_authentication():
     store, record, apps, proposal, repo, registry, executor = setup_binding(auth=False)
     confirm(store, record, registry, executor)
     result = update_application_status(ApplicationStatusUpdateInput(application_id="a", evidence_type="mail",
         evidence_id=record.id, target_status="interview1"), repo, store)
-    assert not result.success
-    assert store.get(record.id).processing_status == "needs_auth_metadata"
+    assert result.success and result.data.wrote
     with store.storage.session() as session:
-        assert session.get(ApplicationSnapshot, "a").stage == "applied"
+        assert session.get(ApplicationSnapshot, "a").stage == "interview1"
 
 
 def test_unbinding_revokes_old_identity_without_text_fallback_and_old_approval_replay():
@@ -204,7 +203,7 @@ def test_unassessed_and_analyzed_mail_do_not_present_legacy_zero_as_confidence()
     assert _summary(store.get(record.id)).analysis_state == "unassessed"
 
 
-@pytest.mark.parametrize("state,label", [("failed_terminal", "分析或核验失败"), ("needs_auth_metadata", "发件人待核验"),
+@pytest.mark.parametrize("state,label", [("failed_terminal", "分析或核验失败"), ("needs_auth_metadata", "待重新处理"),
                                           ("ambiguous_application", "待确认投递")])
 def test_terminal_states_have_explicit_labels(state, label):
     store, record, apps, proposal, repo, registry, executor = setup_binding()

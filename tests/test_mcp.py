@@ -115,9 +115,9 @@ def test_registers_exactly_the_read_only_tools() -> None:
         _browser_bridge_store(),
     )
 
-    assert MCP_TOOL_PROTOCOL_VERSION == "25"
-    assert len(MCP_TOOL_NAMES) == 47
-    assert len(MCP_READ_ONLY_TOOL_NAMES) == 28
+    assert MCP_TOOL_PROTOCOL_VERSION == "29"
+    assert len(MCP_TOOL_NAMES) == 51
+    assert len(MCP_READ_ONLY_TOOL_NAMES) == 30
     assert MCP_READ_ONLY_TOOL_NAMES == (
         "capabilities",
         "today_schedule",
@@ -145,8 +145,10 @@ def test_registers_exactly_the_read_only_tools() -> None:
         "daily_recruitment_sync_status",
         "background_task_status",
         "application_review_status",
+        "application_review_results",
         "recruitment_mail_run_status",
         "recruitment_mail_binding_candidates",
+        "application_identity_candidates",
     )
     assert registered == MCP_READ_ONLY_TOOL_NAMES
     assert tuple(server.tools) == MCP_READ_ONLY_TOOL_NAMES
@@ -180,6 +182,25 @@ def test_official_mcp_server_advertises_standard_safety_annotations() -> None:
     assert cancel.destructive_hint is True
 
 
+def test_review_tools_expose_retained_presentation_and_click_confirmation() -> None:
+    server = FakeMCPServer()
+    register_agent_tools(server, InMemoryRepository(), _mail_store(), _browser_bridge_store())
+
+    _, review = server.tools["batch_observe_application_status"]
+    for field in ("retained_count", "unchanged_or_retained_count", "retained_by_stage",
+                  "saved_stage", "attention_required_count", "identity_confirmation_items"):
+        assert field in review
+    assert "Retained rows remain unresolved internally and are not verified unchanged" in review
+    assert "later stages never revert" in review
+    assert "login/CAPTCHA, timeouts" in review
+    assert "never auto-approve an identity binding" in review
+    _, candidates = server.tools["application_identity_candidates"]
+    assert "do not first ask whether to list them" in candidates
+    _, proposal = server.tools["application_identity_propose"]
+    assert "user must click the approval card" in proposal
+    assert "Never auto-approve or ask users to type confirmation text" in proposal
+
+
 def test_agent_profile_exposes_business_tools_not_diagnostic_primitives() -> None:
     server = FakeMCPServer()
 
@@ -192,7 +213,7 @@ def test_agent_profile_exposes_business_tools_not_diagnostic_primitives() -> Non
 
     assert registered == MCP_AGENT_TOOL_NAMES
     assert tuple(server.tools) == MCP_AGENT_TOOL_NAMES
-    assert len(MCP_AGENT_TOOL_NAMES) == 39
+    assert len(MCP_AGENT_TOOL_NAMES) == 43
     assert {
         "search_jobs",
         "application_query",

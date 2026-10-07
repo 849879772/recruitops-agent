@@ -124,7 +124,7 @@ class CodexHomeConfig(BaseModel):
                     f"{quote(self.mcp_default_tools_approval_mode)}"
                 ),
                 "required = true",
-                "startup_timeout_sec = 20",
+                "startup_timeout_sec = 60",
                 "tool_timeout_sec = 120",
                 "",
             )

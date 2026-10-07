@@ -49,7 +49,27 @@ def grounded_time(value, source):
     return None, None
 
 
-def ensure_mail_schedule(store, record, proposal, owner, application=None):
+def mail_schedule_associations(session, rows):
+    """Load multi-job associations from their source mails in one bounded query."""
+    refs = [row.source_ref for row in rows if row.source == "recruitment_mail_schedule"]
+    if not refs:
+        return {}
+    records = session.scalars(select(RecruitmentMailRecord).where(RecruitmentMailRecord.id.in_(refs))).all()
+    from .binding import BINDING_KEY, binding_revision
+    result = {}
+    for record in records:
+        metadata = record.raw_metadata or {}
+        association = metadata.get("schedule_associations", {})
+        binding = metadata.get(BINDING_KEY, {})
+        valid = isinstance(association, dict) and association.get("content_digest", record.content_digest) == record.content_digest
+        valid = valid and (not binding or (binding.get("state") == "bound"
+            and binding.get("content_digest") == record.content_digest
+            and association.get("binding_revision", binding_revision(record)) == binding_revision(record)))
+        result[record.id] = association if valid else {"application_ids": [], "associated_jobs": []}
+    return result
+
+
+def ensure_mail_schedule(store, record, proposal, owner, application=None, *, applications=None):
     event = proposal.event_type.value
     if event not in EVENT_LABELS:
         return None
@@ -69,20 +89,46 @@ def ensure_mail_schedule(store, record, proposal, owner, application=None):
         existing = session.scalar(select(ScheduleEventSnapshot).where(
             ScheduleEventSnapshot.source == "recruitment_mail_schedule",
             ScheduleEventSnapshot.source_ref == record.id))
+        selected = applications if applications is not None else [application] if application else []
+        from .binding import BINDING_KEY, binding_revision
+        association = {"application_ids": [app.id for app in selected], "associated_jobs": [
+            {"application_id": app.id, "company_name": app.company_name, "job_title": app.job_title,
+             "stage": app.stage.value} for app in selected], "content_digest": current.content_digest,
+             "binding_revision": binding_revision(current)}
+        if selected:
+            metadata = dict(current.raw_metadata or {})
+            metadata["schedule_associations"] = association
+            current.raw_metadata = metadata
+            if existing is not None:
+                existing.application_id = selected[0].id
+                existing.company_name = selected[0].company_name
+                existing.job_title = "、".join(app.job_title for app in selected)[:512]
+        else:
+            # No verified selected target means no current schedule association.
+            # Never resurrect old associations after unbind, cleanup, or revision.
+            metadata = dict(current.raw_metadata or {})
+            metadata["schedule_associations"] = association
+            current.raw_metadata = metadata
+            if existing is not None:
+                existing.application_id = None
+                existing.job_title = proposal.job_title or ""
+                existing.application_stage = "applied"
         if existing is not None:
             return {"id": existing.id, "created": False, "status": existing.status,
-                    "time_kind": existing.time_kind, "event_date": str(existing.event_date) if existing.event_date else None}
+                    "time_kind": existing.time_kind, "event_date": str(existing.event_date) if existing.event_date else None,
+                    **association}
         label = EVENT_LABELS[event]
         company = proposal.company_name or "招聘邮件"
         item = ScheduleEventSnapshot(
             id=key, source="recruitment_mail_schedule", source_ref=record.id,
             title=f"{company} · {label}"[:512], event_type=label,
-            company_name=company, job_title=proposal.job_title or "",
-            application_id=application.id if application else None,
-            application_stage=application.stage.value if application else "applied",
+            company_name=selected[0].company_name if selected else company,
+            job_title="、".join(app.job_title for app in selected)[:512] if selected else proposal.job_title or "",
+            application_id=selected[0].id if selected else None,
+            application_stage=selected[0].stage.value if selected else "applied",
             event_date=day, event_time=clock, time_kind=kind, status="pending",
             note="请查看原邮件中的具体要求。" if day else "时间待确认，请查看原邮件或手动补充；未推算相对日期。",
         )
         session.add(item)
         return {"id": key, "created": True, "status": "pending", "time_kind": kind,
-                "event_date": day.isoformat() if day else None}
+                "event_date": day.isoformat() if day else None, **association}

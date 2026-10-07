@@ -88,6 +88,57 @@ def test_explicit_disable_survives_later_model_save(owner, monkeypatch):
     assert client.post(URL + "/read", headers=headers).json()["module_readiness"]["assistant"]["status"] == "disabled"
 
 
+def test_saved_vision_choice_survives_readback_before_runtime_restart(owner, monkeypatch):
+    client, headers, root, _ = owner
+    desktop(monkeypatch)
+    assert save(client, headers, settings={"vision_enabled": True}).status_code == 200
+    assert not get_settings().vision_enabled  # The startup authorization mask is still off.
+
+    for _ in range(2):
+        response = client.post(URL + "/read", headers=headers)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["configured_capabilities"]["vision_enabled"] is True
+        assert payload["settings"]["vision_enabled"] is False
+        assert "fixture-not-a-real-key" not in response.text
+        # This is the checkbox value the form sends on its next ordinary save.
+        assert client.post(URL + "/save", headers=headers, json={"settings": {
+            "vision_enabled": payload["configured_capabilities"]["vision_enabled"],
+        }}).status_code == 200
+
+    preferences = json.loads((root / ".data/settings/preferences.json").read_text(encoding="utf-8"))
+    assert preferences["vision_enabled"] is True
+    assert not get_settings().vision_enabled
+
+    # Simulate the owned supervisor applying the saved opt-in after onboarding.
+    from packages.desktop_runtime.capabilities import configured_capabilities
+    (root / "config/runtime-capabilities.json").write_text(json.dumps({
+        "schema": 1, "instance_id": "b" * 32, "first_run_complete": True,
+    }), encoding="utf-8")
+    mask = configured_capabilities(root, "b" * 32, writes=True)
+    monkeypatch.setenv("RECRUITOPS_DESKTOP_CAPABILITIES", json.dumps(mask))
+    get_settings.cache_clear()
+    assert get_settings().vision_enabled
+    payload = client.post(URL + "/read", headers=headers).json()
+    assert payload["configured_capabilities"]["vision_enabled"] is True
+    assert payload["settings"]["vision_enabled"] is True
+
+    # A later explicit opt-out must not be resurrected by the old startup mask.
+    assert save(client, headers, settings={"vision_enabled": False}).status_code == 200
+    assert save(client, headers).status_code == 200
+    payload = client.post(URL + "/read", headers=headers).json()
+    assert payload["configured_capabilities"]["vision_enabled"] is False
+    assert payload["settings"]["vision_enabled"] is False
+
+
+def test_unsaved_vision_is_not_shown_as_opted_in_in_desktop(owner, monkeypatch):
+    client, headers, _, _ = owner
+    desktop(monkeypatch)
+    payload = client.post(URL + "/read", headers=headers).json()
+    assert payload["configured_capabilities"]["vision_enabled"] is False
+    assert payload["settings"]["vision_enabled"] is False
+
+
 def test_non_desktop_model_save_does_not_enable_assistant(owner, monkeypatch):
     client, headers, _, _ = owner
     monkeypatch.setenv("RECRUITOPS_ENV", "test")

@@ -6,7 +6,7 @@ from threading import RLock
 from time import perf_counter
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from packages.config import get_settings
 from packages.tools.typed import EvidenceSource, ToolErrorCode, ToolInput, ToolResponse, ToolStatus
@@ -40,6 +40,15 @@ class RecruitmentMailRunStartInput(ToolInput):
     thread_id: str | None = Field(default=None, min_length=1, max_length=255)
     turn_id: str | None = Field(default=None, min_length=1, max_length=255)
     refresh: bool = True
+    retry_failed: bool = Field(default=False, description=(
+        "Only after the user explicitly requests retrying selected failed mail. Requires 1-50 record_ids; "
+        "grants one bounded processing round, never repeats successful mail or refreshes the mailbox."))
+
+    @model_validator(mode="after")
+    def bounded_explicit_retry(self):
+        if self.retry_failed and (not self.record_ids or len(self.record_ids) > 50):
+            raise ValueError("mail_retry_requires_explicit_records")
+        return self
 
 
 class RecruitmentMailRunStatusInput(ToolInput):
@@ -98,7 +107,7 @@ def mail_run_service(dependencies):
         service = getattr(store, "_mcp_mail_run_service", None)
         if service is None:
             service = MailProcessingRunService(store, dependencies.repository, get_settings(),
-                sync_mail=lambda: ensure_mail_fresh(get_settings(), store, limit=500))
+                sync_mail=lambda: ensure_mail_fresh(get_settings(), store, limit=500, force=True))
             store._mcp_mail_run_service = service
         else:
             service.settings = get_settings()
@@ -107,9 +116,15 @@ def mail_run_service(dependencies):
 
 def recruitment_mail_run_start(request, dependencies):
     started = perf_counter()
+    if not request.thread_id:
+        return _response(request, "recruitment_mail_run_start", {
+            "success": False, "reason": "mail_conversation_thread_required",
+            "next_action": "使用当前会话上下文中的 thread_id 重试；不要猜测或认领其他会话的任务。",
+        }, action=True)
     service = mail_run_service(dependencies)
     result = service.start(record_ids=request.record_ids,
-        thread_id=request.thread_id, turn_id=request.turn_id, refresh=request.refresh)
+        thread_id=request.thread_id, turn_id=request.turn_id, refresh=request.refresh,
+        **({"retry_failed": True} if request.retry_failed else {}))
     if result.get("run_id") and _mail_wait_seconds(request):
         result = service.wait(result["run_id"], timeout_seconds=_mail_wait_seconds(request))
     return _response(request, "recruitment_mail_run_start", _mail_turn_data({"run": result}), action=True).model_copy(
@@ -144,7 +159,10 @@ def _mail_wait_seconds(request):
 
 def _mail_turn_data(data):
     run = data.get("run") or {}
-    return {**data, "execution_mode": "foreground",
+    waiting = run.get("status") == "awaiting_confirmation"
+    return {**data, "execution_mode": "waiting_for_user" if waiting else "foreground",
+            **({"confirmation_required": True,
+                "next_action": "用户在当前会话关联弹窗中选择岗位。任务尚未完成；确认后系统继续原范围，不要轮询等待或要求用户输入继续。"} if waiting else {}),
             "continuation_required": run.get("status") in {"accepted", "running", "pausing", "cancelling"}}
 
 
@@ -152,6 +170,23 @@ def recruitment_mail_binding_candidates_operation(request, dependencies):
     from packages.tools.recruitment_mail import recruitment_mail_binding_candidates
 
     return recruitment_mail_binding_candidates(request, dependencies.mail_store)
+
+
+def application_identity_candidates_operation(request, dependencies):
+    from packages.tools.application_identity_binding import application_identity_candidates
+    return application_identity_candidates(request, dependencies.mail_store.storage)
+
+
+def application_identity_propose_operation(request, dependencies):
+    from packages.approval import ApprovalRegistry, SqlAlchemyApprovalPersistence
+    from packages.tools.application_identity_binding import application_identity_propose
+    store = dependencies.mail_store
+    with _SERVICE_LOCK:
+        registry = getattr(store, "_mcp_binding_approval_registry", None)
+        if registry is None:
+            registry = ApprovalRegistry(SqlAlchemyApprovalPersistence(store.storage))
+            store._mcp_binding_approval_registry = registry
+    return application_identity_propose(request, store.storage, registry)
 
 
 def recruitment_mail_binding_propose_operation(request, dependencies):

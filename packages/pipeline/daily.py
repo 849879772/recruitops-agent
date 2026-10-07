@@ -596,6 +596,7 @@ class DailyPipelineResult:
     failed_job_ids: tuple[str, ...] = ()
     rejection_reasons: Mapping[str, int] = field(default_factory=dict)
     failure_reasons: Mapping[str, int] = field(default_factory=dict)
+    job_write_statistics: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def failed_count(self) -> int:
@@ -652,6 +653,7 @@ class DailyPipelineResult:
             "failed_job_ids": list(self.failed_job_ids),
             "rejection_reasons": dict(self.rejection_reasons),
             "failure_reasons": dict(self.failure_reasons),
+            "job_write_statistics": dict(self.job_write_statistics),
             "companies": [item.to_dict() for item in self.company_results],
         }
 
@@ -1296,6 +1298,36 @@ def _title_key(company_id: Any, title: Any) -> str:
     return _text(title_key)
 
 
+def _title_first_listing_key(company_id: str, job: Any) -> tuple[str, str]:
+    """Explicit native identities keep distinct jobs with the same title."""
+
+    return (_title_key(company_id, _field(job, "title")), _native_job_identity(job))
+
+
+def _title_first_existing(
+    job: Mapping[str, Any], rows: Sequence[_ExistingSnapshot], *, allow_legacy_upgrade: bool,
+) -> _ExistingSnapshot | None:
+    native_id = _native_job_identity(job)
+    matches = [row for row in rows if not native_id or _native_job_identity(row.job) == native_id]
+    if not matches and native_id and allow_legacy_upgrade and len(rows) == 1:
+        row = rows[0]
+        if (not _native_job_identity(row.job)
+                and _compact(row.job.city).casefold() == _compact(job.get("city")).casefold()):
+            matches = [row]
+    return next((row for row in matches if not stored_detail_retry_required(row.job)),
+                matches[0] if matches else None)
+
+
+def _listing_native_ids(work: _CompanyWork) -> dict[tuple[str, str], set[str]]:
+    result: dict[tuple[str, str], set[str]] = {}
+    for job in work.accepted_jobs:
+        native_id = _native_job_identity(job)
+        if native_id:
+            key = (_title_key(work.company.id, job.get("title")), _compact(job.get("city")).casefold())
+            result.setdefault(key, set()).add(native_id)
+    return result
+
+
 def _screen_title(job: Mapping[str, Any], profile: Any) -> Any:
     """Run the title-only policy; the fallback exists only during staged integration."""
 
@@ -1889,6 +1921,8 @@ class DailyRecruitmentPipeline:
         self.stop_requested = stop_requested
         self.company_batch_limit = company_batch_limit
         self.clock = clock
+        self._inserted_job_companies: dict[str, str] = {}
+        self._written_job_ids: set[str] = set()
 
     def _check_stop(self) -> None:
         if self.stop_requested is not None and self.stop_requested.is_set():
@@ -2680,6 +2714,8 @@ class DailyRecruitmentPipeline:
         """Run the shared title-first capture policy for one daily pass."""
 
         self._check_stop()
+        self._inserted_job_companies.clear()
+        self._written_job_ids.clear()
         if not dry_run and self.storage is None:
             raise PipelineError("storage is required unless dry_run=True")
 
@@ -2824,23 +2860,21 @@ class DailyRecruitmentPipeline:
                 reason_code="company_batch_limit_reached",
             )
         works = sorted(works, key=lambda item: item.company.id)
+        # List rows may already have committed during crawl. Read stable IDs
+        # across sources, while remembering which rows this invocation inserted.
+        existing_by_id = self._read_existing(
+            job.get("id") for work in works for job in work.accepted_jobs
+            if bool(getattr(_screen_title(job, self.profile), "eligible", False))
+        )
+        for rows in existing_by_company.values():
+            for row in rows:
+                existing_by_id.setdefault(row.job.id, row)
         existing_by_title: dict[tuple[str, str], list[_ExistingSnapshot]] = {}
-        existing_by_key: dict[tuple[str, str], _ExistingSnapshot] = {}
         for company_id, rows in existing_by_company.items():
             for row in rows:
                 title_key = _title_key(company_id, row.job.title)
                 if title_key:
                     existing_by_title.setdefault((company_id, title_key), []).append(row)
-        for title_key, rows in existing_by_title.items():
-            existing_by_key[title_key] = next(
-                (
-                    row
-                    for row in rows
-                    if not stored_detail_retry_required(row.job)
-                ),
-                rows[0],
-            )
-
         metrics: dict[str, Counter[str]] = {
             work.company.id: Counter() for work in works
         }
@@ -2864,20 +2898,45 @@ class DailyRecruitmentPipeline:
         restored_detail_ids: dict[str, set[str]] = {
             work.company.id: set() for work in works
         }
+        candidates_by_id: dict[str, _TitleFirstCandidate] = {}
+        shared_candidates: list[tuple[_CompanyWork, _TitleFirstCandidate, str]] = []
+        scored_candidate_ids: set[str] = set()
 
         for work in works:
             company_id = work.company.id
-            seen_title_keys: set[str] = set()
+            seen_listing_keys: set[tuple[str, str]] = set()
+            listing_native_ids = _listing_native_ids(work)
             for job in sorted(
                 work.accepted_jobs,
                 key=lambda item: (_title_key(company_id, item.get("title")), _compact(item.get("id"))),
             ):
                 title_key = _title_key(company_id, job.get("title"))
-                if not title_key or title_key in seen_title_keys:
+                listing_key = _title_first_listing_key(company_id, job)
+                if not title_key or listing_key in seen_listing_keys:
                     continue
-                seen_title_keys.add(title_key)
-                existing = existing_by_key.get((company_id, title_key))
+                seen_listing_keys.add(listing_key)
+                job_id = _compact(job.get("id"))
+                shared = candidates_by_id.get(job_id)
+                if shared is not None:
+                    metrics[company_id]["reused"] += 1
+                    shared_candidates.append((work, shared, title_key))
+                    continue
+                existing = existing_by_id.get(job_id)
+                if job_id in self._inserted_job_companies:
+                    existing = None
+                elif existing is None:
+                    existing = _title_first_existing(
+                        job, existing_by_title.get((company_id, title_key), ()),
+                        allow_legacy_upgrade=len(listing_native_ids.get(
+                            (title_key, _compact(job.get("city")).casefold()), (),
+                        )) <= 1,
+                    )
                 if existing is not None:
+                    shared = candidates_by_id.get(existing.job.id)
+                    if shared is not None:
+                        metrics[company_id]["reused"] += 1
+                        shared_candidates.append((work, shared, title_key))
+                        continue
                     if not stored_detail_retry_required(existing.job):
                         stored_screening = _screen_title(_snapshot_job_payload(existing.job), self.profile)
                         if not bool(getattr(stored_screening, "eligible", False)):
@@ -2913,6 +2972,7 @@ class DailyRecruitmentPipeline:
                                     detail_retry=True,
                                 )
                             )
+                            candidates_by_id[existing.job.id] = candidates[-1]
                     else:
                         resolved_detail_titles[company_id].add(title_key)
                         if self.resume_from_checkpoint and (
@@ -2935,6 +2995,9 @@ class DailyRecruitmentPipeline:
                         ):
                             screening = _screen_title(job, self.profile)
                             if bool(getattr(screening, "eligible", False)):
+                                if existing.job.id in scored_candidate_ids:
+                                    continue
+                                scored_candidate_ids.add(existing.job.id)
                                 resume_candidates.append(
                                     _TitleFirstCandidate(
                                         work=work,
@@ -2967,6 +3030,7 @@ class DailyRecruitmentPipeline:
                     screening=screening,
                 )
                 candidates.append(candidate)
+                candidates_by_id[job_id] = candidate
                 new_ids.append(_compact(job.get("id")))
                 metrics[company_id]["new"] += 1
 
@@ -2982,6 +3046,8 @@ class DailyRecruitmentPipeline:
                         and _existing_scope_matches(existing.job, work.company, work)
                     ):
                         inactive_ids.append(existing.job.id)
+
+        predicted_insert_ids = set(new_ids)
 
         def persist_details(batch: Sequence[_TitleFirstCandidate]) -> None:
             nonlocal written
@@ -3052,6 +3118,23 @@ class DailyRecruitmentPipeline:
                         candidate.title_key
                     )
 
+        for work, candidate, title_key in shared_candidates:
+            if screen_title_job(candidate.job, self.profile).eligible:
+                if _capture_status(candidate.job.get("capture_status")) == "failed":
+                    work.detail_failure_count += 1
+                    reason = _compact(candidate.job.get("capture_failure_reason")) or "detail_capture_failed"
+                    work.detail_failure_reasons[reason] += 1
+                else:
+                    work.detail_success_count += 1
+                    resolved_detail_titles[work.company.id].add(title_key)
+                work.jd_results.append({
+                    "job_id": _compact(candidate.job.get("id")),
+                    "status": candidate.job.get("capture_status"),
+                    "failure_reason": candidate.job.get("capture_failure_reason") or "",
+                    "detail_url": candidate.job.get("detail_url"),
+                    "detail_reuse": {"basis": "same_stable_job_id", "owner_company_id": candidate.work.company.id},
+                })
+
         unresolved_detail_titles: dict[str, set[str]] = {}
         for work in works:
             company_id = work.company.id
@@ -3099,6 +3182,15 @@ class DailyRecruitmentPipeline:
             inactive_ids=inactive_ids,
             dry_run=dry_run,
         ) or written
+
+        if not dry_run and self.storage is not None:
+            new_ids = sorted(self._inserted_job_companies)
+            for company_id, counts in metrics.items():
+                counts["new"] = sum(owner == company_id for owner in self._inserted_job_companies.values())
+        else:
+            # Eligible listings would be inserted before JD-based exclusions.
+            # Keep the prediction consistent with that durable admission policy.
+            new_ids = sorted(predicted_insert_ids)
 
         # Source bookkeeping must not gate durable jobs or pending score markers.
         # Let errors propagate after persistence, never report a successful run.
@@ -3229,7 +3321,7 @@ class DailyRecruitmentPipeline:
 
         company_results: list[CompanyRunResult] = []
         failed_company_count = 0
-        failed_job_count = len(failed_ids)
+        failed_job_count = len(set(failed_ids))
         filtered_count = sum(item["filtered"] for item in metrics.values())
         for work in works:
             company_id = work.company.id
@@ -3289,7 +3381,7 @@ class DailyRecruitmentPipeline:
             selected_companies=len(selected),
             crawled_companies=sum(not bool(work.failure_reason) for work in works),
             skipped_companies=skipped,
-            new_count=len(new_ids),
+            new_count=len(set(new_ids)),
             changed_count=0,
             reused_count=len(set(reused_ids)),
             rejected_count=len(rejected_ids),
@@ -3315,6 +3407,7 @@ class DailyRecruitmentPipeline:
             failed_job_ids=tuple(sorted(set(failed_ids))),
             rejection_reasons=dict(rejection_reasons),
             failure_reasons=dict(failure_reasons),
+            job_write_statistics=self._title_first_write_statistics(new_ids, dry_run=dry_run),
         )
 
     def _register_title_first_source(
@@ -3690,7 +3783,7 @@ class DailyRecruitmentPipeline:
             capture_evidence = dict(getattr(previous, "capture_evidence", {}) or {})
         return Job(
             id=previous.id if previous is not None else _compact(job.get("id")),
-            company_id=candidate.work.company.id,
+            company_id=previous.company_id if previous is not None else candidate.work.company.id,
             title=_text(previous.title if previous is not None else job.get("title")),
             city=(previous.city if previous is not None else _text(job.get("city")) or None),
             detail_url=detail_url,
@@ -3729,19 +3822,16 @@ class DailyRecruitmentPipeline:
                 or None
             ),
             source_platform=(
-                previous.source_platform
-                if previous is not None
-                else candidate.work.company.crawler_key or None
+                (previous.source_platform if previous is not None else None)
+                or candidate.work.company.crawler_key or None
             ),
             source_tenant=(
-                previous.source_tenant
-                if previous is not None
-                else _compact(candidate.work.company.extra.get("source_identity")) or None
+                (previous.source_tenant if previous is not None else None)
+                or _compact(candidate.work.company.extra.get("source_identity")) or None
             ),
             native_job_id=(
-                previous.native_job_id
-                if previous is not None
-                else _compact(
+                (previous.native_job_id if previous is not None else None)
+                or _compact(
                     job.get("native_job_id")
                     or job.get("source_job_id")
                     or job.get("native_id")
@@ -3750,14 +3840,12 @@ class DailyRecruitmentPipeline:
                 or None
             ),
             normalized_detail_url=(
-                previous.normalized_detail_url
-                if previous is not None
-                else _compact(job.get("normalized_detail_url")) or None
+                (previous.normalized_detail_url if previous is not None else None)
+                or _compact(job.get("normalized_detail_url")) or None
             ),
             business_key=(
-                previous.business_key
-                if previous is not None
-                else _compact(job.get("business_key")) or None
+                (previous.business_key if previous is not None else None)
+                or _compact(job.get("business_key")) or None
             ),
             created_at=previous.created_at if previous is not None else now,
             updated_at=(
@@ -3789,8 +3877,8 @@ class DailyRecruitmentPipeline:
         availability_status: str,
         title_key: str,
         preserve_existing_score: bool = False,
-    ) -> None:
-        upsert_job_snapshot(
+    ) -> bool:
+        return bool(upsert_job_snapshot(
             session,
             model,
             capture_status=capture_status,
@@ -3798,7 +3886,9 @@ class DailyRecruitmentPipeline:
             availability_status=availability_status,
             title_key=title_key,
             preserve_existing_score=preserve_existing_score,
-        )
+            return_inserted=True,
+            preserve_existing_identity=True,
+        ))
 
     def _persist_title_first(
         self,
@@ -3837,20 +3927,25 @@ class DailyRecruitmentPipeline:
         # is intentionally updating its score; keep one row per write scope.
         if scored_candidates:
             candidates = list(scored_candidates)
+        inserted: dict[str, str] = {}
+        written_ids: set[str] = set()
         with self.storage.write_transaction() as session:
             for company in company_models:
                 upsert_company_snapshot(session, company)
             for existing in existing_updates:
-                session.execute(
+                receipt = session.execute(
                     update(JobSnapshot).where(JobSnapshot.id == existing.job.id).values(
                         last_seen_at=now, availability_status="active",
                         updated_at=JobSnapshot.updated_at,
                     )
                 )
+                if receipt.rowcount:
+                    written_ids.add(existing.job.id)
             for job_id in dict.fromkeys(_compact(item) for item in inactive_ids if _compact(item)):
                 row = session.get(JobSnapshot, job_id)
-                if row is not None and hasattr(row, "availability_status"):
+                if row is not None and hasattr(row, "availability_status") and row.availability_status != "inactive":
                     row.availability_status = "inactive"
+                    written_ids.add(job_id)
             # Flush ORM metadata before SQL upserts so onupdate cannot overwrite
             # the repaired job's timestamp during the final transaction flush.
             session.flush()
@@ -3865,7 +3960,21 @@ class DailyRecruitmentPipeline:
                         # A concurrent capture may have completed after the
                         # pre-run read. Exclusions only change provisional rows.
                         continue
-                    preserved = {"created_at": stored.created_at, "first_seen_at": stored.first_seen_at}
+                    preserved = {
+                        "created_at": stored.created_at, "first_seen_at": stored.first_seen_at,
+                        "company_id": stored.company_id, "title": stored.title, "city": stored.city,
+                        "organization_id": stored.organization_id,
+                        "recruitment_unit_id": stored.recruitment_unit_id,
+                        "recruitment_campaign_id": stored.recruitment_campaign_id,
+                        "source_platform": stored.source_platform, "source_tenant": stored.source_tenant,
+                        "native_job_id": stored.native_job_id, "business_key": stored.business_key,
+                        "normalized_detail_url": stored.normalized_detail_url,
+                    }
+                    for name in ("source_platform", "source_tenant", "native_job_id", "business_key", "normalized_detail_url"):
+                        if not getattr(stored, name):
+                            preserved[name] = getattr(model, name)
+                    if stored.company_id != candidate.work.company.id:
+                        preserved.update(source=stored.source, source_ref=stored.source_ref)
                     if _upsert_status != "complete" and _stored_capture_status(stored) == "complete":
                         preserved.update(
                             jd_raw=stored.jd_raw, detail_url=stored.detail_url,
@@ -3879,7 +3988,7 @@ class DailyRecruitmentPipeline:
                         stored_analysis = session.get(JobAnalysisSnapshot, model.id)
                         if _existing_score_is_valid(_ExistingSnapshot(stored, stored_analysis)):
                             analysis = None
-                self._upsert_title_first_job(
+                was_inserted = self._upsert_title_first_job(
                     session,
                     model,
                     capture_status=_upsert_status,
@@ -3891,23 +4000,65 @@ class DailyRecruitmentPipeline:
                         or analysis.analysis_status in {"pending", "failed", "refused"}
                     ),
                 )
+                written_ids.add(model.id)
+                if was_inserted:
+                    inserted[model.id] = model.company_id
                 if analysis is not None:
                     upsert_job_analysis_snapshot(session, model, analysis)
+        # Publish receipts only after the transaction's context committed.
+        self._inserted_job_companies.update(inserted)
+        self._written_job_ids.update(written_ids)
         return True
+
+    def _title_first_write_statistics(self, predicted_ids: Sequence[str], *, dry_run: bool) -> dict[str, Any]:
+        counts: Counter[str] = Counter()
+        inactive_count = 0
+        if not dry_run and self.storage is not None:
+            for row in self._read_existing(self._inserted_job_companies).values():
+                status = _stored_capture_status(row.job)
+                counts[status if status in {"complete", "failed"} else "pending"] += 1
+                inactive_count += _stored_availability_status(row.job) == "inactive"
+        return {
+            "inserted_count": len(self._inserted_job_companies),
+            "updated_count": len(self._written_job_ids - self._inserted_job_companies.keys()),
+            "unique_written_count": len(self._written_job_ids),
+            "new_complete_count": counts["complete"],
+            "new_pending_count": counts["pending"],
+            "new_failed_count": counts["failed"],
+            "new_inactive_count": inactive_count,
+            "predicted_insert_count": len(set(predicted_ids)) if dry_run or self.storage is None else None,
+            "basis": "predicted_unique_candidates" if dry_run or self.storage is None else "committed_insert_receipts",
+            "dry_run": dry_run,
+        }
 
     def _persist_title_first_listing(
         self, work: _CompanyWork, existing: Sequence[_ExistingSnapshot], *, dry_run: bool,
     ) -> bool:
         """Admit a company's eligible list rows before recording list completion."""
 
-        seen = {_title_key(work.company.id, item.job.title) for item in existing}
+        seen = {_title_first_listing_key(work.company.id, item.job) for item in existing}
+        known_titles = {_title_key(work.company.id, item.job.title) for item in existing}
+        existing_by_title: dict[str, list[_ExistingSnapshot]] = {}
+        for item in existing:
+            existing_by_title.setdefault(_title_key(work.company.id, item.job.title), []).append(item)
+        native_ids = _listing_native_ids(work)
         pending: list[_TitleFirstCandidate] = []
         written = False
         for job in sorted(work.accepted_jobs, key=lambda row: (_title_key(work.company.id, row.get("title")), _compact(row.get("id")))):
             title_key = _title_key(work.company.id, job.get("title"))
-            if not title_key or title_key in seen:
+            listing_key = _title_first_listing_key(work.company.id, job)
+            previous = _title_first_existing(
+                job, existing_by_title.get(title_key, ()),
+                allow_legacy_upgrade=len(native_ids.get(
+                    (title_key, _compact(job.get("city")).casefold()), (),
+                )) <= 1,
+            )
+            if (not title_key or listing_key in seen
+                    or (not listing_key[1] and title_key in known_titles)
+                    or previous is not None):
                 continue
-            seen.add(title_key)
+            seen.add(listing_key)
+            known_titles.add(title_key)
             screening = _screen_title(job, self.profile)
             if not bool(getattr(screening, "eligible", False)):
                 continue
@@ -4881,13 +5032,19 @@ class DailyRecruitmentPipeline:
         ids = sorted({_compact(item) for item in job_ids if _compact(item)})
         if not ids or self.storage is None:
             return {}
+        jobs: list[JobSnapshot] = []
+        analyses: list[JobAnalysisSnapshot] = []
         with self.storage.session() as session:
-            jobs = list(session.scalars(select(JobSnapshot).where(JobSnapshot.id.in_(ids))))
-            analyses = list(
-                session.scalars(
-                    select(JobAnalysisSnapshot).where(JobAnalysisSnapshot.job_id.in_(ids))
-                )
-            )
+            # A full source snapshot can exceed PostgreSQL's bind-parameter
+            # limit. Keep the cross-source identity lookup bounded.
+            for offset in range(0, len(ids), 500):
+                batch = ids[offset:offset + 500]
+                rows = list(session.scalars(select(JobSnapshot).where(JobSnapshot.id.in_(batch))))
+                jobs.extend(rows)
+                if rows:
+                    analyses.extend(session.scalars(
+                        select(JobAnalysisSnapshot).where(JobAnalysisSnapshot.job_id.in_([row.id for row in rows]))
+                    ))
         analyses_by_id = {row.job_id: row for row in analyses}
         return {
             row.id: _ExistingSnapshot(job=row, analysis=analyses_by_id.get(row.id))

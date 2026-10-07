@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine, URL, make_url
 
 # Keep the documented direct-script invocation working before an editable install.
@@ -49,6 +49,12 @@ class MigrationResult:
     @property
     def applied_versions(self) -> tuple[int, ...]:
         return tuple(int(name.split("_", 1)[0]) for name in self.applied)
+
+
+@dataclass(frozen=True)
+class MigrationPlan:
+    pending: tuple[str, ...]
+    applied: tuple[str, ...]
 
 
 def _guard_database_target(database: Engine | str | URL) -> None:
@@ -249,6 +255,68 @@ def _create_ledger(engine: Engine) -> None:
         )
 
 
+def _inspect_migrations(engine: Engine, migrations: tuple[MigrationFile, ...]) -> MigrationPlan:
+    """Validate every recorded migration without creating or changing the ledger."""
+
+    try:
+        with engine.connect() as connection:
+            if not inspect(connection).has_table("schema_migrations"):
+                return MigrationPlan(
+                    pending=tuple(migration.name for migration in migrations), applied=()
+                )
+            rows = connection.execute(
+                text("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
+            ).mappings().all()
+        by_version = {migration.version: migration for migration in migrations}
+        applied_versions: set[int] = set()
+        for row in rows:
+            version = row["version"]
+            migration = by_version.get(version)
+            if migration is None:
+                raise MigrationError(
+                    f"applied migration version {version} is missing from this package"
+                )
+            if row["name"] != migration.name or row["checksum"] != migration.checksum:
+                raise MigrationError(f"migration ledger mismatch for version {version}")
+            applied_versions.add(version)
+        return MigrationPlan(
+            pending=tuple(item.name for item in migrations if item.version not in applied_versions),
+            applied=tuple(item.name for item in migrations if item.version in applied_versions),
+        )
+    except MigrationError:
+        raise
+    except Exception as exc:
+        # Driver exceptions can contain a connection URL; expose only a safe reason.
+        raise MigrationError("unable to inspect migration ledger") from exc
+
+
+def check_migrations(
+    database: Engine | str | URL,
+    migrations_dir: Path | str = DEFAULT_MIGRATIONS_DIR,
+) -> MigrationPlan:
+    """Return pending/applied migrations without running SQL migrations or DDL."""
+
+    _guard_database_target(database)
+    migrations = discover_migrations(migrations_dir)
+    owns_engine = not isinstance(database, Engine)
+    engine = create_storage_engine(database) if owns_engine else database
+    try:
+        # Opening a missing SQLite file would itself create a database. Inspection
+        # must not have that side effect, even though desktop instances use PostgreSQL.
+        if (engine.dialect.name == "sqlite" and engine.url.database
+                and engine.url.database != ":memory:"
+                and not engine.url.query.get("uri")
+                and not Path(engine.url.database).is_file()):
+            raise MigrationError("migration inspection requires an existing database")
+        if (engine.dialect.name == "sqlite" and engine.url.query.get("uri")
+                and engine.url.query.get("mode") not in {"ro", "memory"}):
+            raise MigrationError("SQLite URI inspection requires read-only or memory mode")
+        return _inspect_migrations(engine, migrations)
+    finally:
+        if owns_engine:
+            engine.dispose()
+
+
 def _apply_one(engine: Engine, migration: MigrationFile) -> bool:
     """Apply one migration and its ledger row in the same transaction."""
 
@@ -301,6 +369,9 @@ def apply_migrations(
     applied: list[str] = []
     skipped: list[str] = []
     try:
+        # Reject drift anywhere in the ledger before executing an earlier pending
+        # migration or creating the ledger. This also rejects accidental downgrades.
+        _inspect_migrations(engine, migrations)
         _create_ledger(engine)
         for migration in migrations:
             if _apply_one(engine, migration):
@@ -328,11 +399,27 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=DEFAULT_MIGRATIONS_DIR,
     )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Inspect without applying migrations; exit 10 when migrations are pending",
+    )
     args = parser.parse_args(argv)
     try:
+        if args.check_only:
+            plan = check_migrations(args.database_url, args.migrations_dir)
+            print(
+                f"migration check complete: pending={len(plan.pending)} "
+                f"applied={len(plan.applied)}"
+            )
+            return 10 if plan.pending else 0
         result = apply_migrations(args.database_url, args.migrations_dir)
     except MigrationError as exc:
         print(f"migration failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        # Connection/setup failures may contain credentials in driver diagnostics.
+        print("migration failed: unable to access migration database", file=sys.stderr)
         return 1
 
     print(
@@ -349,8 +436,10 @@ if __name__ == "__main__":
 __all__ = [
     "MigrationError",
     "MigrationFile",
+    "MigrationPlan",
     "MigrationResult",
     "apply_migrations",
+    "check_migrations",
     "discover_migrations",
     "main",
     "run_migrations",

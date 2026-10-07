@@ -41,9 +41,15 @@ def parsed_model_evidence(record, payload: dict) -> ParsedRecruitmentEmail:
 
 def model_application_matches(record, payload, application):
     parsed = parsed_model_evidence(record, payload)
-    from .binding import confirmed_binding_matches
+    from .binding import confirmed_binding_matches, bound_application_ids, binding_scope
     confirmed = confirmed_binding_matches(record, application)
     if confirmed is not None:
+        if confirmed and len(bound_application_ids(record)) > 1:
+            # A human multi-selection does not make role-specific evidence
+            # applicable to every selected application.
+            proposal = MailAnalysisProposal.model_validate(payload)
+            return bool(binding_scope(record, payload)["allows_multiple"]
+                        and company_names_match(proposal.company_name or "", application.company_name))
         return confirmed
     if mail_matches_application(parsed, application):
         return True

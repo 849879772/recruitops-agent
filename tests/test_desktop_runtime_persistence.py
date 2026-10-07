@@ -28,6 +28,7 @@ def test_restart_keeps_database_password_identity_and_unique_backups(tmp_path, b
     marker = first.layout.data / "pgdata/fixture-data"
     marker.write_text("keep")
     password, identity = first.env["PGPASSWORD"], first.events.instance_id
+    first.backup()
     first.stop()
     calls = len(tree.calls)
     second = reopen(first, tree)
@@ -38,7 +39,9 @@ def test_restart_keeps_database_password_identity_and_unique_backups(tmp_path, b
         assert second.env["PGPASSWORD"] == password
         assert marker.read_text() == "keep"
         assert not any("initdb" in call[0][0] for call in tree.calls[calls:])
+        second.backup()
         assert len(list((first.layout.data / "backups").glob("*.dump"))) == 2
+        assert not list((first.layout.data / "backups").glob("pre-migration-*.dump"))
         assert password not in (first.layout.data / "instance.json").read_text()
         assert password not in stream.getvalue()
     finally:

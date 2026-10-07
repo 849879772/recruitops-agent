@@ -106,11 +106,12 @@ def test_identity_gate_pauses_before_observation(page, html):
     "<main>查询投递记录 技术面试</main>",
     "<main>简历 手机号 邮箱<input type='tel'><input type='email'></main>",
     "<main>发送验证码 手机号<input autocomplete='one-time-code'></main>",
+    "<main>请勿向他人透露验证码</main>",
     f"<main>查询投递记录 技术面试</main><div hidden>{DJI_TEXT}</div>",
     f"<main>查询投递记录 技术面试</main><div style='display:none'>{DJI_TEXT}</div>",
     f"<main>{'岗位介绍 ' * 200}<footer>{DJI_TEXT}</footer></main>",
 ], ids=["resume-contact", "code-help", "identity-help", "prompt-only", "path-only",
-        "contact-inputs", "otp-alone", "hidden", "display-none", "footer-help"])
+        "contact-inputs", "otp-alone", "code-warning", "hidden", "display-none", "footer-help"])
 def test_non_gates_on_same_dji_path_are_not_login(page, html):
     set_body(page, html)
     response = observe(page)
@@ -123,9 +124,9 @@ def test_non_gates_on_same_dji_path_are_not_login(page, html):
     "<div data-sitekey='fixture'>Challenge</div>",
     "<div data-recruitops-auth='captcha'>Challenge</div>",
     "<p>安全检查 请完成安全验证</p>",
-    "<input name='captcha'><p>验证码</p>",
-    "<input placeholder='验证码'>",
-], ids=["captcha-marker", "sitekey", "auth-marker", "challenge-text", "captcha-input", "legacy-code-input"])
+    "<input name='captcha'><p>请输入图形验证码</p>",
+    "<input placeholder='验证码'><p>请完成人机验证</p>",
+], ids=["captcha-marker", "sitekey", "auth-marker", "challenge-text", "graphic-code-input", "human-code-input"])
 def test_captcha_keeps_priority_over_identity_gate(page, challenge):
     set_body(page, DJI_HTML + challenge)
     response = observe(page)
@@ -133,12 +134,19 @@ def test_captcha_keeps_priority_over_identity_gate(page, challenge):
     assert response["state"]["resumeAction"] == "resume_after_captcha"
 
 
+@pytest.mark.parametrize("code_control", ["<input id='captcha'>", "<input name='captcha'>", "<input placeholder='验证码'>"])
+def test_sms_code_field_name_does_not_turn_identity_gate_into_human_challenge(page, code_control):
+    set_body(page, DJI_HTML + code_control)
+    response = observe(page)
+    assert_pause(response, "login_required")
+    assert page.evaluate("__effects") == []
+
+
 @pytest.mark.parametrize(("html", "reason"), [
     ("<main>请先登录</main>", "login_required"),
     ("<input type='password'>", "login_required"),
     ("<div role='dialog'>确认当前页面</div>", "state_unclear"),
     ("<input type='password'><div data-captcha>Challenge</div>", "captcha_required"),
-    ("<main>请勿向他人透露验证码</main>", "captcha_required"),
 ])
 def test_existing_pause_rules_are_preserved(page, html, reason):
     set_body(page, html)

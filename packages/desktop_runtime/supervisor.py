@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import stat
 import time
 import urllib.request
 from pathlib import Path
@@ -38,10 +39,11 @@ class Supervisor:
     def __init__(self, bundle, layout, repository, events, *, tree_factory=WindowsTree,
                  probe=None, sleep=time.sleep, clock=time.monotonic, timeout=30,
                  instance_factory=Instance, recover=False, enable_writes_for_instance=None,
-                 desktop=False):
+                 desktop=False, backup_timeout=600):
         self.bundle, self.layout, self.repository, self.events = bundle, layout, repository, events
         self.tree_factory, self.probe, self.sleep, self.clock = tree_factory, probe, sleep, clock
         self.timeout = timeout
+        self.backup_timeout = backup_timeout
         self.tree = self.lock = None
         self.leases = []
         self.services = {}
@@ -58,19 +60,48 @@ class Supervisor:
         self.failed = False
         self.stopped = False
         self.capabilities = {}
+        self.incomplete_backups = set()
+        self.current_backup = None
 
     def command(self, name, *args):
         return [str(self.bundle.resource(name)), *map(str, args)]
 
-    def run_step(self, stage, argv, *, output=None):
+    def run_step(self, stage, argv, *, output=None, timeout=None, success_codes=(0,), progress=False):
         self.stage = stage
         fields = {"log": str(Path(output).relative_to(self.layout.data)).replace("\\", "/")} if output else {}
-        self.events.emit("starting", stage, **fields)
+        self.events.emit("starting", stage, elapsed_seconds=0, **fields)
+        started = self.clock()
+        limit = self.timeout if timeout is None else timeout
         child = self.tree.spawn(argv, self.layout.data, self.env, output=output)
-        exit_code = child.wait(self.timeout)
-        if exit_code != 0:
+        try:
+            if progress:
+                next_progress = started + 5
+                while (exit_code := child.poll()) is None:
+                    self.check_children()
+                    now = self.clock()
+                    if now - started >= limit:
+                        raise RuntimeFailure("process_timeout")
+                    if now >= next_progress:
+                        self.events.emit("progress", stage, elapsed_seconds=round(now - started, 1))
+                        next_progress = now + 5
+                    self.sleep(0.2)
+            else:
+                exit_code = child.wait(limit)
+        except RuntimeFailure as exc:
+            if exc.code != "process_timeout":
+                raise
+            # Reap the owned handle before a failed backup can be removed.
+            try:
+                child.terminate()
+                child.wait(5)
+            except RuntimeFailure:
+                pass  # stop() still owns and closes the entire process tree.
+            self.events.emit("timed_out", stage, elapsed_seconds=round(self.clock() - started, 1))
+            raise RuntimeFailure(f"{stage}_timeout") from exc
+        if exit_code not in success_codes:
             raise RuntimeFailure(f"{stage}_failed", exit_code=exit_code)
-        self.events.emit("completed", stage)
+        self.events.emit("completed", stage, elapsed_seconds=round(self.clock() - started, 1))
+        return exit_code
 
     def db_ready(self):
         expected = (self.layout.data / "pgdata").resolve().as_posix().replace("'", "''")
@@ -145,6 +176,9 @@ class Supervisor:
             self.events.emit("opened", "instance", fresh=fresh,
                              recovered=bool(getattr(candidate, "recovered", False)))
             self.layout.prepare()
+            # The instance lock excludes another supervisor; these are leftovers
+            # from processes owned by an earlier, already-closed Windows job.
+            self.cleanup_partial_backups()
             self.tree = self.tree_factory()
             db = PortLease()
             self.leases.append(db)
@@ -190,10 +224,21 @@ class Supervisor:
             self.events.emit("starting", self.stage, log="logs/postgres.log")
             self.services["database"] = self.tree.spawn(self.command("postgres", "-D", pgdata, "-h", "127.0.0.1", "-p", db.port, "-c", f"data_directory={pgdata}", "-c", "unix_socket_directories=", "-c", "password_encryption=scram-sha-256"), self.layout.data, self.env, output=database_log)
             self.await_ready("database")
-            # Preserve a logical recovery point before any application migration.
-            self.backup("pre-migration")
-            self.instance.save("migrating")
-            self.run_step("migration", self.command("python", "-s", "-B", self.bundle.resource("migration_script"), "--migrations-dir", self.bundle.root / "app/migrations"))
+            migration = self.command("python", "-s", "-B", self.bundle.resource("migration_script"),
+                                     "--migrations-dir", self.bundle.root / "app/migrations")
+            pending = self.run_step("migration_check", [*migration, "--check-only"],
+                                    output=self.layout.data / "logs/migration-check.log", success_codes=(0, 10)) == 10
+            if pending:
+                # Only a newly initialized cluster is known to contain no user data.
+                # An existing database without a migration ledger still needs backup.
+                if not fresh:
+                    self.backup("pre-migration")
+                self.instance.save("migrating")
+                self.run_step("migration", migration, timeout=max(120, self.timeout),
+                              output=self.layout.data / "logs/migration.log")
+            else:
+                self.events.emit("skipped", "migration", reason="up_to_date")
+            self.prune_automatic_backups()
             self.check_children()
             api.close()
             self.stage = "api"
@@ -215,17 +260,87 @@ class Supervisor:
             raise
 
     def backup(self, label="manual"):
+        if label not in {"manual", "pre-migration"}:
+            raise RuntimeFailure("invalid_backup_label")
         self.check_children()
         previous = self.stage
         name = f"{label}-{self.events.run_id}-{secrets.token_hex(4)}.dump"
         target = self.layout.data / "backups" / name
         partial = target.with_suffix(".partial")
-        self.run_step("backup", self.command("pg_dump", "-w", "-Fc", "-f", partial))
+        self.incomplete_backups.add(partial)
+        self.run_step("backup", self.command("pg_dump", "-w", "-Fc", "-f", partial),
+                      output=self.layout.data / "logs/backup.log", timeout=self.backup_timeout, progress=True)
         if not partial.is_file() or not partial.stat().st_size:
             raise RuntimeFailure("backup_empty")
+        self.verify_backup(partial)
         partial.replace(target)
+        self.incomplete_backups.discard(partial)
+        self.current_backup = target
         self.events.emit("saved", "backup", filename=name)
+        if label == "pre-migration":
+            self.prune_automatic_backups(verified=target)
         self.stage = previous
+
+    def verify_backup(self, path):
+        # This validates the archive catalogue, not a full restore of its data.
+        self.run_step("backup_verify", self.command("pg_restore", "--list", path),
+                      output=self.layout.data / "logs/backup-verify.log", timeout=max(30, self.timeout))
+
+    def backup_files(self, pattern):
+        directory = self.layout.data / "backups"
+        files = []
+        for path in directory.iterdir():
+            if not re.fullmatch(pattern, path.name):
+                continue
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                continue
+            files.append((path, info.st_mtime_ns))
+        return [path for path, _ in sorted(files, key=lambda item: (item[1], item[0].name), reverse=True)]
+
+    def remove_backup_files(self, paths):
+        removed = 0
+        for path in paths:
+            try:
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    continue
+                path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError:
+                self.events.emit("warning", "backup_cleanup", code="backup_cleanup_deferred")
+        if removed:
+            self.events.emit("cleaned", "backup_cleanup", removed=removed)
+
+    def cleanup_partial_backups(self):
+        try:
+            paths = self.backup_files(r"(?:pre-migration|manual)-[0-9a-f]{32}-[0-9a-f]{8}\.partial")
+            self.remove_backup_files(paths)
+        except OSError:
+            self.events.emit("warning", "backup_cleanup", code="backup_cleanup_deferred")
+
+    def prune_automatic_backups(self, *, verified=None):
+        previous = self.stage
+        try:
+            files = self.backup_files(r"pre-migration-[0-9a-f]{32}-[0-9a-f]{8}\.dump")
+            verified = verified or self.current_backup
+            if verified in files:
+                files.remove(verified)
+                files.insert(0, verified)
+            if len(files) <= 3:
+                return
+            # Validate all retained recovery points before pruning legacy backups.
+            # A corrupt recent archive must never cause deletion of older good ones.
+            for path in files[:3]:
+                if path != verified:
+                    self.verify_backup(path)
+            self.remove_backup_files(files[3:])
+        except (RuntimeFailure, OSError):
+            self.events.emit("warning", "backup_cleanup", code="backup_retention_deferred")
+        finally:
+            self.stage = previous
 
     def tick(self):
         now = self.clock()
@@ -265,6 +380,8 @@ class Supervisor:
                 finally:
                     try:
                         tree.close()
+                        self.remove_backup_files(self.incomplete_backups)
+                        self.incomplete_backups.clear()
                     except RuntimeFailure:
                         graceful = False
                         raise

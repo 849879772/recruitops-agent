@@ -35,21 +35,21 @@
 
 ### 1. 下载桌面版
 
-当前可用版本为 RecruitOps v0.1.6，请下载 `RecruitOps-v0.1.6.zip`：
+当前稳定版为 RecruitOps v0.1.7（2026-10-07），请下载 `RecruitOps-v0.1.7.zip`：
 
-- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.6)
-- [Gitee v0.1.6 更新说明](https://gitee.com/zs-k/recruitops-agent/blob/main/docs/RELEASE_v0.1.6.md)（完整压缩包请从 GitHub 或 123 云盘下载）
-- [123 云盘](https://1835739780.share.123pan.cn/123pan/QbN4Td-Aa02d)（含压缩包和 SHA-256 校验文件，无提取码）
+- [GitHub Releases](https://github.com/849879772/recruitops-agent/releases/tag/v0.1.7)
+- [Gitee v0.1.7 更新说明](https://gitee.com/zs-k/recruitops-agent/blob/main/docs/RELEASE_v0.1.7.md)
+- 123 云盘下载链接：上传完成后同步。
 
-安装包大小约 704 MB。下载完成后可按需核对 SHA-256：
+下载完成后可按需核对 SHA-256：
 
 ```text
-6518E892E0C6D3E8847A34A773EB8262BCE39A0009F58DFE5F6AFE4C16BBCCF2
+6045928839A2D31B56F8AD1B32868B14C675321A0935937F374522350EFEE030
 ```
 
 如果旧版已经爬取到岗位，或已有投递记录、招聘邮件，请先阅读[已有数据的桌面版升级步骤](docs/UPGRADE_EXISTING_DATA.md)。不要直接把旧版 `.data` 复制到不同安装路径。
 
-本版重点改进来源刷新容错、长任务成果保存、抓取效率，以及全量任务结束后的自动汇报；模型连接改为仅支持 DeepSeek 官方接口。完整范围与限制见 [v0.1.6 更新说明](docs/RELEASE_v0.1.6.md)。
+本版重点完善官网页面与截图证据复核、岗位对应关系人工确认、邮件识别重试与多岗位测评关联、定时任务启动与部分成果汇报，并优化登录保留、启动备份和投递看板。完整范围与限制见 [v0.1.7 更新说明](docs/RELEASE_v0.1.7.md)。
 
 ### 2. 完整解压
 
@@ -175,17 +175,13 @@ RecruitOps-Desktop-Preview.exe
 
 状态更新采用只升不降的优先级：已由邮件、人工或可靠官网证据确认的笔试、面试等阶段，不会因为官网只显示“已投递”“筛选中”或没有状态文本而被降级。
 
-![投递记录](docs/assets/applications.png)
-
 ### 第五步：处理邮件和日程
 
 进入 **招聘邮箱** 点击 **同步邮件**，或让求职助理处理未处理邮件。已成功处理的邮件会保存处理状态，后续同步不会重复执行同一事件；需要人工确认的邮件会保留在待确认列表。
 
 邮件中的测评、笔试和面试如果包含明确日期，会生成日程；只有截止时间但没有具体开始时间的事项会以截止提醒保存；时间不明确的事项进入待办。
 
-| 招聘邮箱 | 日程安排 |
-| --- | --- |
-| ![招聘邮箱](docs/assets/mail.png) | ![日程安排](docs/assets/schedule.png) |
+![招聘邮箱演示](docs/assets/mail.png)
 
 ### 第六步：查看公司来源和任务状态
 
@@ -214,7 +210,7 @@ RecruitOps-Desktop-Preview.exe
 
 其中包含本地数据库、配置、任务检查点和招聘网站登录状态。建议定期备份整个 `.data` 目录。
 
-若旧版已经爬取岗位，或已有投递记录、邮件等数据，必须先正常退出软件并完整备份 `.data`。新版本先解压到临时目录，随后让新程序回到旧版的**相同绝对路径**，再把整个旧 `.data` 同盘移回；使用原 Windows 用户启动。不要在软件运行时复制数据库，也不要直接覆盖正在使用的旧目录。逐步操作及回退方法见[已有数据的桌面版升级步骤](docs/UPGRADE_EXISTING_DATA.md)。
+若旧版已有岗位、投递记录或邮件等数据，必须先正常退出软件并完整备份 `.data`。新版本先解压到临时目录，随后让新程序回到旧版的**相同绝对路径**，在首次启动前完整复制旧 `.data`，再使用原 Windows 用户启动。一次只使用一个版本，不要在软件运行时复制数据库或混用新旧程序资源。仅有待应用的数据库结构迁移时才会生成自动迁移前备份；它不能代替完整 `.data` 备份。逐步操作及回退方法见[已有数据的桌面版升级步骤](docs/UPGRADE_EXISTING_DATA.md)。
 
 ## 常见问题
 

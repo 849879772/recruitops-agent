@@ -196,16 +196,17 @@ def test_browse_separates_pending_incomplete_and_excluded_without_stale_scores()
                 source="fixture", source_ref=f"analysis:{status}",
             ))
     page = repository.browse_jobs()
-    assert page.total == 4
-    assert page.stats.unscored == 3
+    assert page.total == 7
+    assert page.stats.unscored == 6
     assert page.stats.pending == 1
     assert page.stats.jd_incomplete == 1
-    assert page.stats.excluded == 0
+    assert page.stats.excluded == 3
     assert [j.id for j in repository.browse_jobs(evaluation="pending").items] == ["eligible"]
     assert [j.id for j in repository.browse_jobs(evaluation="jd_incomplete").items] == ["jd_incomplete"]
-    assert repository.browse_jobs(evaluation="excluded").total == 0
+    assert {j.id for j in repository.browse_jobs(evaluation="excluded").items} == {"direction_out", "doctorate_only", "internship"}
     assert repository.browse_jobs(evaluation="scored").total == 1
-    assert repository.browse_jobs(evaluation="unscored").total == 3
+    assert repository.browse_jobs(evaluation="unscored").total == 6
+    assert {j.id: j.analysis_status for j in page.items if j.id in statuses} == {status: status for status in statuses}
     assert all(j.match_score is None for j in page.items if j.id != "job-1")
     assert page.facets.companies[0].top_score == 88
     assert [j.id for j in page.featured] == ["job-1"]

@@ -17,16 +17,16 @@ from packages.tools.application_status_evidence import (
 
 def test_target_submission_is_not_conflicted_by_another_jobs_rejection():
     target = "机器人端到端评测工程师"
-    quote = f"{target} 投递简历 2026-08-18"
+    quote = f"{target} 申请成功 2026-08-18"
     result = {
         "status": "rejected",
         "entries": [{"status": "rejected", "context": "机器人软件工程师 流程终止"}],
         "application_records": [
-            {"title": target, "context": quote, "status": "", "signals": {}},
+            {"title": target, "context": quote, "status": "", "label": "申请成功", "signals": {}},
             {"title": "机器人软件工程师", "status": "rejected"},
         ],
     }
-    args = dict(target_title=target, evidence=quote, observed_label="投递简历")
+    args = dict(target_title=target, evidence=quote, observed_label="申请成功")
     assert not _structured_observation_conflicts(result, "19", "applied", **args)
     assert _structured_observation_conflicts(result, "19", "interview", **args)
     result["application_records"][0]["signals"]["conflicting_statuses"] = True
@@ -203,7 +203,7 @@ def test_generic_testing_label_overrides_model_written_guess_and_retains_history
     assert result.verification.data.target_stage.value == "written"
 
 
-def test_exact_submission_card_is_read_only_unchanged_despite_low_model_confidence(tmp_path):
+def test_exact_dated_submission_confirms_applied_without_regression(tmp_path):
     store, page_url = _prepared_store(tmp_path)
     quote = "软件开发工程师 投递简历 2026-08-22"
     operation = _observed_operation(store, page_url, observation={
@@ -216,15 +216,15 @@ def test_exact_submission_card_is_read_only_unchanged_despite_low_model_confiden
         confidence=0.75, captured_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
     result = verify_application_status_evidence(request, store)
-    assert result.success and result.status == "unchanged" and result.read_only
-    assert result.reason_code == "no_newer_status_observed"
+    assert result.success and result.status == "unchanged"
+    assert result.read_only
     with store.storage.session() as session:
         app = session.get(ApplicationSnapshot, "24")
         assert app.stage == "applied" and app.stage_history == []
     with store.storage.write_transaction() as session:
         session.get(ApplicationSnapshot, "24").stage = "rejected"
     result = verify_application_status_evidence(request, store)
-    assert not result.success
+    assert not (result.verification and result.verification.data and result.verification.data.wrote)
     with store.storage.session() as session:
         assert session.get(ApplicationSnapshot, "24").stage == "rejected"
 

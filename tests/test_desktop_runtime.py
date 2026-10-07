@@ -167,6 +167,7 @@ class FakeChild:
 class FakeTree:
     def __init__(self, fail=None):
         self.fail, self.calls, self.outputs, self.closed = fail, [], [], False
+        self.pending_migrations = True
 
     def spawn(self, argv, cwd, env, *, output=None):
         self.calls.append((argv, cwd, dict(env)))
@@ -176,10 +177,16 @@ class FakeTree:
             name = "backup"
         if name == "python":
             name = "api" if any("api_bootstrap" in a for a in argv) else "migration"
+            if "--check-only" in argv:
+                name = "migration_check"
         service = name in {"postgres", "api"}
         if self.fail == "spawn":
             raise RuntimeFailure("process_spawn_failed")
         result = 1 if name == self.fail else 0
+        if name == "migration_check" and not result:
+            result = 10 if self.pending_migrations else 0
+        if name == "migration" and not result:
+            self.pending_migrations = False
         if name == "initdb" and not result:
             pgdata = Path(argv[argv.index("-D") + 1])
             pgdata.mkdir()
@@ -209,7 +216,8 @@ def test_start_order_and_exit(tmp_path, bundle):
     try:
         runtime.tick()
         stages = [json.loads(line) for line in stream.getvalue().splitlines()]
-        assert [r["stage"] for r in stages if r["event"] == "starting"] == ["initdb", "database", "backup", "migration", "api"]
+        assert [r["stage"] for r in stages if r["event"] == "starting"] == ["initdb", "database", "migration_check", "migration", "api"]
+        assert not list((runtime.layout.data / "backups").glob("*.dump"))
         assert all(call[1] == runtime.layout.data for call in tree.calls)
         assert all(call[2]["RECRUITOPS_WRITE_ENABLED"] == "false" for call in tree.calls)
         assert "--auth-host=scram-sha-256" in tree.calls[0][0]
@@ -223,7 +231,7 @@ def test_start_order_and_exit(tmp_path, bundle):
     assert tree.closed
 
 
-@pytest.mark.parametrize("failure", ["initdb", "backup", "migration", "postgres", "api", "spawn", "timeout"])
+@pytest.mark.parametrize("failure", ["initdb", "migration_check", "migration", "postgres", "api", "spawn", "timeout"])
 def test_failure_stops_owned_tree_and_downstream(tmp_path, bundle, failure):
     runtime, tree, _ = supervisor_fixture(tmp_path, bundle, failure)
     with pytest.raises(RuntimeFailure):
@@ -233,6 +241,159 @@ def test_failure_stops_owned_tree_and_downstream(tmp_path, bundle, failure):
     if failure != "api":
         assert not any("api_bootstrap" in str(call[0]) for call in tree.calls)
     assert not (runtime.layout.data / "tmp/initdb-password").exists()
+
+
+def restart_fixture(runtime, tree):
+    runtime.stop()
+    stream = io.StringIO()
+    restarted = Supervisor(runtime.bundle, runtime.layout, runtime.repository, Events(stream),
+                           tree_factory=lambda: tree, probe=lambda stage: True, timeout=0)
+    return restarted, stream
+
+
+def test_current_database_restart_skips_dump_and_migration(tmp_path, bundle):
+    runtime, tree, _ = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    restarted, stream = restart_fixture(runtime, tree)
+    tree.calls.clear()
+    try:
+        restarted.start()
+        starts = [r["stage"] for r in map(json.loads, stream.getvalue().splitlines()) if r["event"] == "starting"]
+        assert starts == ["database", "migration_check", "api"]
+        assert not list((runtime.layout.data / "backups").glob("*.dump"))
+    finally:
+        restarted.stop()
+
+
+def test_existing_database_is_backed_up_and_verified_before_pending_migration(tmp_path, bundle):
+    runtime, tree, _ = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    restarted, stream = restart_fixture(runtime, tree)
+    tree.pending_migrations = True
+    try:
+        restarted.start()
+        starts = [r["stage"] for r in map(json.loads, stream.getvalue().splitlines()) if r["event"] == "starting"]
+        assert starts == ["database", "migration_check", "backup", "backup_verify", "migration", "api"]
+        assert len(list((runtime.layout.data / "backups").glob("pre-migration-*.dump"))) == 1
+        assert not list((runtime.layout.data / "backups").glob("*.partial"))
+    finally:
+        restarted.stop()
+
+
+@pytest.mark.parametrize("failure", ["backup", "pg_restore", "migration_check"])
+def test_upgrade_failure_preserves_old_backups_and_never_runs_migration(tmp_path, bundle, failure):
+    runtime, tree, _ = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    restarted, _ = restart_fixture(runtime, tree)
+    old = runtime.layout.data / "backups" / ("pre-migration-" + "a" * 32 + "-11111111.dump")
+    old.write_bytes(b"old-recovery-point")
+    tree.pending_migrations, tree.fail = True, failure
+    tree.calls.clear()
+    with pytest.raises(RuntimeFailure):
+        restarted.start()
+    assert old.read_bytes() == b"old-recovery-point"
+    assert not list((runtime.layout.data / "backups").glob("*.partial"))
+    assert not any("api_bootstrap" in str(call[0]) for call in tree.calls)
+    assert not any("apply_migrations" in str(call[0]) and "--check-only" not in call[0] for call in tree.calls)
+
+
+def backup_history(runtime, count=6):
+    directory = runtime.layout.data / "backups"
+    files = []
+    for i in range(count):
+        path = directory / f"pre-migration-{i:032x}-{i:08x}.dump"
+        path.write_bytes(b"fixture-archive")
+        os.utime(path, (100 + i, 100 + i))
+        files.append(path)
+    return files
+
+
+def test_retention_prunes_only_old_automatic_backups_after_verification(tmp_path, bundle):
+    runtime, tree, _ = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    files = backup_history(runtime)
+    manual = runtime.layout.data / "backups" / ("manual-" + "b" * 32 + "-11111111.dump")
+    manual.write_bytes(b"manual-recovery-point")
+    unrelated = runtime.layout.data / "backups/user-notes.txt"
+    unrelated.write_text("keep")
+    try:
+        runtime.prune_automatic_backups()
+        assert [p.exists() for p in files] == [False, False, False, True, True, True]
+        assert manual.exists() and unrelated.exists()
+        assert sum(Path(call[0][0]).stem == "pg_restore" for call in tree.calls) == 3
+    finally:
+        runtime.stop()
+
+
+def test_failed_retention_validation_keeps_every_existing_backup(tmp_path, bundle):
+    runtime, tree, stream = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    files = backup_history(runtime)
+    tree.fail = "pg_restore"
+    try:
+        runtime.prune_automatic_backups()
+        assert all(path.exists() for path in files)
+        assert "backup_retention_deferred" in stream.getvalue()
+        assert runtime.stage == "runtime"
+    finally:
+        runtime.stop()
+
+
+def test_new_upgrade_recovery_point_is_kept_even_if_clock_moves_backwards(tmp_path, bundle):
+    runtime, tree, _ = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    files = backup_history(runtime)
+    try:
+        runtime.current_backup = files[0]
+        runtime.prune_automatic_backups()
+        assert files[0].exists()
+        assert files[-1].exists() and files[-2].exists()
+        assert sum(path.exists() for path in files) == 3
+    finally:
+        runtime.stop()
+
+
+def test_restart_cleans_only_owned_partial_files(tmp_path, bundle):
+    runtime, tree, _ = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    directory = runtime.layout.data / "backups"
+    partials = [directory / (prefix + "a" * 32 + "-12345678.partial") for prefix in ("manual-", "pre-migration-")]
+    for path in partials:
+        path.write_bytes(b"incomplete")
+    unrelated = directory / "user-upload.partial"
+    unrelated.write_bytes(b"keep")
+    restarted, _ = restart_fixture(runtime, tree)
+    try:
+        restarted.start()
+        assert not any(path.exists() for path in partials)
+        assert unrelated.read_bytes() == b"keep"
+    finally:
+        restarted.stop()
+
+
+def test_backup_has_independent_budget_progress_and_specific_timeout(tmp_path, bundle):
+    runtime, tree, stream = supervisor_fixture(tmp_path, bundle)
+    runtime.start()
+    elapsed = [0.0]
+    runtime.clock = lambda: elapsed[0]
+    runtime.sleep = lambda _: elapsed.__setitem__(0, elapsed[0] + 1)
+    runtime.backup_timeout = 35
+    spawn = tree.spawn
+    stalled = FakeChild(service=True)
+    def stalled_dump(argv, *args, **kwargs):
+        child = spawn(argv, *args, **kwargs)
+        return stalled if Path(argv[0]).stem == "pg_dump" else child
+    tree.spawn = stalled_dump
+    try:
+        with pytest.raises(RuntimeFailure, match="backup_timeout"):
+            runtime.backup()
+        assert elapsed[0] == 35  # The ordinary step timeout is zero in this fixture.
+        assert stalled.service is False
+        progress = [r for r in map(json.loads, stream.getvalue().splitlines()) if r["event"] == "progress"]
+        assert [r["elapsed_seconds"] for r in progress] == [5, 10, 15, 20, 25, 30]
+    finally:
+        runtime.stop()
+    assert not list((runtime.layout.data / "backups").glob("*.partial"))
 
 
 def test_ready_timeout(tmp_path, bundle):

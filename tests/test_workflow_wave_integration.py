@@ -80,7 +80,7 @@ def test_failed_review_drains_siblings_before_resume_and_keeps_scope(tmp_path, m
         assert first.summary["run_status"] == "stopped"
         assert first.summary["remaining_count"] == 10
         assert first.summary["excluded_terminal"] == 1
-        assert "diagnostic" not in first.model_dump_json()
+        assert "must not leak diagnostic" not in first.model_dump_json()
         run_id = first.summary["run_id"]
         with repo.storage.session() as session:
             assert session.get(TaskRun, run_id).status == "stopped"

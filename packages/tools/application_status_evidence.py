@@ -12,10 +12,14 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
 
 from packages.browser_bridge import BrowserBridgeStore, OperationName, OperationStatus, normalize_status
 from packages.storage import ApplicationSnapshot
-from packages.domain.urls import normalize_http_page_url
+from packages.domain.urls import application_progress_channel, normalize_http_page_url
+from packages.domain.application_identity import is_application_title, matching_records, unique_record
+from packages.domain.application_evidence_text import evidence_text_key, localize_evidence
+from packages.domain.application_status_semantics import current_status_labels, explicit_label_status, is_resume_routing_status, literal_record_status, noncanonical_status_reason, status_is_unasserted, timeline_without_current, status_evidence_conflict
 from packages.tools.browser_status_update import (
     BrowserStatusUpdateInput,
     BrowserStatusUpdateResponse,
@@ -33,6 +37,10 @@ class VerificationError(StrEnum):
     EVIDENCE_NOT_IN_OBSERVATION = "evidence_not_in_observation"
     STATUS_EVIDENCE_CONFLICT = "status_evidence_conflict"
     VISUAL_EVIDENCE_UNVERIFIED = "visual_evidence_unverified"
+    TARGET_CARD_NOT_UNIQUE = "target_card_not_unique"
+    STATUS_SEMANTICS_UNSUPPORTED = "status_semantics_unsupported"
+    UNTRUSTED_WEB_CONTENT = "untrusted_web_content"
+    RECORD_PRESENT_STATUS_UNKNOWN = "record_present_status_unknown"
 
 
 class VerifyApplicationStatusEvidenceInput(BaseModel):
@@ -50,6 +58,11 @@ class VerifyApplicationStatusEvidenceInput(BaseModel):
     evidence: str = Field(min_length=1, max_length=2_000)
     confidence: float = Field(ge=0.0, le=1.0)
     captured_at: datetime
+    source_ref: str | None = Field(default=None, max_length=64)
+    source_title: str | None = Field(default=None, max_length=512)
+    current: bool = False
+    current_node_ref: str | None = Field(default=None, max_length=64)
+    read_only: bool = False
 
     @field_validator("captured_at")
     @classmethod
@@ -90,7 +103,7 @@ def has_unmapped_status(card: Mapping[str, object]) -> bool:
 
 
 _DECISIVE_STATUS_PATTERN = re.compile(
-    r"(?:笔试|机试|编程测试|在线考试|面试|一面|二面|三面|终面|"
+    r"(?:笔试|机试|编程测试|在线考试|面试|初试|复试|一面|二面|三面|终面|"
     r"hr\s*面|终试|洽谈|offer|录用|拟录用|签约|待入职|已入职|"
     r"淘汰|不合适|未通过|暂不匹配|不匹配|流程终止|流程结束|"
     r"申请终止|拒绝|已挂|撤回)",
@@ -99,34 +112,24 @@ _DECISIVE_STATUS_PATTERN = re.compile(
 
 
 def supports_no_newer_status(card: Mapping[str, object]) -> bool:
-    """Whether one bound card only confirms that the application still exists.
+    """Whether a quoteable current baseline label contains no later outcome.
 
     Generic labels such as screening, processing, or testing do not outrank a
     previously confirmed written/interview stage. Explicit forward or terminal
     evidence must still go through the normal verifier.
     """
 
-    signals = card.get("signals") or {}
-    if isinstance(signals, Mapping) and signals.get("conflicting_statuses"):
+    if status_evidence_conflict(card):
         return False
-    if _normalise_status(card.get("status")):
+    if _normalise_status(card.get("status")) or timeline_without_current(card):
         return False
-    if not has_unmapped_status(card):
-        return True
-    labels = [str(card.get("label") or "")]
-    raw_labels = card.get("raw_status_labels")
-    if isinstance(raw_labels, list):
-        labels.extend(str(value or "") for value in raw_labels)
-    status_text = " ".join(value for value in labels if value.strip())
-    if not status_text:
-        context = str(card.get("context") or card.get("evidence") or "")
-        match = re.search(
-            r"(?:当前进度|申请进度|应聘进度|当前状态|状态|\bstatus)\s*[:：]\s*([^\n]{1,120})",
-            context,
-            re.I,
-        )
-        status_text = match.group(1) if match else ""
-    return not bool(_DECISIVE_STATUS_PATTERN.search(status_text))
+    labels = current_status_labels(card)
+    return bool(labels) and all(
+        not _DECISIVE_STATUS_PATTERN.search(label)
+        and not status_is_unasserted(label, "applied")
+        and (is_resume_routing_status(label) or re.search(r"筛选|初筛|简历评估|投递|申请成功|已申请|处理中|待处理|等待处理|测评|测试中|screening|submitted|under\s*review", label, re.I))
+        for label in labels
+    )
 
 
 def _error(
@@ -147,25 +150,40 @@ def _structured_observation_conflicts(
     observed_status: str,
     *,
     target_title: str = "",
+    target_application: object = None,
     observed_label: str = "",
     evidence: str = "",
 ) -> bool:
     """Reject a model interpretation that disagrees with structured Edge evidence."""
 
     records = [item for item in (result.get("application_records") or []) if isinstance(item, Mapping)]
-    title_key = lambda value: "".join(str(value or "").casefold().split())
-    targets = [item for item in records if target_title and title_key(item.get("title")) == title_key(target_title)]
+    targets = matching_records(target_application or {"id": application_id, "job_title": target_title}, records)
     if len(targets) > 1:
         return True
     if len(targets) == 1:
         card = targets[0]
         context = str(card.get("context") or card.get("evidence") or "")
-        signals = card.get("signals") or {}
-        if signals.get("conflicting_statuses"):
+        if status_evidence_conflict(card):
+            return True
+        if timeline_without_current(card) or not current_status_labels(card):
             return True
         card_status = _normalise_status(card.get("status"))
         if card_status and card_status != observed_status:
             return True
+        if evidence and observed_label and evidence in context and observed_label in context:
+            if not card_status and supports_no_newer_status(card) and observed_status != "applied":
+                return True
+            # Page summaries and entries for a different job do not establish
+            # this card's status. Still reject any contradictory target entry.
+            scoped_statuses = {
+                _normalise_status(entry.get("status"))
+                for entry in (result.get("entries") or [])
+                if isinstance(entry, Mapping)
+                and (str(entry.get("application_id") or "") == application_id
+                     or _title_matches(str(card.get("raw_title") or card.get("title") or target_title),
+                                       str(entry.get("context") or entry.get("evidence") or "")))
+            } - {None}
+            return any(status != observed_status for status in scoped_statuses)
         # A submission card with no decisive later outcome only supports the
         # applied baseline; browser_status_update preserves any higher stored stage.
         if observed_status == "applied" and not card_status and supports_no_newer_status(card) and evidence and observed_label:
@@ -299,6 +317,8 @@ def _verify_application_status_evidence(
             VerificationError.OBSERVATION_NOT_SUCCEEDED,
             "The referenced browser observation has not completed successfully.",
         )
+    if operation.result.get('diagnostics_compacted_v1'):
+        return _error('observation_evidence_expired', '历史页面诊断已按保留策略压缩，请重新观察；不能用摘要更新状态。')
     command = operation.command if isinstance(operation.command, dict) else {}
     command_ids = {
         str(item).strip()
@@ -318,9 +338,26 @@ def _verify_application_status_evidence(
         return _error(VerificationError.OBSERVATION_BINDING_MISMATCH,
                       "The captured page is not bound to the requested application page.")
     dom_result = {key: value for key, value in operation.result.items() if key != "vision"}
-    evidence_haystack = json.dumps(dom_result, ensure_ascii=False, sort_keys=True)
+    def text_values(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                yield from text_values(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from text_values(item)
+    evidence_sources = list(text_values(dom_result))
+    def locate(fragment):
+        return next((found for text in evidence_sources
+                     if (found := localize_evidence(text, fragment)) is not None), None)
     visual_reading = None
-    if request.evidence not in evidence_haystack or request.observed_label not in evidence_haystack:
+    if request.source_ref and not request.source_ref.startswith("vision:"):
+        from .application_page_evidence import page_sources
+        source = next((item for item in page_sources(operation.result) if item["ref"] == request.source_ref), {})
+        evidence_sources = [source.get("text", "")]
+    if ((request.source_ref or "").startswith("vision:")
+            or locate(request.evidence) is None or locate(request.observed_label) is None):
         visual_reading = operation.result.get("vision")
         if not isinstance(visual_reading, dict) or not any(
             event.event_type == "vision_analysis" and event.payload == visual_reading
@@ -330,33 +367,92 @@ def _verify_application_status_evidence(
                 VerificationError.EVIDENCE_NOT_IN_OBSERVATION,
                 "No persisted server-side visual reading supports this evidence.",
             )
-        evidence_haystack = str(visual_reading.get("text") or "")
-    if request.evidence not in evidence_haystack:
+        evidence_sources = [str(visual_reading.get("text") or "")]
+    evidence, label = locate(request.evidence), locate(request.observed_label)
+    if evidence is None:
         return _error(
             VerificationError.EVIDENCE_NOT_IN_OBSERVATION,
             "The submitted evidence is not present in the persisted Edge observation.",
         )
-    if request.observed_label not in evidence_haystack:
+    if label is None:
         return _error(
             VerificationError.EVIDENCE_NOT_IN_OBSERVATION,
             "The submitted status label is not present in the persisted Edge observation.",
         )
+    request = request.model_copy(update={"evidence": evidence, "observed_label": label})
+    application = None
+    page_applications = []
     try:
         with store.storage.session() as session:
             application = session.get(ApplicationSnapshot, request.application_id)
             target_title = application.job_title if application is not None else ""
             current_stage = application.stage if application is not None else ""
             record_url = normalize_http_page_url(application.record_url or "") if application is not None else None
+            page_applications = [item for item in session.scalars(
+                select(ApplicationSnapshot).where(ApplicationSnapshot.record_url.is_not(None)))
+                if normalize_http_page_url(item.record_url or "") == page_url]
+        from .application_identity_binding import hydrate_verified_identity_bindings
+        hydrate_verified_identity_bindings(store.storage, page_applications)
     except Exception:
         target_title = ""
         current_stage = ""
         record_url = None
+    if application is not None and application_progress_channel(application.record_url) == "mail_only":
+        return _error(VerificationError.OBSERVATION_BINDING_MISMATCH,
+                      "mail_only: 该投递没有有效的官网进度链接，仅通过邮件更新；不能使用页面证据更新状态。")
     if record_url != page_url:
         return _error(VerificationError.OBSERVATION_BINDING_MISMATCH,
                       "The application page changed after this observation was requested.")
+    records = [card for card in operation.result.get("application_records", []) if isinstance(card, Mapping)
+               and is_application_title(card.get("raw_title") or card.get("title"))]
+    bound_card = unique_record(application, records) if application is not None else None
+    source_card = None
+    if request.source_ref:
+        from .application_page_evidence import validate_page_candidate
+        source_card, source_error = validate_page_candidate(
+            operation.result, application, page_applications, card_title=request.source_title,
+            source_ref=request.source_ref, quotation=request.evidence, label=request.observed_label,
+            status=request.observed_status, current=request.current,
+            current_node_ref=request.current_node_ref, visual=visual_reading is not None,
+        )
+        if source_error:
+            return _error(source_error, "The proposed page source does not establish a unique current application status.")
+        request = request.model_copy(update={"evidence": source_card["context"],
+                                           "observed_label": source_card["label"],
+                                           "source_title": source_card["title"]})
+    if records and visual_reading is None and source_card is None:
+        if bound_card is None:
+            return _error(VerificationError.TARGET_CARD_NOT_UNIQUE,
+                          "The persisted cards do not uniquely identify the target application.")
+        owners = [item for item in page_applications
+                  if any(card is bound_card for card in matching_records(item, records))]
+        if len(owners) != 1 or str(owners[0].id) != request.application_id:
+            return _error(VerificationError.TARGET_CARD_NOT_UNIQUE,
+                          "Another stored application on this page also matches the quoted card.")
+        if timeline_without_current(bound_card) or not current_status_labels(bound_card):
+            return _error(VerificationError.RECORD_PRESENT_STATUS_UNKNOWN,
+                          "The application record exists, but no current stage is identified.")
+        context = str(bound_card.get("context") or bound_card.get("evidence") or "")
+        evidence = localize_evidence(context, request.evidence)
+        label = localize_evidence(evidence or "", request.observed_label)
+        if evidence is None or label is None:
+            return _error(VerificationError.EVIDENCE_NOT_IN_OBSERVATION,
+                          "Both quotations must occur inside the uniquely bound target card.")
+        if not any(evidence_text_key(label) == evidence_text_key(item) for item in current_status_labels(bound_card)):
+            literal = literal_record_status(context)
+            if (literal and literal[0] == request.observed_status == explicit_label_status(label)
+                    and localize_evidence(literal[1], label)):
+                # Preserve the date/action evidence, even if the caller quoted
+                # just its action label. The card is already uniquely bound.
+                evidence, label = context, literal[1]
+            else:
+                return _error(VerificationError.STATUS_EVIDENCE_CONFLICT,
+                              "The quotation is not an identified current status label on this card.")
+        request = request.model_copy(update={"evidence": evidence, "observed_label": label})
     confidence = request.confidence
     if visual_reading is not None:
-        if not target_title or not _title_matches(target_title, request.evidence):
+        visual_title = str(source_card.get("title") or "") if source_card else target_title
+        if not visual_title or not _title_matches(visual_title, request.evidence):
             return _error(
                 VerificationError.VISUAL_EVIDENCE_UNVERIFIED,
                 "Visual evidence must quote the target job title together with its visible status.",
@@ -369,11 +465,22 @@ def _verify_application_status_evidence(
     deterministic_label_status = _normalise_status(request.observed_label)
     if deterministic_label_status is not None:
         observed_status = deterministic_label_status
+    if noncanonical_status_reason(request.observed_label) or status_is_unasserted(request.observed_label, observed_status):
+        return _error(VerificationError.STATUS_SEMANTICS_UNSUPPORTED,
+                      "The label mentions a negated, conditional, or future stage rather than asserting it.")
+    conflict_observation = operation.result
+    if source_card is not None:
+        # Only an unknown parser record may be enriched by source-checked current
+        # evidence. Known current labels and conflicting records were checked above.
+        conflict_observation = {**operation.result, "application_records": [
+            source_card if card is bound_card else card for card in records
+        ] if bound_card is not None else [*records, source_card]}
     if _structured_observation_conflicts(
-        operation.result,
+        conflict_observation,
         request.application_id,
         observed_status,
         target_title=target_title,
+        target_application=application,
         observed_label=request.observed_label,
         evidence=request.evidence,
     ):
@@ -381,6 +488,8 @@ def _verify_application_status_evidence(
             VerificationError.STATUS_EVIDENCE_CONFLICT,
             "The submitted status conflicts with structured evidence in the persisted Edge observation.",
         )
+    if source_card is not None:
+        bound_card = source_card
     captured_at = operation.result.get("captured_at")
     if not captured_at:
         return _error(
@@ -389,19 +498,31 @@ def _verify_application_status_evidence(
         )
     # Confirming an existing submission is a read, not an automatic status write.
     # Require a unique persisted target card and quotations scoped to that card.
-    cards = [card for card in operation.result.get("application_records", [])
-             if isinstance(card, Mapping) and "".join(str(card.get("title") or "").split())
-             == "".join(target_title.split())]
-    if visual_reading is None and observed_status == "applied" and len(cards) == 1:
+    cards = [bound_card] if bound_card is not None else []
+    if observed_status == "applied" and len(cards) == 1:
         card = cards[0]
         context = str(card.get("context") or card.get("evidence") or "")
         card_status = _normalise_status(card.get("status"))
         baseline_card = card_status == "applied" or supports_no_newer_status(card)
-        if (current_stage == "applied" and baseline_card
+        # A source-checked screenshot can confirm an existing submission without
+        # meeting the higher threshold for changing a stage. Never raise the
+        # model's confidence or let a low-quality reading authorize a write.
+        visual_baseline = visual_reading is None or (
+            source_card is not None and confidence >= 0.80
+            and (literal_record_status(context) or (None,))[0] == "applied"
+        )
+        if (current_stage == "applied" and baseline_card and visual_baseline
                 and request.evidence in context and request.observed_label in context):
             return VerifyApplicationStatusEvidenceResponse(
                 success=True, status="unchanged", reason_code="no_newer_status_observed", read_only=True,
             )
+    if request.read_only:
+        # The caller may only confirm the existing applied baseline. A change
+        # since its snapshot must never turn this fast path into a stage write.
+        return VerifyApplicationStatusEvidenceResponse(
+            success=False, status="STATE_UNCLEAR", reason_code="read_only_baseline_not_confirmed",
+            read_only=True,
+        )
     verification = browser_status_update(
         BrowserStatusUpdateInput(
             application_id=request.application_id,
@@ -417,11 +538,18 @@ def _verify_application_status_evidence(
                     "entries": [
                         {
                             "application_id": request.application_id,
+                            "title": str(bound_card.get("raw_title") or bound_card.get("title") or "") if bound_card else target_title,
+                            "external_application_id": str(bound_card["application_id"]) if bound_card and bound_card.get("application_id") else None,
+                            "external_job_id": str(bound_card["job_id"]) if bound_card and bound_card.get("job_id") else None,
                             "status": observed_status,
                             "label": request.observed_label,
                             "context": request.evidence,
                             "evidence": request.evidence,
                             "confidence": confidence,
+                            "stage_labels": bound_card.get("stage_labels") or [] if bound_card else [],
+                            "current_step_label": bound_card.get("current_step_label") or "" if bound_card else "",
+                            "signals": {**(bound_card.get("signals") or {}),
+                                        "conflicting_statuses": status_evidence_conflict(bound_card)} if bound_card else {},
                         }
                     ],
                 },

@@ -1,6 +1,6 @@
 {
   "name": "recruitops-desktop",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "Isolated RecruitOps desktop preview",
   "author": "RecruitOps contributors",
@@ -8,8 +8,9 @@
   "scripts": {
     "build": "tsc",
     "start": "npm run build && electron .",
-    "test": "npm run build && node --test tests/policy.test.cjs tests/runtime.test.cjs tests/browser-service.test.cjs tests/filler-service.test.cjs tests/filler-store.test.cjs tests/filler-application-service.test.cjs tests/filler-parity.test.cjs tests/bridge.test.cjs tests/bridge-offline.test.cjs tests/review-readiness.test.cjs tests/review-hidden.test.cjs tests/python-bridge.test.cjs tests/packaging.test.cjs ../../tests/desktop_filler/adapter.test.cjs ../../tests/desktop_filler/contracts.test.cjs ../../tests/desktop_filler/bundled-engine.test.cjs",
-    "test:review": "npm run build && node --test --test-concurrency=1 tests/bridge.test.cjs tests/bridge-offline.test.cjs tests/browser-service.test.cjs tests/review-readiness.test.cjs tests/python-bridge.test.cjs tests/review-hidden.test.cjs",
+    "test": "npm run build && node --test tests/policy.test.cjs tests/runtime.test.cjs tests/browser-service.test.cjs tests/filler-service.test.cjs tests/filler-store.test.cjs tests/recruitment-session-store.test.cjs tests/filler-application-service.test.cjs tests/filler-parity.test.cjs tests/bridge.test.cjs tests/bridge-offline.test.cjs tests/review-readiness.test.cjs tests/review-hidden.test.cjs tests/python-bridge.test.cjs tests/packaging.test.cjs ../../tests/desktop_filler/adapter.test.cjs ../../tests/desktop_filler/contracts.test.cjs ../../tests/desktop_filler/bundled-engine.test.cjs",
+    "test:review": "npm run build && node --test --test-concurrency=1 tests/bridge.test.cjs tests/bridge-offline.test.cjs tests/browser-service.test.cjs tests/review-readiness.test.cjs tests/review-record-entry.test.cjs tests/review-record-details.test.cjs tests/review-vision.test.cjs tests/review-vision-hidden.test.cjs tests/review-page-cache.test.cjs tests/review-reuse-hidden.test.cjs tests/python-bridge.test.cjs tests/review-hidden.test.cjs tests/review-sso.test.cjs",
+    "test:login": "npm run build && node --test tests/recruitment-session-store.test.cjs tests/auth-observation.test.cjs tests/review-sso.test.cjs && playwright test tests/shell.spec.cjs -g \"persistent dedicated login|debounced session recovery\" --workers=1",
     "test:workbench": "npm run build && node --test tests/application-delete-hidden.test.cjs",
     "test:filler": "npm run build && node --test --test-concurrency=1 tests/filler-service.test.cjs tests/filler-store.test.cjs tests/filler-application-service.test.cjs tests/filler-panel-offline.test.cjs tests/filler-frame-executor.test.cjs tests/filler-executor-hidden.test.cjs tests/filler-browser-engine.test.cjs tests/filler-application-context.test.cjs tests/policy.test.cjs ../../tests/desktop_filler/adapter.test.cjs ../../tests/desktop_filler/contracts.test.cjs ../../tests/desktop_filler/bundled-engine.test.cjs ../../tests/desktop_filler/offline-engine.test.cjs",
     "test:e2e": "npm run build && playwright test",

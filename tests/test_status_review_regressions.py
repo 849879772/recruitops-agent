@@ -46,7 +46,7 @@ def test_batch_returns_terminal_unknown_text_for_model_instead_of_unchanged(tmp_
     assert "暂不匹配" in str(result.unresolved[0].observation)
 
 
-def test_batch_treats_non_decisive_unknown_text_as_no_newer_status(tmp_path, monkeypatch):
+def test_batch_keeps_non_decisive_unknown_label_unresolved(tmp_path, monkeypatch):
     from packages.tools import batch_browser_operations as module
     repository = _repository(tmp_path, [{
         "id": "24", "title": "软件开发工程师", "record_url": "https://ats.example/applications",
@@ -65,8 +65,8 @@ def test_batch_treats_non_decisive_unknown_text_as_no_newer_status(tmp_path, mon
     result = asyncio.run(batch_observe_application_status(
         BatchObserveApplicationStatusInput(application_ids=["24"]), object(), repository))
 
-    assert result.unchanged[0].reason == "no_newer_status_observed"
-    assert not result.unresolved and not result.updated
+    assert result.unresolved[0].reason == "status_unmapped"
+    assert not result.unchanged and not result.updated
     with repository.storage.session() as session:
         assert session.get(ApplicationSnapshot, "24").stage == "written"
 
@@ -76,11 +76,11 @@ def test_mcp_verifier_returns_readonly_and_error_results(tmp_path, monkeypatch):
     store, url = _prepared_store(tmp_path)
     operation = _observed_operation(store, url, observation={
         "page_url": url, "captured_at": "2026-08-22T12:00:00Z",
-        "application_records": [{"title": "软件开发工程师", "context": "软件开发工程师 投递", "status": ""}],
+        "application_records": [{"title": "软件开发工程师", "context": "软件开发工程师 申请成功", "status": "applied", "label": "申请成功"}],
     })
     definition = next(d for d in TOOL_DEFINITIONS if d.name == "verify_application_status_evidence")
     handler = _build_handler(definition, SimpleNamespace(browser_bridge=store))
-    result = handler(request_for(operation))
+    result = handler(request_for(operation, label="申请成功", evidence="申请成功"))
     assert result.success and result.read_only
     error = handler(request_for(operation, evidence="not present"))
     assert error.error_code == "evidence_not_in_observation" and not error.retryable
@@ -97,7 +97,7 @@ def test_unknown_label_can_be_interpreted_and_written_without_mail(tmp_path):
         "application_records": [{"title": "软件开发工程师", "status": "", "context": quote,
                                  "signals": {"has_explicit_status": True}}],
     })
-    low = verify_application_status_evidence(request_for(operation, label="状态", evidence=quote), store)
+    low = verify_application_status_evidence(request_for(operation, status="rejected", label="暂不匹配", evidence=quote), store)
     assert not low.success and low.reason_code == "confidence_below_threshold"
     result = verify_application_status_evidence(request_for(operation, status="rejected", label="暂不匹配", evidence=quote, confidence=0.99), store)
     assert result.success and result.status == "updated"

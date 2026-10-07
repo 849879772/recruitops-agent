@@ -9,11 +9,26 @@ const dispatch = { protocol_version: 1, type: 'operation.dispatch', device_id: '
   operation_id: 'op-1', operation: 'observe_application_status_page', command: { action: 'observe_application_page', selector_key: 'application_page', params: {},
     page_url: 'https://ats.example/applications', origin: 'https://ats.example', application_id: 'app-1', application_ids: ['app-1'] } } };
 test('only fixed read operations with trusted operation/application binding are accepted', () => {
-  assert.deepEqual(reviewCommand(dispatch), { url: 'https://ats.example/applications', ids: ['app-1'] });
+  assert.deepEqual(reviewCommand(dispatch), { url: 'https://ats.example/applications', ids: ['app-1'], includeVision: false });
   const bad = structuredClone(dispatch); bad.payload.command.action = 'execute_javascript';
   assert.throws(() => reviewCommand(bad), /ACTION_NOT_ALLOWED/);
   bad.payload.command.action = 'observe_application_page'; bad.payload.operation_id = 'other';
   assert.throws(() => reviewCommand(bad), /COMMAND_INVALID/);
+});
+test('vision reuse is a bounded optional hint, never a new operation or application identity', () => {
+  const request = structuredClone(dispatch);
+  request.payload.command.params = {include_vision: true,
+    vision_fallback_reason: 'no_structured_evidence_visible_status_likely',
+    review_task_id: 'review-run-1', reuse_observation_operation_id: 'source-op'};
+  assert.deepEqual(reviewCommand(request), {url: 'https://ats.example/applications', ids: ['app-1'], includeVision: true,
+    reviewTaskId: 'review-run-1', reuseObservationOperationId: 'source-op'});
+  for (const hint of ['op-1','source '.repeat(50),{},null]) {
+    request.payload.command.params.reuse_observation_operation_id = hint;
+    assert.equal(reviewCommand(request).reuseObservationOperationId, undefined);
+  }
+  request.payload.command.params.include_vision = false;
+  request.payload.command.params.reuse_observation_operation_id = 'source-op';
+  assert.equal(reviewCommand(request).reuseObservationOperationId, undefined);
 });
 test('owned WS HMAC handshake, ack/progress/result, duplicate dispatch and cancel', async () => {
   const server = http.createServer();

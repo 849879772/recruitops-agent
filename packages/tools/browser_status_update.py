@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 from threading import RLock
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
@@ -18,7 +18,9 @@ from sqlalchemy.exc import IntegrityError
 
 from packages.approval import AgentApplicationWriteAdapter
 from packages.domain.models import ApplicationStage
-from packages.domain.urls import normalize_http_page_url
+from packages.domain.application_identity import matching_records, title_in_context
+from packages.domain.application_status_semantics import noncanonical_status_reason, status_is_unasserted, timeline_without_current
+from packages.domain.urls import application_progress_channel, normalize_http_page_url
 from packages.storage import ApplicationSnapshot, Storage, WriteAudit
 
 
@@ -65,6 +67,11 @@ _STATUS_ALIASES = {
     "笔试": "written",
     "笔试中": "written",
     "面试": "interview",
+    "初试": "interview",
+    "复试": "interview",
+    "一面": "interview",
+    "二面": "interview",
+    "三面": "interview",
     "录用": "offer",
     "已拒绝": "rejected",
     "已撤回": "withdrawn",
@@ -86,6 +93,8 @@ _STATE_UNCLEAR_CODES = {
     "status_captured_at_missing",
     "confidence_below_threshold",
     "current_stage_invalid",
+    "status_semantics_unsupported",
+    "record_present_status_unknown",
 }
 _WRITE_LOCK = RLock()
 
@@ -126,11 +135,19 @@ class BrowserStatusEntry(_BrowserResultModel):
         max_length=255,
         validation_alias=AliasChoices("application_id", "applicationId"),
     )
+    title: str = Field(default="", max_length=512)
+    job_id: str | None = Field(default=None, max_length=255)
+    external_application_id: str | None = Field(default=None, max_length=255)
+    external_job_id: str | None = Field(default=None, max_length=255)
     status: str = Field(default="", max_length=128)
     label: str = Field(default="", max_length=200)
     context: str = Field(default="", max_length=1_000)
     evidence: str = Field(default="", max_length=2_000)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Preserve bounded current-step evidence through the rule verifier.
+    stage_labels: list[Annotated[str, Field(max_length=200)]] = Field(default_factory=list, max_length=30)
+    current_step_label: str = Field(default="", max_length=200)
+    signals: dict[str, bool] = Field(default_factory=dict, max_length=16)
 
     @field_validator("application_id", mode="before")
     @classmethod
@@ -326,18 +343,8 @@ def _normalise_status(value: object) -> str | None:
     return _STATUS_ALIASES.get(key)
 
 
-def _text_key(value: str) -> str:
-    return "".join(character for character in value.casefold() if character.isalnum())
-
-
 def _title_matches(title: str, text: str) -> bool:
-    compact_title = re.sub(r"\s+", "", title.casefold())
-    compact_text = re.sub(r"\s+", "", text.casefold())
-    if compact_title and compact_title in compact_text:
-        return True
-    title_key = _text_key(title)
-    context_key = _text_key(text)
-    return len(title_key) >= 3 and title_key in context_key
+    return title_in_context(title, text)
 
 
 def _context_text(entry: BrowserStatusEntry) -> str:
@@ -402,11 +409,21 @@ def _application_snapshot_diff(application: ApplicationSnapshot) -> dict[str, An
     }
 
 
+def _entry_identity(entry: BrowserStatusEntry) -> dict:
+    # Entry.application_id is the internal namespace; card.application_id is ATS.
+    return {"title": entry.title, "application_id": entry.external_application_id,
+            "job_id": entry.external_job_id}
+
+
 def _context_is_consistent(
     application: ApplicationSnapshot,
     page_applications: list[ApplicationSnapshot],
     entry: BrowserStatusEntry,
 ) -> bool:
+    if entry.title:
+        owners = [item for item in page_applications if matching_records(item, [_entry_identity(entry)])]
+        if len(owners) != 1 or owners[0].id != application.id:
+            return False
     context = _context_text(entry)
     if not context:
         return True
@@ -437,7 +454,19 @@ def _match_entry(
         return _Match(entry, 0.99, MatchMethod.APPLICATION_ID), ""
 
     explicit_other = [entry for entry in entries if entry.application_id]
-    if len(page_applications) == 1 and len(entries) == 1 and not explicit_other:
+    titled = [entry for entry in entries if entry.title and not entry.application_id]
+    if titled:
+        matches = matching_records(application, [_entry_identity(entry) for entry in titled])
+        if len(matches) > 1:
+            return None, "status_entry_ambiguous"
+        if len(matches) == 1:
+            entry = next(entry for entry in titled if _entry_identity(entry) == matches[0])
+            competing = [item for item in page_applications
+                         if matching_records(item, [_entry_identity(entry)])]
+            if len(competing) != 1 or competing[0].id != application.id:
+                return None, "target_job_mismatch"
+            return _Match(entry, 0.95, MatchMethod.UNIQUE_TITLE_CONTEXT), ""
+    if len(page_applications) == 1 and len(entries) == 1 and not explicit_other and not titled:
         return _Match(entries[0], 0.95, MatchMethod.UNIQUE_PAGE), ""
 
     contextual = [
@@ -1025,6 +1054,8 @@ def browser_status_update(
                     ]
                 else:
                     page_applications = []
+            from .application_identity_binding import hydrate_verified_identity_bindings
+            hydrate_verified_identity_bindings(storage, page_applications)
         except Exception:
             data = _data(
                 request,
@@ -1091,7 +1122,7 @@ def browser_status_update(
             confidence=0.0,
             match_method=None,
         )
-        if record_url is None:
+        if application_progress_channel(application.record_url) == "mail_only":
             return _persist_decision(
                 storage,
                 request=request,
@@ -1101,8 +1132,8 @@ def browser_status_update(
                 task_id=task_id,
                 started_at=started_at,
                 status=UpdateStatus.STATE_UNCLEAR,
-                reason_code="record_url_missing_or_invalid",
-                reason="The Agent application has no valid official record URL.",
+                reason_code="mail_only",
+                reason="该投递没有有效的官网进度链接，仅通过邮件更新；不能使用页面证据更新状态。",
                 evidence=evidence_base,
                 before=before,
                 after=None,
@@ -1240,6 +1271,17 @@ def browser_status_update(
                 match_method=None,
             )
 
+        if timeline_without_current(match.entry.model_dump()):
+            return _persist_decision(
+                storage, request=request, audit_id=audit_id, idempotency_key=idempotency_key,
+                token_id=token_id, task_id=task_id, started_at=started_at,
+                status=UpdateStatus.STATE_UNCLEAR, reason_code="record_present_status_unknown",
+                reason="The application has a process timeline without an identified current step.",
+                evidence=evidence_base, before=before, after=None, application=application,
+                record_url=record_url, current_stage=_stage_or_none(application.stage), target_stage=None,
+                entry=match.entry, captured_at=request.terminal_result.captured_at,
+                confidence=0.0, match_method=match.method,
+            )
         observed_status = _normalise_status(match.entry.status)
         if observed_status is None:
             return _persist_decision(
@@ -1302,6 +1344,18 @@ def browser_status_update(
                 captured_at=request.terminal_result.captured_at,
                 confidence=0.0,
                 match_method=match.method,
+            )
+
+        if noncanonical_status_reason(match.entry.label) or status_is_unasserted(match.entry.label, observed_status):
+            return _persist_decision(
+                storage, request=request, audit_id=audit_id, idempotency_key=idempotency_key,
+                token_id=token_id, task_id=task_id, started_at=started_at,
+                status=UpdateStatus.STATE_UNCLEAR, reason_code="status_semantics_unsupported",
+                reason="The status label only mentions a negated, conditional, or future stage.",
+                evidence=evidence_base, before=before, after=None, application=application,
+                record_url=record_url, current_stage=_stage_or_none(application.stage), target_stage=None,
+                entry=match.entry, captured_at=request.terminal_result.captured_at,
+                confidence=0.0, match_method=match.method,
             )
 
         confidence = _effective_confidence(request.terminal_result, match)

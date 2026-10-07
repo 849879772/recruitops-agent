@@ -4,15 +4,18 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 from apps.api.codex_bff import CodexBffService
 from packages.automation import AutomationRunResult, AutomationStore, ClaimedAutomation
 from packages.codex_runtime.events import CodexEventType
+from packages.automation.startup import start_automation_thread
+from packages.automation.latest_report import _redact_diagnostic
 
 
 class CodexAutomationExecutor:
-    """Run one persistent automation through the same Codex harness as chat."""
+    """Run one occurrence directly or through the chat harness, never twice."""
 
     def __init__(
         self,
@@ -42,6 +45,70 @@ class CodexAutomationExecutor:
         return build_runtime_task_handlers(settings=settings)
 
     async def __call__(self, task: ClaimedAutomation) -> AutomationRunResult:
+        direct = task.task_id in {"daily_recruitment_intelligence", "crawler_health"}
+        thread = None
+        startup_attempts = 1
+        if isinstance(self.store, AutomationStore):
+            previous = await asyncio.to_thread(self.store.execution, task.execution_id)
+            if previous is not None and (previous.thread_id or previous.status != "running"):
+                # A claimed occurrence may execute only once, including when
+                # its conversation lives locally rather than in the runtime.
+                return AutomationRunResult(
+                    status=previous.status if previous.status != "running" else "blocked",
+                    summary=previous.result_summary,
+                    error=previous.error or ("automation_execution_already_started"
+                        if previous.status == "running" else None),
+                    thread_id=previous.thread_id, turn_id=previous.turn_id,
+                    skip_completion=True)
+            if not await asyncio.to_thread(self.store.claim_execution_start, task.execution_id):
+                previous = await asyncio.to_thread(self.store.execution, task.execution_id)
+                return AutomationRunResult(
+                    status=previous.status if previous and previous.status != "running" else "blocked",
+                    summary=previous.result_summary if previous else None,
+                    error=previous.error if previous and previous.status != "running"
+                          else "automation_execution_already_started",
+                    thread_id=previous.thread_id if previous else None,
+                    turn_id=previous.turn_id if previous else None,
+                    skip_completion=True)
+            if direct:
+                thread_id = await asyncio.to_thread(
+                    self.store.ensure_task_conversation, task.execution_id, direct=True)
+                thread = SimpleNamespace(id=thread_id)
+        if not direct:
+            from packages.config import get_settings
+
+            settings = self._settings or get_settings()
+
+            async def record_retry(**kwargs: Any) -> None:
+                nonlocal startup_attempts
+                startup_attempts = kwargs["attempt"] + 1
+                if isinstance(self.store, AutomationStore):
+                    kwargs["error"] = _redact_diagnostic(kwargs.get("error"), settings)
+                    await asyncio.to_thread(
+                        self.store.record_startup_retry, task.execution_id, **kwargs)
+
+            try:
+                if self.service is None:
+                    raise RuntimeError("本地助理服务尚未启动")
+                thread = await start_automation_thread(self.service, on_retry=record_retry)
+            except Exception as exc:
+                if isinstance(self.store, AutomationStore):
+                    thread_id = await asyncio.to_thread(
+                        self.store.ensure_task_conversation, task.execution_id, direct=False)
+                    thread = SimpleNamespace(id=thread_id)
+                error = _redact_diagnostic(f"{type(exc).__name__}: {exc}", settings)
+                return AutomationRunResult(
+                    status="failed", summary="定时任务未启动：助理工具连接失败，未执行业务操作。",
+                    error=error, thread_id=thread.id if thread else None,
+                    details={"status": "failed", "stage": "startup", "error": error,
+                             "error_code": getattr(exc, "error_code", "automation_startup_failed"),
+                             "attempts": getattr(exc, "attempts", 1)})
+            if isinstance(self.store, AutomationStore):
+                await asyncio.to_thread(self.store.mark_running_context, task.execution_id,
+                    thread_id=thread.id, direct=direct)
+            else:
+                await asyncio.to_thread(self.store.mark_running_context, task.execution_id,
+                    thread_id=thread.id, turn_id=None)
         if task.task_id == "daily_recruitment_intelligence":
             from packages.config import get_settings
             from packages.scheduler.models import TaskContext
@@ -49,15 +116,18 @@ class CodexAutomationExecutor:
 
             settings = self._settings or get_settings()
             if not settings.write_enabled:
-                return AutomationRunResult(status="blocked", error="write_disabled")
+                return AutomationRunResult(status="blocked", error="write_disabled", thread_id=thread.id if thread else None)
             if task.target_kind not in {"all", "company", "source"} or (
                 task.target_kind in {"company", "source"} and not task.target_id
             ):
-                return AutomationRunResult(status="blocked", error="invalid_sync_scope")
+                return AutomationRunResult(status="blocked", error="invalid_sync_scope", thread_id=thread.id if thread else None)
             context = TaskContext(task_id=task.task_id, task_label=task.task_label,
                 scheduled_for=task.scheduled_for, run_id=task.execution_id, attempt=1,
                 read_only=False, write_enabled=settings.write_enabled,
-                metadata={"details": {"mode": "full", "company_ids": [task.target_id]
+                metadata={"thread_id": thread.id if thread else None,
+                    "task_id": task.task_id,
+                    "automation_execution_id": task.execution_id,
+                    "details": {"mode": "full", "company_ids": [task.target_id]
                     if task.target_kind == "company" and task.target_id else [],
                     "source_record_ids": [task.target_id]
                     if task.target_kind == "source" and task.target_id else []}})
@@ -75,11 +145,29 @@ class CodexAutomationExecutor:
                 }
             report = summarize(result, task.execution_id, settings=settings)
             write_json_atomic(report_path(settings), report)
+            completed = report["status"] in {"succeeded", "partial"}
+            summary = "全量任务部分完成" if report["status"] == "partial" else "全量任务已完成"
+            if completed:
+                counts = [
+                    ("新增", report.get("new_jobs")),
+                    ("刷新已有岗位", report.get("updated_jobs")
+                     if report.get("updated_jobs") is not None else report.get("reused_jobs")),
+                    ("完成评分", report.get("scored_jobs")),
+                ]
+                statistics = "、".join(
+                    f"{label} {count} 条" for label, count in counts if count is not None)
+                if statistics:
+                    summary += "；" + statistics
+                if report["status"] == "partial":
+                    summary += "。部分公司抓取、详情或评分未完成，请查看本轮明细。"
+            else:
+                summary = f"全量任务执行失败：{report['error']}"
             return AutomationRunResult(
-                status="succeeded" if result.get("status") == "completed" else "failed",
-                summary="全量任务已结束；部分公司或评分未完成" if report["status"] == "partial" else
-                    ("全量任务已完成" if report["status"] == "succeeded" else f"全量任务执行失败：{report['error']}"),
+                status="succeeded" if completed else "failed",
+                summary=summary,
                 error=report.get("error"),
+                thread_id=thread.id if thread else None,
+                details=report,
             )
         if task.task_id == "crawler_health":
             from packages.config import get_settings
@@ -87,7 +175,10 @@ class CodexAutomationExecutor:
 
             settings = self._settings or get_settings()
             context = TaskContext(task_id=task.task_id, task_label=task.task_label,
-                                  scheduled_for=task.scheduled_for, run_id=task.execution_id, attempt=1)
+                                  scheduled_for=task.scheduled_for, run_id=task.execution_id, attempt=1,
+                                  metadata={"thread_id": thread.id if thread else None,
+                                            "task_id": task.task_id,
+                                            "automation_execution_id": task.execution_id})
             handler = self._runtime_handlers(settings)[task.task_id]
             result = await asyncio.to_thread(handler, context)
             report_path = Path(settings.agent_root) / ".data" / "scheduler" / f"{task.execution_id}.json"
@@ -96,13 +187,16 @@ class CodexAutomationExecutor:
             summary = {key: result.get(key) for key in ("status", "company_total", "integration_status_counts")}
             summary["report_path"] = str(report_path)
             return AutomationRunResult(status="succeeded" if result.get("status") == "observed" else "failed",
-                                       summary=json.dumps(summary, ensure_ascii=False))
-        thread = await self.service.thread_start()
+                                       summary=json.dumps(summary, ensure_ascii=False),
+                                       thread_id=thread.id if thread else None, details=summary)
         subscription = self.service.subscribe(thread.id)
         chunks: list[str] = []
         turn_id: str | None = None
         try:
-            turn = await self.service.turn_start(thread.id, self._prompt(task))
+            prompt = self._prompt(task) + (
+                f"\n本轮任务属于 thread_id={json.dumps(thread.id)}；"
+                "启动投递复核或邮件处理工具时必须传入该 thread_id，延续返回的 run_id 时保持归属不变。")
+            turn = await self.service.turn_start(thread.id, prompt)
             turn_id = turn.id
             await asyncio.to_thread(
                 self.store.mark_running_context,
@@ -184,7 +278,14 @@ class CodexAutomationExecutor:
                         reconnect_deadline = None
                         last_reconnect_error = None
 
-            return await asyncio.wait_for(wait_for_completion(), timeout=self.timeout_seconds)
+            result = await asyncio.wait_for(wait_for_completion(), timeout=self.timeout_seconds)
+            if startup_attempts > 1:
+                from dataclasses import replace
+
+                result = replace(result,
+                    summary=f"助理工具连接已恢复（第 {startup_attempts} 次尝试）。\n{result.summary or ''}",
+                    details={**(result.details or {}), "startup_attempts": startup_attempts})
+            return result
         except TimeoutError:
             if turn_id is not None:
                 await self.service.turn_interrupt(thread.id, turn_id)
@@ -276,9 +377,11 @@ class CodexAutomationExecutor:
             return (
                 "这是本地持久化计划触发的投递进度复核，不是用户咨询。"
                 f"{scope}。{selection}"
-                "由工具完成页面观测和状态校验；include_vision=false；不要读取本地技能文件或调用未开放的连接工具。"
-                "本定时任务禁止调用视觉分析，"
-                "即使 DOM 证据不足也只归类为无法确认或需要登录或验证，不做第二次视觉观察；"
+                "没有有效已保存官网进度链接的记录仅邮件更新，工具会跳过；单独报告 excluded_mail_only，"
+                "不计为失败或已挂，不猜测链接，也不因此启动邮件处理。"
+                "由工具完成页面观测和状态校验；允许工具内部按配置做有界文本和截图兜底，"
+                "不要另外反复调用模型或截图，不读取本地技能文件或调用未开放的连接工具。"
+                "登录墙、验证码、空白页不截图；证据仍不足时保留原阶段并说明未核验，"
                 "通过统一状态校验写入有明确证据的状态变化，包括淘汰；不得用旧投递确认覆盖终态。"
                 "不得询问是否继续，不得创建新的计划，不得改为爬虫或云端任务。"
                 "最后简洁说明目标、页面证据、数据库是否变化；若阻塞，明确错误码和可操作原因。"

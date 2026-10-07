@@ -1,13 +1,12 @@
 """Paged SQL job reads with a bounded, revision-aware title/summary cache.
 
-Title policy stays in Python because its Unicode/ASCII-boundary and doctorate
-exceptions must match ingestion exactly. Only distinct titles are screened; large
-analysis text and JSON are loaded only for the requested page/featured rows.
+Ingestion owns title screening. Browsing never re-screens persisted jobs against
+the current candidate profile; title categories only support explicit UI filters.
+Large analysis text and JSON are loaded only for the requested page/featured rows.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from hashlib import sha256
 import json
 import re
 from threading import RLock
@@ -40,8 +39,6 @@ class _Cache:
     signature: Any = None
     created: float = 0
     titles: dict[str, str] = field(default_factory=dict)
-    title_decisions: dict[str, str | None] = field(default_factory=dict)
-    profile_key: Any = None
     fold_overrides: dict[str, str] = field(default_factory=dict)
     catalog: dict[str, dict[str, Any]] = field(default_factory=dict)
     summaries: dict[Any, Any] = field(default_factory=dict)
@@ -75,30 +72,11 @@ def _revision(session):
 
 
 def _ensure_index(cache, session):
-    from packages.config import get_settings
-    from packages.candidate_profile.loader import load_candidate_profile
-    from packages.matching.title_policy import screen_title_job
-
-    path = get_settings().candidate_profile_config
-    exists = path.is_file()
-    profile_key = (str(path.resolve()), sha256(path.read_bytes()).hexdigest() if exists else None)
-    signature = (_revision(session), profile_key)
+    signature = _revision(session)
     if cache.signature == signature and monotonic() - cache.created < _CACHE_TTL_SECONDS:
         return
-    profile = load_candidate_profile(path) if exists else None
-    if cache.profile_key != profile_key or len(cache.title_decisions) > 50_000:
-        cache.title_decisions = {}
-    cache.profile_key = profile_key
     titles = session.scalars(select(JobSnapshot.title).where(*_base_predicates()).distinct())
-    cache.titles = {}
-    for title in titles:
-        if title not in cache.title_decisions:
-            cache.title_decisions[title] = (
-                job_category({"title": title})
-                if screen_title_job({"title": title}, profile).eligible else None
-            )
-        if cache.title_decisions[title] is not None:
-            cache.titles[title] = cache.title_decisions[title]
+    cache.titles = {title: job_category({"title": title}) for title in titles}
     cache.catalog = {
         str(row["name"]).strip().casefold(): dict(row)
         for row in session.execute(select(
@@ -185,11 +163,8 @@ def _fold(expression, cache):
 
 
 def _effective_status():
-    return case(
-        (JobAnalysisSnapshot.analysis_status.in_(_LEGACY_EXCLUSIONS),
-         case((JobSnapshot.capture_status == "complete", "eligible"), else_="jd_incomplete")),
-        else_=JobAnalysisSnapshot.analysis_status,
-    )
+    # Without re-screening, an earlier exclusion remains its recorded status.
+    return JobAnalysisSnapshot.analysis_status
 
 
 def _platform():
@@ -219,8 +194,6 @@ def _row_item(row, cache, stages, *, compact=False):
     score = row["job_match_score"] if row["job_match_score"] is not None else row["analysis_match_score"]
     if status and status != "complete":
         score = None
-    if status in _LEGACY_EXCLUSIONS:
-        status = "eligible" if row["capture_status"] == "complete" else "jd_incomplete"
     category = cache.titles[row["title"]]
     values = dict(
         id=str(row["id"]), company_id=str(row["company_id"]),
@@ -388,7 +361,7 @@ def browse_jobs(repository, *, query=None, company=None, category=None, platform
     with cache.lock, repository.storage.session() as session:
         _ensure_index(cache, session)
         dialect = session.bind.dialect.name
-        base = _full_statement().where(_title_membership(cache.titles, dialect))
+        base = _full_statement()
         if first_seen_on is not None:
             base = base.where(func.date(JobSnapshot.first_seen_at) == first_seen_on)
         score, status = _effective_score(), _effective_status()

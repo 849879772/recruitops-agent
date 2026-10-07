@@ -335,15 +335,28 @@
             <div class="section-heading">
               <div><h2 id="applications-heading">投递记录</h2><p class="section-description" id="application-page-description">步骤看所在列、卡面只看结果</p></div>
               <div class="section-actions">
+                <button class="button button--secondary" id="application-identity-queue-button" type="button">查看待核对</button>
+                <button class="button button--secondary" id="application-review-results-button" type="button">查看复核明细</button>
                 <button class="button button--secondary" id="application-add-button" type="button">手动添加</button>
                 <button class="icon-button" id="applications-refresh-button" type="button" aria-label="刷新投递记录" title="刷新投递记录"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" stroke="currentColor" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.7-3.9L4 9M4 5v4h4M4 13a8 8 0 0 0 14.7 3.9L20 15M20 19v-4h-4"></path></svg></button>
               </div>
             </div>
+            <section class="workspace-section identity-queue-panel" id="application-identity-queue-panel" aria-labelledby="application-identity-queue-heading" hidden>
+              <div class="section-heading section-heading--compact">
+                <div><h3 id="application-identity-queue-heading">查看待核对</h3><p class="section-description">核对本地投递与官网岗位。每份投递只保留一项，确认后从待办中移除。</p></div>
+                <div class="section-actions"><button class="button button--ghost" id="application-identity-queue-refresh" type="button">刷新</button><button class="button button--ghost" id="application-identity-queue-close" type="button">暂不处理</button></div>
+              </div>
+              <div id="application-identity-queue-list" aria-live="polite"></div>
+            </section>
             <form id="application-filter-form" class="application-filter-bar" role="search">
               <label for="application-search">搜索投递记录</label>
               <input id="application-search" type="search" maxlength="200" placeholder="搜索公司名称或岗位名称" autocomplete="off">
               <button class="button button--ghost" type="reset">重置</button>
             </form>
+            <div class="application-channel-toolbar">
+              <div class="segmented-control application-channel-filter" id="application-channel-filter" role="group" aria-label="投递进度更新方式"></div>
+              <span class="muted-label" id="application-channel-count-note" aria-live="polite"></span>
+            </div>
             <div class="application-summary" id="application-summary" aria-label="投递漏斗"></div>
             <div class="application-kanban" id="application-kanban" data-state="loading"><div class="loading-rows" aria-label="加载中"><span></span><span></span><span></span></div></div>
           </section>
@@ -803,6 +816,16 @@
       </div>
     </dialog>
 
+    <dialog id="application-edit-dialog" class="job-detail-dialog application-edit-dialog" aria-labelledby="application-edit-heading">
+      <div class="job-detail-shell">
+        <header class="job-detail-header">
+          <div><p class="eyebrow">编辑投递记录</p><h2 id="application-edit-heading">投递记录</h2></div>
+          <button class="icon-button" id="application-edit-close" type="button" aria-label="关闭投递编辑" title="关闭">×</button>
+        </header>
+        <div id="application-edit-body"></div>
+      </div>
+    </dialog>
+
     <dialog id="application-create-dialog" class="job-detail-dialog schedule-editor-dialog" aria-labelledby="application-create-heading">
       <div class="job-detail-shell">
         <header class="job-detail-header">
@@ -826,6 +849,22 @@
       </div>
     </dialog>
 
+    <dialog id="mail-binding-dialog" class="job-detail-dialog mail-binding-dialog" aria-labelledby="mail-binding-heading">
+      <div class="job-detail-shell">
+        <header class="job-detail-header">
+          <div><p id="mail-binding-position" class="eyebrow">邮件关联</p><h2 id="mail-binding-heading">选择对应的投递</h2></div>
+          <button id="mail-binding-close" class="button button--ghost" type="button" aria-label="关闭，稍后处理邮件关联">稍后处理</button>
+        </header>
+        <div id="mail-binding-content" class="job-detail-content" aria-live="polite"></div>
+      </div>
+    </dialog>
+    <dialog id="review-results-dialog" class="job-detail-dialog review-results-dialog" aria-labelledby="review-results-heading">
+      <div class="job-detail-shell">
+        <header class="job-detail-header"><h2 id="review-results-heading">官网复核明细</h2>
+          <button id="review-results-close" class="button button--ghost" type="button">关闭</button></header>
+        <div id="review-results-content" class="job-detail-content" aria-live="polite"></div>
+      </div>
+    </dialog>
     <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
     <noscript>
       <div class="noscript-message">需要启用 JavaScript 才能读取 RecruitOps API。</div>

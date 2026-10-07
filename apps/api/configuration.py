@@ -376,7 +376,9 @@ def read_configuration():
         "model_migration_required": settings.model_connection_migration_required,
         "active_model_connection_id": active_connection_id,
         "configured_capabilities": {
-            key: getattr(settings, key) is True
+            # Form choices must survive the startup capability mask. Runtime
+            # readiness remains in `settings`; this metadata grants no authority.
+            key: preferences.get(key, getattr(settings, key)) is True
             for key in DESKTOP_CAPABILITY_FIELDS
         },
         "options": {

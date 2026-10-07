@@ -17,6 +17,7 @@ from sqlalchemy import select
 from packages.config import DEFAULT_OFFERBIU_INDUSTRY_GROUPS, Settings, get_settings
 from packages.browser_bridge import BrowserBridgeStore
 from packages.domain.models import RecruitmentBatch
+from packages.domain.urls import application_progress_channel
 from packages.discovery.company_registry import CompanySourceRecord, CompanySourceRegistry
 from packages.discovery.offerbiu_refresh import OfferBiuRefreshService
 from packages.discovery.reconciliation import normalize_company_name
@@ -50,6 +51,7 @@ from packages.reporting import build_reporting_summary
 from packages.storage import Storage
 from packages.storage.models import CompanySnapshot, JobSnapshot
 from packages.storage.sync import AgentStateStore
+from packages.storage.task_identity import task_identity
 from packages.tools.recruitment_mail import RecruitmentMailReviewInput, review_recruitment_mail
 from packages.tools.application_status_update import ApplicationStatusUpdateInput, update_application_status
 from packages.tools.typed import read_recruitment_persistence
@@ -449,7 +451,7 @@ def _link_unambiguous_recruitment_mail(
     *,
     settings: Settings | None = None,
 ) -> dict[str, int]:
-    """Link mail and apply only authenticated, uniquely bound progress evidence."""
+    """Link mail and apply uniquely bound, source-grounded progress evidence."""
 
     categories = [
         category
@@ -463,7 +465,6 @@ def _link_unambiguous_recruitment_mail(
         if record.processing_status in {
             RecruitmentMailProcessingStatus.IRRELEVANT.value,
             RecruitmentMailProcessingStatus.IGNORED.value,
-            RecruitmentMailProcessingStatus.NEEDS_AUTH_METADATA.value,
             RecruitmentMailProcessingStatus.AMBIGUOUS_APPLICATION.value,
             RecruitmentMailProcessingStatus.FAILED_TERMINAL.value,
         }:
@@ -523,7 +524,6 @@ def _link_unambiguous_recruitment_mail(
             conflicts += 1
             persisted = store.get(record_id=record.id)
             terminal_statuses = {
-                RecruitmentMailProcessingStatus.NEEDS_AUTH_METADATA.value,
                 RecruitmentMailProcessingStatus.AMBIGUOUS_APPLICATION.value,
                 RecruitmentMailProcessingStatus.FAILED_TERMINAL.value,
             }
@@ -735,6 +735,7 @@ def build_runtime_task_handlers(
         resumed_from: str | None = None,
         stop_requested: Event | None = None,
         company_batch_limit: int | None = None,
+        ownership: Mapping[str, Any] | None = None,
     ) -> DailyRecruitmentSync:
         if daily_sync is not None:
             return daily_sync
@@ -806,6 +807,7 @@ def build_runtime_task_handlers(
                 else mode
             ),
             "metadata": {
+                **(dict(ownership) if isinstance(ownership, Mapping) else {}),
                 "requested_mode": (
                     requested_mode
                     if requested_mode in _DAILY_MODES
@@ -1398,6 +1400,15 @@ def build_runtime_task_handlers(
                 resumed_from=resumed_from,
                 stop_requested=context.stop_requested,
                 company_batch_limit=company_batch_limit,
+                ownership={
+                    **task_identity(
+                        context.run_id,
+                        {**(dict(details) if isinstance(details, Mapping) else {}), **dict(context.metadata)},
+                        task_id=context.task_id,
+                    ),
+                    **({"automation_execution_id": context.metadata["automation_execution_id"]}
+                       if context.metadata.get("automation_execution_id") == context.run_id else {}),
+                },
             ).run(
                 run_id=context.run_id,
                 dry_run=requested_dry_run,
@@ -1413,16 +1424,30 @@ def build_runtime_task_handlers(
                 discovery_metrics.get("applied")
                 and discovery_metrics.get("registered_entries", 0)
             )
+            job_receipts = pipeline_metrics.get("job_write_statistics") or {}
+            committed_receipts = isinstance(job_receipts, dict) and (
+                job_receipts.get("basis") == "committed_insert_receipts"
+                and not requested_dry_run
+            )
+
+            def job_receipt_count(key):
+                if requested_dry_run:
+                    return 0
+                count = job_receipts.get(key) if committed_receipts else None
+                return count if type(count) is int and count >= 0 else None
+
             write_statistics = {
                 "source_registration_write_performed": source_registration_written,
                 "source_registered_entry_count": discovery_metrics.get("registered_entries"),
                 "pipeline_write_performed": bool(pipeline_metrics.get("written")),
-                "job_snapshot_write_count": None,
+                "job_snapshot_write_count": job_receipt_count("unique_written_count"),
+                "job_snapshot_insert_count": job_receipt_count("inserted_count"),
+                "job_snapshot_update_count": job_receipt_count("updated_count"),
                 "offline_reconciliation_write_performed": bool(offline_metrics.get("written")),
                 "basis": (
                     "Reported business-stage writes, excluding scheduler/checkpoint bookkeeping. "
-                    "Pipeline writes may include job snapshots and analysis; not a job row count. "
-                    "Per-run job write count is unknown without a row-level write receipt. "
+                    "Job row counts use committed per-run receipts; insert, update and unique written rows are distinct. "
+                    "Per-run job write counts are unknown without row-level receipts; dry runs write zero rows. "
                     "False means no write receipt, not proof that no partial writes occurred. "
                     "Registered entries count source rows, not distinct companies."
                 ),
@@ -1531,12 +1556,15 @@ def build_runtime_task_handlers(
 
     def application_progress(_context: TaskContext) -> dict[str, object]:
         applications = repo.list_applications()
-        pages = {item.record_url for item in applications if item.record_url}
+        mail_only_count = sum(application_progress_channel(item.record_url) == "mail_only" for item in applications)
+        pages = {item.record_url for item in applications
+                 if application_progress_channel(item.record_url) == "official_page"}
         return {
             "status": "waiting_browser" if pages else "no_reviewable_pages",
             "application_count": len(applications),
             "reviewable_page_count": len(pages),
             "missing_record_url_count": sum(not item.record_url for item in applications),
+            "excluded_mail_only": mail_only_count,
             "browser_navigation_attempted": False,
             "source_write_attempted": False,
         }

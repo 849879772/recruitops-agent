@@ -6,7 +6,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { _electron } = require('playwright');
 
-test('hidden real main reviews rAF, iframe and auth evidence without presenting a window', {timeout: 60000}, async t => {
+test('hidden real main reviews rAF, iframe and auth evidence without presenting a window', {timeout: 90000}, async t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'recruitops-review-anonymous-'));
   let foreignRequests=0;
   const foreignServer=http.createServer((_req,res)=>{foreignRequests++;res.end('foreign');});
@@ -19,7 +19,7 @@ test('hidden real main reviews rAF, iframe and auth evidence without presenting 
   const server=http.createServer((req,res)=>{
     if (req.url==='/missing') { req.socket.destroy(); return; }
     if (req.url==='/normal-redirect') { res.writeHead(302,{Location:'/redirected-records'});res.end();return; }
-    if (req.url==='/foreign-redirect') { res.writeHead(302,{Location:foreignOrigin+'/redirected'});res.end();return; }
+    if (req.url==='/foreign-redirect') { res.writeHead(302,{Location:foreignOrigin+'/sso/login?code=redirect-secret&email=person@example.test'});res.end();return; }
     res.setHeader('Content-Type','text/html; charset=utf-8');
     if (req.url==='/helper-frame') { res.end('<!doctype html><title>Helper</title>');return; }
     if (req.url==='/candidate/applications/deliver-query/dji') {
@@ -36,6 +36,21 @@ test('hidden real main reviews rAF, iframe and auth evidence without presenting 
     }
     if (req.url==='/denied-frame') {
       res.end(`<!doctype html><iframe src="${foreignOrigin}/records" width="900" height="500"></iframe>`);return;
+    }
+    if (req.url==='/denied-helper-delayed') {
+      res.end(`<!doctype html><main>Loading applications</main><iframe src="${foreignOrigin}/helper"></iframe>
+        <script>setTimeout(()=>document.querySelector('main').innerHTML=${JSON.stringify(oneRecordTable)},1400)</script>`);return;
+    }
+    if (req.url==='/not-found') {
+      res.statusCode=404;res.end('<!doctype html><title>404 Page not found</title><main>页面不存在</main>');return;
+    }
+    if (req.url==='/unparsed' || req.url==='/unparsed-helpers') {
+      res.end('<!doctype html><title>Applications</title><main>Application records account person@example.test</main>'+
+        (req.url==='/unparsed-helpers'?`<iframe hidden src="${foreignOrigin}/helper"></iframe><iframe src="about:blank"></iframe>
+          <iframe hidden src="/helper-frame"></iframe><iframe src="${foreignOrigin}/visible-helper" width="900" height="500"></iframe>`:''));return;
+    }
+    if (req.url==='/blank-hidden-helper') {
+      res.end(`<!doctype html><iframe hidden src="${foreignOrigin}/helper"></iframe>`);return;
     }
     if (req.url==='/hidden-record-frame') {
       res.end('<!doctype html><iframe hidden src="/redirected-records"></iframe>');return;
@@ -74,7 +89,7 @@ test('hidden real main reviews rAF, iframe and auth evidence without presenting 
         ? "location.hash='/applications'"
         : req.url==='/feishu-spa'
           ? "history.replaceState({},'',location.pathname+'#/app/application_center?tenant=anonymous')"
-          : `location.href=${JSON.stringify(foreignOrigin+'/foreign')}`;
+          : `location.href=${JSON.stringify(foreignOrigin+'/foreign?token=navigation-secret&email=person@example.test')}`;
       res.end(`<!doctype html><title>Navigation fixture</title><main>Loading applications</main><script>
         setTimeout(()=>{${transition}},100);
         setTimeout(()=>{document.querySelector('main').innerHTML=${JSON.stringify(oneRecordTable)}},600);
@@ -165,16 +180,22 @@ test('hidden real main reviews rAF, iframe and auth evidence without presenting 
     assert.equal(auth.result.result.database_updated,false);
     assert.equal(auth.result.result.application_records?.length||0,0);
   }
-  for (const route of ['/denied-frame','/hidden-record-frame']) {
+  for (const route of ['/denied-frame','/hidden-record-frame','/blank-hidden-helper']) {
     const failure=await application.evaluate(async(_electron,{origin,route})=>{
-      try {await globalThis.reviewFixture.reviewPage(origin+route,'scope-'+route.slice(1),['fixture-app'],undefined,Date.now()+1100);}
+      try {await globalThis.reviewFixture.reviewPage(origin+route,'scope-'+route.slice(1),['fixture-app'],undefined,
+        Date.now()+(route==='/denied-frame'?15000:1100));}
       catch(error){return {code:error.message,summary:error.lastObservation};}
     },{origin,route});
-    assert.equal(failure.code,'browser_readiness_timeout',route);
+    assert.equal(failure.code,route==='/denied-frame'?'FRAME_SCOPE_DENIED':'browser_readiness_timeout',route);
     assert.equal(failure.summary.recordCount,0);
     if(route==='/denied-frame') {
       assert.equal(failure.summary.pageState,'frame_scope_denied');
       assert.equal(failure.summary.skippedFrameCount,1);
+      assert.equal(failure.summary.scopeDeniedFrameCount,1);
+    } else if(route==='/blank-hidden-helper') {
+      assert.equal(failure.summary.pageState,'blank');
+      assert.equal(failure.summary.skippedFrameCount,1);
+      assert.equal(failure.summary.scopeDeniedFrameCount,0);
     }
   }
   assert.equal(foreignRequests,0);
@@ -183,21 +204,50 @@ test('hidden real main reviews rAF, iframe and auth evidence without presenting 
   assert.equal(delayedFrames.review_readiness,'records');
   assert.equal(delayedFrames.result.diagnostics.iframeCount,2);
   assert.equal(delayedFrames.result.application_records.length,1);
+  const deniedHelper=await application.evaluate(async(_electron,origin)=>globalThis.reviewFixture.reviewPage(
+    origin+'/denied-helper-delayed','delayed-with-denied-helper',['fixture-app'],undefined,Date.now()+5000),origin);
+  assert.equal(deniedHelper.review_readiness,'records');
+  assert.equal(deniedHelper.result.diagnostics.skippedFrameCount,1);
+  const unavailable=await application.evaluate(async(_electron,origin)=>globalThis.reviewFixture.reviewPage(
+    origin+'/not-found','unavailable-page',['fixture-app'],undefined,Date.now()+5000),origin);
+  assert.equal(unavailable.error_code,'APPLICATION_PAGE_UNAVAILABLE');
+  assert.equal(unavailable.result.database_updated,false);
+  for(const route of ['/unparsed','/unparsed-helpers']) {
+    const unparsed=await application.evaluate(async(_electron,{origin,route})=>globalThis.reviewFixture.reviewPage(
+      origin+route,'unparsed-page',['fixture-app'],undefined,Date.now()+16000),{origin,route});
+    assert.equal(unparsed.error_code,undefined,route);
+    assert.equal(unparsed.status,'SUCCEEDED');
+    assert.equal(unparsed.result.extraction_reason,'unparsed_page');
+    assert.equal(unparsed.result.evidence_only,true);
+    assert.equal(unparsed.result.database_updated,false);
+    assert.equal(unparsed.result.last_observation.pageState,'unrecognized_content');
+    assert.ok(unparsed.result.last_observation.sampling.elapsedMs>=12000);
+    assert.ok(!JSON.stringify(unparsed.result.last_observation).includes('person@'));
+    if(route==='/unparsed-helpers') {
+      assert.ok(unparsed.result.diagnostics.skippedFrameCount>=2);
+      assert.equal(unparsed.result.diagnostics.scopeDeniedFrameCount,1);
+    }
+  }
   const neverReady=await application.evaluate(async(_electron,origin)=>{
     try { await globalThis.reviewFixture.reviewPage(origin+'/iframe-never-ready','iframe-deadline',['fixture-app'],undefined,Date.now()+1100); }
     catch(error){return {code:error.message,summary:error.lastObservation};}
   },origin);
   assert.equal(neverReady.code,'browser_readiness_timeout');
   assert.equal(neverReady.summary.iframeCount,2);
-  assert.equal(neverReady.summary.pageState,'frame_unavailable');
+  assert.equal(neverReady.summary.pageState,'unrecognized_content');
   assert.equal(neverReady.summary.unavailableFrameCount,2);
-  for(const route of ['/client-login-redirect','/account.html']) {
+  for(const route of ['/client-login-redirect']) {
     const login=await application.evaluate(async(_electron,{origin,route})=>globalThis.reviewFixture.reviewPage(
       origin+route,'login-'+route.slice(1),['fixture-app'],undefined,Date.now()+3500),{origin,route});
     assert.equal(login.error_code,'LOGIN_REQUIRED',route);
     assert.equal(login.review_readiness,'login_required',route);
     assert.equal(login.result.database_updated,false);
   }
+  const publicHome=await application.evaluate(async(_electron,origin)=>globalThis.reviewFixture.reviewPage(
+    origin+'/account.html','public-home',['fixture-app'],undefined,Date.now()+16000),origin);
+  assert.equal(publicHome.review_readiness,'record_entry_required');
+  assert.equal(publicHome.error_code,'APPLICATION_RECORD_HOME_REDIRECT');
+  assert.equal(publicHome.result.navigation_diagnostics.reason,'application_record_home_redirect');
   const clientRedirect=await application.evaluate(async(_electron,origin)=>globalThis.reviewFixture.reviewPage(
     origin+'/client-record-redirect','client-record-redirect',['fixture-app'],undefined,Date.now()+3500),origin);
   assert.equal(clientRedirect.review_readiness,'records');
@@ -217,14 +267,22 @@ test('hidden real main reviews rAF, iframe and auth evidence without presenting 
     origin+'/normal-redirect','normal-redirect',['fixture-app'],undefined,Date.now()+3000),origin);
   assert.equal(redirected.review_readiness,'records');
   assert.equal(redirected.result.page.page_url,origin+'/redirected-records');
+  assert.equal(redirected.result.navigation_diagnostics.sameOrigin,true);
+  assert.equal(redirected.result.navigation_diagnostics.reason,'will_redirect_same_origin');
   const foreignRedirect=await application.evaluate(async(_electron,args)=>{
     try {
       await globalThis.reviewFixture.reviewPage(args.origin+'/foreign-redirect','foreign-redirect',
         ['fixture-app'],undefined,Date.now()+3000);
       return 'unexpectedly-reviewed';
-    } catch(error) { return error.message; }
+    } catch(error) { return {code:error.message,navigation:error.navigation}; }
   },{origin,foreignOrigin});
-  assert.equal(foreignRedirect,'browser_navigation_changed');
+  assert.equal(foreignRedirect.code,'browser_navigation_changed');
+  assert.equal(foreignRedirect.navigation.reason,'will_redirect_cross_origin');
+  assert.equal(foreignRedirect.navigation.attemptedUrl,foreignOrigin+'/sso/login');
+  assert.equal(foreignRedirect.navigation.ssoCandidate,true);
+  assert.equal(foreignRedirect.navigation.sameOrigin,false);
+  assert.ok(!JSON.stringify(foreignRedirect).includes('redirect-secret'));
+  assert.ok(!JSON.stringify(foreignRedirect).includes('person@'));
   assert.equal(foreignRequests,0,'the redirect target is rejected before any foreign request reaches the local fixture');
   for(const [route,expectedHash,operationId] of [
     ['/hash-change','#/applications','owned-hash-change'],
@@ -244,9 +302,13 @@ test('hidden real main reviews rAF, iframe and auth evidence without presenting 
       await globalThis.reviewFixture.reviewPage(args.origin+'/foreign-navigation','foreign-navigation',
         ['fixture-app'],undefined,Date.now()+3000);
       return 'unexpectedly-reviewed';
-    } catch(error) { return error.message; }
+    } catch(error) { return {code:error.message,navigation:error.navigation}; }
   },{origin,foreignOrigin});
-  assert.equal(foreignAttempt,'browser_navigation_changed');
+  assert.equal(foreignAttempt.code,'browser_navigation_changed');
+  assert.ok(['will_navigate_cross_origin','did_start_navigation_cross_origin'].includes(foreignAttempt.navigation.reason));
+  assert.equal(new URL(foreignAttempt.navigation.attemptedUrl).origin,foreignOrigin);
+  assert.equal(foreignAttempt.navigation.sameOrigin,false);
+  assert.ok(!JSON.stringify(foreignAttempt).includes('navigation-secret'));
   assert.equal(foreignRequests,0,'the foreign navigation is rejected before any foreign request reaches the local fixture');
   await shell.evaluate(url=>window.desktop.command({action:'open',url}),origin+'/two-applications');
   await shell.waitForFunction(async()=>{

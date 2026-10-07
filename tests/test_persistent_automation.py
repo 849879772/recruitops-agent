@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, time, timezone
 
+import pytest
+
 from packages.automation import (
+    AutomationRunningError,
     AutomationRunResult,
     AutomationStore,
     LocalAutomationWorker,
@@ -80,6 +83,30 @@ def test_same_task_and_target_can_run_at_multiple_daily_times(tmp_path) -> None:
     assert morning.id != evening.id
     assert len(rows) == 2
     assert {row.start_time for row in rows} == {time(9, 0), time(18, 0)}
+
+
+def test_delete_schedule_removes_completed_history_but_not_running_work(tmp_path) -> None:
+    store = AutomationStore(_storage(tmp_path))
+    schedule = store.upsert_daily(
+        task_id="application_progress", task_label="投递复核", start_time=time(3, 0),
+        now=datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc),
+    )
+    claimed = store.claim_due(now=datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc))
+    assert claimed is None
+    with store.storage.transaction(write=True) as session:
+        session.get(type(schedule), schedule.id).next_run_at = datetime(
+            2026, 9, 19, 19, 0, tzinfo=timezone.utc,
+        )
+    claimed = store.claim_due(now=datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc))
+    assert claimed is not None
+    with pytest.raises(AutomationRunningError):
+        store.delete(schedule.id)
+    assert len(store.list()) == 1
+    store.complete(claimed.execution_id, status="succeeded")
+    assert store.delete(schedule.id) == 1
+    assert store.list() == []
+    assert store.executions(schedule.id) == []
+    assert store.delete(schedule.id) is None
 
 
 def test_schedule_saved_before_due_time_is_claimed_on_first_poll_after_due(tmp_path) -> None:

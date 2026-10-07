@@ -274,3 +274,19 @@ def test_daily_sync_tool_forwards_stage_mode(tmp_path, mode) -> None:
 def test_resume_mode_requires_a_run_id() -> None:
     with pytest.raises(ValidationError, match="resume_run_id"):
         DailyRecruitmentSyncInput(mode="resume")
+
+
+def test_daily_status_retains_committed_job_receipts_and_pending_detail_counts():
+    receipts = {"basis": "committed_insert_receipts", "inserted_count": 9,
+                "updated_count": 18, "unique_written_count": 27,
+                "new_complete_count": 0, "new_pending_count": 0, "new_failed_count": 9}
+    compact = _compact_status_result({
+        "status": "partial", "warnings": ["details incomplete"],
+        "write_statistics": {"job_snapshot_insert_count": 9},
+        "pipeline": {"selected_companies": 1360, "new": 9,
+                     "job_write_statistics": receipts, "failed_jobs": 1239},
+    })
+    assert compact["new"] == 9
+    assert compact["job_write_statistics"] == receipts
+    assert compact["write_statistics"] == {"job_snapshot_insert_count": 9}
+    assert compact["run_status"] == "partial"

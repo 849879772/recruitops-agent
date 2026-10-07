@@ -38,7 +38,9 @@ ProcessFactory: TypeAlias = Callable[
     [Sequence[str], Path | None, Mapping[str, str] | None], Awaitable[ProcessLike]
 ]
 NotificationHandler: TypeAlias = Callable[["JsonRpcNotification"], Any]
-CODEX_STDIO_READER_LIMIT = 4 * 1024 * 1024
+# Thread history is one JSON-RPC line and can exceed 4 MiB even for normal
+# long-running reviews. Keep a finite ceiling rather than unlimited buffering.
+CODEX_STDIO_READER_LIMIT = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -324,9 +326,14 @@ class JsonRpcStdioClient:
     async def _read_loop(self) -> None:
         try:
             while True:
-                line = await self.process.stdout.readline()
+                try:
+                    line = await self.process.stdout.readline()
+                except (ValueError, asyncio.LimitOverrunError) as exc:
+                    raise JsonRpcProtocolError("JSON-RPC message exceeds reader limit") from exc
                 if line in (b"", ""):
                     return
+                if len(line) > CODEX_STDIO_READER_LIMIT:
+                    raise JsonRpcProtocolError("JSON-RPC message exceeds reader limit")
                 if isinstance(line, bytes):
                     line = line.decode("utf-8")
                 if not line.strip():

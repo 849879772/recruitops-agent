@@ -327,6 +327,7 @@ class PostgresRecruitmentRepository:
                 source_stage=row.source_stage,
                 source_status=row.source_status,
                 source_status_synced_at=row.source_status_synced_at,
+                last_review=row.last_review,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
                 source=row.source,
@@ -392,6 +393,7 @@ class PostgresRecruitmentRepository:
                     source_stage=row.source_stage,
                     source_status=row.source_status,
                     source_status_synced_at=row.source_status_synced_at,
+                    last_review=row.last_review,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
                     source=row.source,
@@ -417,6 +419,8 @@ class PostgresRecruitmentRepository:
         )
         with self.storage.session() as session:
             rows = list(session.scalars(statement))
+            from packages.recruitment_mail.scheduling import mail_schedule_associations
+            associations = mail_schedule_associations(session, rows)
         return [
             ScheduleEvent(
                 id=row.id,
@@ -432,6 +436,8 @@ class PostgresRecruitmentRepository:
                 starts_at=row.starts_at,
                 ends_at=row.ends_at,
                 application_id=row.application_id,
+                application_ids=associations.get(row.source_ref, {}).get("application_ids", [row.application_id] if row.application_id else []),
+                associated_jobs=associations.get(row.source_ref, {}).get("associated_jobs", []),
                 location_or_link=row.location_or_link,
                 note=row.note,
                 created_at=row.created_at,

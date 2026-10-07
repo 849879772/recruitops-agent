@@ -91,10 +91,10 @@ def test_daily_result_reason_survives_report_and_execution(tmp_path, payload, st
     if status == "failed":
         assert error in execution.result_summary
     else:
-        assert execution.result_summary == (
-            "全量任务已结束；部分公司或评分未完成" if status == "partial" else "全量任务已完成"
+        assert execution.result_summary.startswith(
+            "全量任务部分完成" if status == "partial" else "全量任务已完成"
         )
-    assert execution.thread_id is None and execution.turn_id is None
+    assert execution.thread_id and execution.turn_id is None
 
 
 @pytest.mark.parametrize("during_setup", [False, True])

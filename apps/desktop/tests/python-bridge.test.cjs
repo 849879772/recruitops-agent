@@ -35,6 +35,8 @@ test('REAL Python bridge + official consumer verify updates, replay, cancellatio
       await new Promise(resolve => setTimeout(resolve, 100));
       assert.equal(signal.aborted, false, 'a readiness stage must not disconnect the bridge');
       onStage('VALIDATING');
+      // Visual evidence follows DOM validation without regressing to EXTRACTING.
+      onStage('VALIDATING');
     }
     if (id === 'unclear-op') {
       onStage('EXTRACTING');
@@ -44,6 +46,13 @@ test('REAL Python bridge + official consumer verify updates, replay, cancellatio
     }
     if (id === 'failed-op') throw new ReviewObservationError('browser_readiness_timeout',reviewDiagnosticSummary({result:{
       application_records:[],diagnostics:{iframeCount:2,frameCount:3,skippedFrameCount:2}}}));
+    if (id === 'consumer-scope-denied') throw new ReviewObservationError('FRAME_SCOPE_DENIED',reviewDiagnosticSummary({result:{
+      page:{page_url:url,text:''},application_records:[],diagnostics:{skippedFrameCount:1,scopeDeniedFrameCount:1,frameCount:2}}}));
+    if (id === 'consumer-page-unavailable') return {
+      type:'result',operation_id:id,status:'STATE_UNCLEAR',error_code:'APPLICATION_PAGE_UNAVAILABLE',
+      result:{evidence_only:true,database_updated:false,page_url:url,application_ids:ids,
+        page:{page_url:url,origin:new URL(url).origin,path:new URL(url).pathname,title:'404 Page not found',text:'页面不存在'}}
+    };
     if (id.startsWith('consumer-')) {
       assert.deepEqual(ids,['consumer-app']);
       if (id === 'consumer-interrupted') return new Promise(resolve => signal.addEventListener('abort',()=>{ interrupted = true; resolve({}); }));
@@ -125,6 +134,15 @@ test('REAL Python bridge + official consumer verify updates, replay, cancellatio
     assert.equal(fresh.success,true); assert.equal(fresh.data.verification.status,'unchanged');
     assert.equal((await request(runtime,'/fixture/state/consumer-interrupted')).status,'CANCELLED');
     assert.equal(counts.get('consumer-interrupted'),1); assert.equal(counts.get('consumer-resumed'),1);
+    for (const id of ['consumer-scope-denied','consumer-page-unavailable']) {
+      const before=await request(runtime,'/fixture/readable/consumer-update');
+      const rejected=await request(runtime,'/fixture/workflow',{device_id:'desktop-cross-language',operation_id:id});
+      assert.equal(rejected.success,false);
+      const after=await request(runtime,`/fixture/readable/${id}`);
+      assert.equal(after.stage,before.stage);
+      assert.equal(after.audits,before.audits);
+      assert.deepEqual(after.history,before.history);
+    }
     for (const [id,status] of [['unclear-op','STATE_UNCLEAR'],['failed-op','FAILED']]) {
       await request(runtime,'/fixture/create',{device_id:'desktop-cross-language',operation_id:id});
       await wait(async()=> (await request(runtime,`/fixture/state/${id}`)).result !== null);
@@ -132,7 +150,8 @@ test('REAL Python bridge + official consumer verify updates, replay, cancellatio
       assert.equal(result.status,status);
       assert.equal(result.result.database_updated,false);
       if(id==='failed-op') {
-        assert.equal(result.result.last_observation.pageState,'frame_scope_denied');
+        assert.equal(result.result.last_observation.pageState,'blank');
+        assert.equal(result.result.last_observation.scopeDeniedFrameCount,0);
         assert.equal(result.result.last_observation.skippedFrameCount,2);
         assert.equal(result.result.last_observation.iframeCount,2);
       }

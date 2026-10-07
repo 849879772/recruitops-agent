@@ -187,12 +187,22 @@ def test_token_bypass_is_scoped_to_local_ui():
         local_ui.local_ui_request.reset(token)
 
 
-def test_ui_uses_inline_editor_not_assistant_prompt():
+def test_ui_uses_application_editor_dialog_not_assistant_prompt():
     from pathlib import Path
-    js = (Path(__file__).parents[1] / 'apps/web/app.js').read_text(encoding='utf-8')
+    web = Path(__file__).parents[1] / 'apps/web'
+    js = (web / 'app.js').read_text(encoding='utf-8')
+    html = (web / 'index.html').read_text(encoding='utf-8')
     assert 'menu.dataset.assistantPrompt' not in js
     assert 'requestSessionToken' not in js
-    assert 'editor.hidden = !editor.hidden' in js
+    assert '<dialog id="application-edit-dialog"' in html
+    assert 'menu.setAttribute("aria-haspopup", "dialog")' in js
+    assert 'openApplicationEditor(application.id);' in js
+    opener = js.split('function openApplicationEditor(', 1)[1].split('function applicationEditor(', 1)[0]
+    assert 'body.appendChild(applicationEditor(application));' in opener
+    assert 'if (!dialog.open) dialog.showModal();' in opener
+    editor = js.split('function applicationEditor(', 1)[1].split('function ', 1)[0]
+    assert '/api/local-ui/applications/${encodeURIComponent(application.id)}' in editor
+    assert 'await request("PATCH",' in editor
 
 
 def seed_record_job(storage, title="New Engineer"):

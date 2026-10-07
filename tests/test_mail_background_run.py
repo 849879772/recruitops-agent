@@ -166,6 +166,71 @@ def test_background_failure_reports_safe_code_and_preserves_pending(monkeypatch)
     assert store.get(records[0].id).processing_status == "pending"
 
 
+@pytest.mark.parametrize("sync_status", ["synced", "cached", "failed", "disabled"])
+def test_mail_run_persists_sync_outcome_and_does_not_claim_freshness(monkeypatch, sync_status):
+    store, records, service = case(2)
+    calls = []
+    service.sync_mail = lambda: {"status": sync_status, "synced_at": "2026-09-27T00:00:00+00:00",
+        "error_type": "TimeoutError" if sync_status == "failed" else None,
+        "sync": {"fetched": 2, "inserted": 2, "reused": 0}}
+    monkeypatch.setattr(runs, "process_pending_mail", processor(calls))
+    result = service.run(service.start(background=False)["run_id"])
+    assert result["completed"] == 2 and result["remaining"] == 0
+    assert result["freshness"]["status"] == sync_status
+    if sync_status in {"synced", "cached"}:
+        assert result["status"] == "completed" and not result.get("sync_warning")
+    else:
+        assert result["status"] == "partial" and result["sync_warning"]
+    assert service.status(result["run_id"])["run"]["freshness"] == result["freshness"]
+
+
+def test_sync_exception_is_safe_and_local_mail_can_still_be_processed(monkeypatch):
+    store, records, service = case(1)
+    def sync():
+        raise RuntimeError("secret password and private mail body")
+    service.sync_mail = sync
+    monkeypatch.setattr(runs, "process_pending_mail", processor([]))
+    result = service.run(service.start(background=False)["run_id"])
+    assert result["status"] == "partial" and result["completed"] == 1
+    assert result["freshness"]["error_type"] == "RuntimeError"
+    assert "secret password" not in str(result)
+
+
+@pytest.mark.parametrize("sync_result", [None, {"status": "unexpected"}, {"status": "failed"}])
+def test_failed_sync_with_empty_local_mail_is_not_completed(sync_result):
+    store, records, service = case(0)
+    service.sync_mail = lambda: sync_result
+    result = service.run(service.start(background=False)["run_id"])
+    assert result["status"] == "partial" and result["sync_warning"]
+    assert result["completed"] == result["total"] == 0
+    assert result["freshness"]["status"] == "failed"
+
+
+def test_explicit_local_only_processing_does_not_claim_mailbox_refresh(monkeypatch):
+    store, records, service = case(1)
+    service.sync_mail = lambda: pytest.fail("local-only run synchronized mail")
+    monkeypatch.setattr(runs, "process_pending_mail", processor([]))
+    result = service.run(service.start(background=False, refresh=False)["run_id"])
+    assert result["status"] == "completed" and result["completed"] == 1
+    assert result["freshness"]["status"] == "not_requested"
+
+
+def test_sync_warning_survives_resume_without_resyncing_frozen_scope(monkeypatch):
+    store, records, service = case(2)
+    sync_calls = []
+    service.sync_mail = lambda: sync_calls.append(1) or {"status": "failed", "error_type": "mail_sync_in_progress"}
+    run_id = service.start(background=False)["run_id"]
+    monkeypatch.setattr(runs, "process_pending_mail", processor([], lambda _: service.control(run_id, "pause", background=False)))
+    first = service.run(run_id)
+    assert first["status"] == "paused" and first["sync_warning"]
+    service.control(run_id, "resume", background=False)
+    monkeypatch.setattr(runs, "process_pending_mail", processor([]))
+    result = service.run(run_id)
+    assert result["status"] == "partial" and result["completed"] == 2
+    assert result["freshness"]["error_type"] == "mail_sync_in_progress"
+    assert sync_calls == [1]
+
+
 def test_status_lists_all_recoverable_candidates_without_starting_any_worker():
     store, records, service = case(1)
     identifiers = []

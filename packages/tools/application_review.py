@@ -11,7 +11,7 @@ from pydantic import Field, field_validator
 
 from packages.approval import ApprovalPreview, OperationName
 from packages.domain.models import Application, ApplicationStage
-from packages.domain.urls import normalize_http_page_url
+from packages.domain.urls import application_progress_channel, normalize_http_page_url
 from packages.repositories.base import RecruitmentRepository
 
 from .typed import (
@@ -117,6 +117,8 @@ class ApplicationStatusReviewData(ToolModel):
     proposals: list[ApplicationStatusProposal] = Field(default_factory=list)
     unchanged: list[ReviewUnchanged] = Field(default_factory=list)
     unresolved: list[ReviewUnresolved] = Field(default_factory=list)
+    excluded: list[ReviewApplication] = Field(default_factory=list)
+    excluded_mail_only: int = Field(default=0, ge=0)
     applications_total: int = Field(ge=0)
     pages_total: int = Field(ge=0)
 
@@ -324,7 +326,13 @@ def application_status_review(
     selected = set(request.application_ids)
     if selected:
         applications = [item for item in applications if item.id in selected]
-    targets, unresolved = _build_targets(applications)
+    excluded = [ReviewApplication(
+        application_id=item.id, company_name=item.company_name,
+        job_title=item.job_title, current_stage=item.stage,
+    ) for item in applications if application_progress_channel(item.record_url) == "mail_only"]
+    targets, unresolved = _build_targets([
+        item for item in applications if application_progress_channel(item.record_url) == "official_page"
+    ])
     evidence = [EvidenceSource(source="applications.json", source_ref=item.id) for item in applications]
     if not evidence:
         evidence = [EvidenceSource(source="recruitment_repository", source_ref="applications")]
@@ -333,17 +341,19 @@ def application_status_review(
             review_id=request.review_id,
             mode=ReviewMode.RECONCILE if request.observations else ReviewMode.PLAN,
             unresolved=unresolved,
+            excluded=excluded,
+            excluded_mail_only=len(excluded),
             applications_total=len(applications),
             pages_total=0,
         )
         return ApplicationStatusReviewResponse(
             tool_name="application_status_review",
-            status=ToolStatus.NO_RESULTS,
-            success=False,
+            status=ToolStatus.SUCCESS if excluded else ToolStatus.NO_RESULTS,
+            success=bool(excluded),
             data=data,
             evidence=evidence,
-            error_code=ToolErrorCode.NO_RESULTS,
-            error_message="No application record URLs are available for browser review.",
+            error_code=None if excluded else ToolErrorCode.NO_RESULTS,
+            error_message=None if excluded else "No application record URLs are available for browser review.",
             timeout_ms=request.timeout_ms,
             elapsed_ms=0,
             read_only=True,
@@ -358,6 +368,8 @@ def application_status_review(
                 mode=ReviewMode.PLAN,
                 targets=targets,
                 unresolved=unresolved,
+                excluded=excluded,
+                excluded_mail_only=len(excluded),
                 applications_total=len(applications),
                 pages_total=len(targets),
             ),
@@ -471,6 +483,8 @@ def application_status_review(
             proposals=proposals,
             unchanged=unchanged,
             unresolved=unresolved,
+            excluded=excluded,
+            excluded_mail_only=len(excluded),
             applications_total=len(applications),
             pages_total=len(targets),
         ),

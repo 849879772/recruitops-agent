@@ -42,6 +42,12 @@ from packages.tools.application_review_tasks import (
     application_review_status,
     control_application_review,
 )
+from packages.tools.application_review_results import (
+    ApplicationReviewResultsInput,
+    ApplicationReviewResultsResponse,
+    application_review_results,
+    compact_batch_response,
+)
 from packages.tools.browser import (
     BrowserObservationInput,
     BrowserObservationResponse,
@@ -122,6 +128,8 @@ from packages.tools.application_status_update import (
     update_application_status,
 )
 from packages.tools.operations import (
+    AutomationScheduleDeleteInput,
+    AutomationScheduleDeleteResponse,
     AutomationScheduleDisableInput,
     AutomationScheduleDisableResponse,
     AutomationScheduleInput,
@@ -134,6 +142,7 @@ from packages.tools.operations import (
     OperationalTaskRunResponse,
     OperationalTaskRunner,
     activate_automation,
+    delete_automation,
     disable_automation,
     list_automations,
     plan_automation,
@@ -212,6 +221,13 @@ from .task_tools import (
     recruitment_mail_run_control,
     recruitment_mail_binding_candidates_operation,
     recruitment_mail_binding_propose_operation,
+    application_identity_candidates_operation,
+    application_identity_propose_operation,
+)
+
+from packages.tools.application_identity_binding import (
+    ApplicationIdentityCandidatesInput, ApplicationIdentityCandidatesResponse,
+    ApplicationIdentityProposeInput, ApplicationIdentityProposeResponse,
 )
 
 
@@ -275,7 +291,7 @@ class MCPToolDefinition:
     open_world: bool = False
 
 
-MCP_TOOL_PROTOCOL_VERSION = "25"
+MCP_TOOL_PROTOCOL_VERSION = "29"
 
 
 MCP_READ_ONLY_TOOL_NAMES: tuple[str, ...] = (
@@ -305,8 +321,10 @@ MCP_READ_ONLY_TOOL_NAMES: tuple[str, ...] = (
     "daily_recruitment_sync_status",
     "background_task_status",
     "application_review_status",
+    "application_review_results",
     "recruitment_mail_run_status",
     "recruitment_mail_binding_candidates",
+    "application_identity_candidates",
 )
 
 MCP_ACTION_TOOL_NAMES: tuple[str, ...] = (
@@ -324,11 +342,13 @@ MCP_ACTION_TOOL_NAMES: tuple[str, ...] = (
     "offerbiu_source_refresh",
     "automation_schedule",
     "automation_schedule_disable",
+    "automation_schedule_delete",
     "daily_recruitment_sync_control",
     "application_review_control",
     "recruitment_mail_run_start",
     "recruitment_mail_run_control",
     "recruitment_mail_binding_propose",
+    "application_identity_propose",
 )
 
 MCP_TOOL_NAMES: tuple[str, ...] = (
@@ -365,6 +385,7 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "automation_schedule",
     "automation_schedule_list",
     "automation_schedule_disable",
+    "automation_schedule_delete",
     "application_capture",
     "operation_run",
     "daily_recruitment_sync",
@@ -373,12 +394,15 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "background_task_status",
     "daily_recruitment_sync_control",
     "application_review_status",
+    "application_review_results",
     "application_review_control",
     "recruitment_mail_run_start",
     "recruitment_mail_run_status",
     "recruitment_mail_run_control",
     "recruitment_mail_binding_candidates",
     "recruitment_mail_binding_propose",
+    "application_identity_candidates",
+    "application_identity_propose",
 )
 
 # The Codex App Server uses this deliberately smaller surface. Low-level audit,
@@ -413,18 +437,22 @@ MCP_AGENT_TOOL_NAMES: tuple[str, ...] = (
     "automation_schedule",
     "automation_schedule_list",
     "automation_schedule_disable",
+    "automation_schedule_delete",
     "daily_recruitment_sync",
     "offerbiu_source_refresh",
     "daily_recruitment_sync_status",
     "background_task_status",
     "daily_recruitment_sync_control",
     "application_review_status",
+    "application_review_results",
     "application_review_control",
     "recruitment_mail_run_start",
     "recruitment_mail_run_status",
     "recruitment_mail_run_control",
     "recruitment_mail_binding_candidates",
     "recruitment_mail_binding_propose",
+    "application_identity_candidates",
+    "application_identity_propose",
 )
 
 
@@ -467,6 +495,7 @@ def _sync_mail_before_read(
     dependencies: MCPToolDependencies,
     *,
     limit: int = 100,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Refresh local mail state before every mail read/review invocation."""
 
@@ -475,7 +504,7 @@ def _sync_mail_before_read(
     settings = get_settings()
     if not bool(getattr(settings, "write_enabled", False)):
         return {"status": "disabled", "reason": "write_disabled", "sync": {}}
-    return ensure_mail_fresh(settings, dependencies.mail_store, limit=limit)
+    return ensure_mail_fresh(settings, dependencies.mail_store, limit=limit, force=force)
 
 
 def _recruitment_mail_process_operation(
@@ -518,7 +547,7 @@ def _mail_sync_operation(
     from time import perf_counter
 
     started = perf_counter()
-    result = _sync_mail_before_read(dependencies, limit=request.limit)
+    result = _sync_mail_before_read(dependencies, limit=request.limit, force=True)
     if result.get("status") not in {"synced", "cached"}:
         return RecruitmentMailSyncResponse(
             tool_name="recruitment_mail_sync",
@@ -527,7 +556,9 @@ def _mail_sync_operation(
             data={"sync": result.get("sync") or {}, "freshness": result},
             evidence=[EvidenceSource(source="imap_readonly")],
             error_code=ToolErrorCode.SOURCE_UNAVAILABLE,
-            error_message="Mailbox synchronization was unavailable.",
+            error_message=("Mailbox synchronization is already in progress; its result is not yet available."
+                           if result.get("error_type") == "mail_sync_in_progress"
+                           else "Mailbox synchronization was unavailable."),
             timeout_ms=request.timeout_ms,
             elapsed_ms=max(0, int((perf_counter() - started) * 1000)),
             read_only=False,
@@ -830,6 +861,21 @@ def _automation_schedule_disable_operation(
     return disable_automation(request, dependencies.automation_store)
 
 
+def _automation_schedule_delete_operation(
+    request: AutomationScheduleDeleteInput,
+    dependencies: MCPToolDependencies,
+) -> BaseModel:
+    if dependencies.automation_store is None:
+        return _missing_dependency_response(
+            request,
+            AutomationScheduleDeleteResponse,
+            tool_name="automation_schedule_delete",
+            dependency_name="automation_store",
+            read_only=False,
+        )
+    return delete_automation(request, dependencies.automation_store)
+
+
 def _application_capture_operation(
     request: Any,
     dependencies: MCPToolDependencies,
@@ -870,11 +916,12 @@ async def _batch_observe_application_status_operation(
     request: Any,
     dependencies: MCPToolDependencies,
 ) -> BaseModel:
-    return await batch_observe_application_status(
+    result = await batch_observe_application_status(
         request,
         dependencies.browser_bridge,
         dependencies.repository,
     )
+    return compact_batch_response(result)
 
 
 def _verify_application_status_evidence_operation(
@@ -947,7 +994,9 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
     ),
     MCPToolDefinition(
         name="application_status_review",
-        description="Plan or reconcile approval-gated application status browser observations.",
+        description=("Plan or reconcile approval-gated application status browser observations. "
+                     "Mail-only records without a valid saved record_url are excluded_mail_only, "
+                     "not unresolved; never invent a progress URL."),
         input_model=ApplicationStatusReviewInput,
         response_model=ApplicationStatusReviewResponse,
         operation=_repository_operation(application_status_review),
@@ -1006,12 +1055,16 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         description=(
             "For an explicit processing request, refresh the mailbox once and process a bounded "
             "set of eligible pending or retryable messages. The service skips already processed "
-            "and terminal messages, limits its internal model batch to ten, and returns the actual "
+            "and non-retryable messages, limits its internal model batch to ten, and returns the actual "
             "per-record proposed, verified, written, unchanged, unresolved, and failed outcomes. "
             "Inspect has_more, remaining_count and scope_complete. For all-pending requests, "
             "continue the same scope after progress while has_more is true, at most five calls. "
             "Aggregate counts; do not claim all mail is complete after a single batch. "
-            "Do not retry this tool speculatively or replay pending body classification in the tool."
+            "Do not retry this tool speculatively or replay pending body classification in the tool. "
+            "Transient model errors have bounded internal retries and cooldowns. Distinguish model_attempted_count "
+            "from historical_failure_count; new mailbox sync does not prove new model analysis. After the user "
+            "explicitly requests a failed-mail retry, use recruitment_mail_run_start with retry_failed=true "
+            "and selected record_ids instead of resetting evidence or repeatedly calling this tool."
         ),
         input_model=RecruitmentMailProcessInput,
         response_model=RecruitmentMailProcessResponse,
@@ -1076,6 +1129,9 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
             "may include expected_updated_at. company_name is required but job_title may be "
             "empty for a company-level todo. Explicit application_id is checked exactly; a "
             "missing binding remains null and an empty bound job is filled from the application. "
+            "For an unchanged application binding, omit company_name/job_title when updating "
+            "status, time, or notes; stored display labels are refreshed from the application. "
+            "Explicit identity edits and new bindings still require matching names. "
             "An item without event_date is canonicalized to time_kind=unspecified; adding a "
             "date canonicalizes unspecified to appointment, while a date without a clock stays "
             "date-only. This local schedule write does not submit an "
@@ -1101,6 +1157,8 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         description=(
             "Open one non-terminal stored application page in Edge and return bounded semantic "
             "evidence. Rejected and withdrawn applications are closed and are never opened. "
+            "Applications without a valid saved record_url are mail-only (仅邮件更新); "
+            "skip browser work and never invent or supply an alternative progress URL. "
             "Start with include_vision=false. Only use include_vision=true for an individual "
             "follow-up after a prior DOM-only observation has no bindable evidence and the single "
             "page has a clear target; supply "
@@ -1116,9 +1174,15 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
     MCPToolDefinition(
         name="batch_observe_application_status",
         description=(
-            "Batch observe stored application pages concurrently; this tool is DOM-only and never "
-            "starts vision analysis. Rejected and withdrawn applications are excluded before any "
-            "browser operation. For a complete current/non-terminal review, set "
+            "Batch observe stored application pages concurrently. It uses deterministic evidence, "
+            "then bounded page-text model review and optional visual fallback for still-unresolved readable pages. "
+            "Omit include_vision or pass true for normal batches; the service already starts DOM-only. "
+            "Use false only when the user explicitly declines image upload, not to choose the initial read mode. "
+            "Models must quote uniquely bound saved evidence; no CAPTCHA, login-wall or blank-page screenshots. "
+            "Rejected and withdrawn applications are excluded before any "
+            "browser operation. Mail-only applications without a valid saved record_url "
+            "are skipped as excluded_mail_only, not failed or unresolved. Never guess a URL. "
+            "For a complete current/non-terminal review, set "
             "all_non_terminal=true and omit application_ids; do not call application_query "
             "with list_all=true just to collect IDs. "
             "The all-mode processes a bounded wave and persists its frozen scope. "
@@ -1129,11 +1193,25 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
             "scope_complete=true. Counts are cumulative, not per-call. Never subtract "
             "excluded_terminal from scope_total again. Do not restart all-mode on timeout. "
             "No separate bridge or capabilities call is required. "
-            "Return updated, unchanged, excluded, blocked, unresolved and failed "
-            "counts accurately. In normal user-facing summaries translate them to 已更新, 状态未变化, "
-            "已跳过（已挂）, 需要登录或验证, 无法确认, and 执行失败; "
+            "Keep internal updated, unchanged, excluded, blocked, unresolved and failed counts accurate. "
+            "Lead user summaries with updates and unchanged_or_retained_count. Use retained_count and "
+            "retained_by_stage, or presentation_state=retained with saved_stage, to describe retained rows "
+            "as 未发现新进展，保留原阶段; applied stays applied and later stages never revert. "
+            "Retained rows remain unresolved internally and are not verified unchanged. Keep their actual "
+            "reasons in details and complete reason_breakdown in audit, not all in the main conclusion. "
+            "attention_required_count covers other unresolved rows; genuine login/CAPTCHA, timeouts and "
+            "execution failures still receive separate notices. Translate updated/verified unchanged/"
+            "excluded/blocked/remaining unresolved/failed as 已更新, 状态未变化, 已跳过, 需要登录或验证, "
+            "无法确认, and 执行失败; distinguish excluded_mail_only as "
+            "已跳过（仅邮件更新） from rejected/withdrawn exclusions. "
+            "identity_confirmation_items are a retained subset collected in the deduplicated 待核对 queue. "
+            "Direct the user to open that list and select a candidate; do not repeatedly generate cards or require typed "
+            "confirmation text or internal IDs. Only an actual user click may approve the existing "
+            "proposal/approval/execution flow; never auto-approve an identity binding. "
+            "An all-mail-only scope requires no browser connection. Exclusion is not verification. "
             "login, CAPTCHA and unclear evidence do not count as successful verification. "
-            "Use the separate individual observation flow for a justified visual fallback."
+            "Read model_record_dispositions and vision_record_dispositions before claiming model review; "
+            "distinguish actual calls, cache reuse, skips and failures. Bounded capture does not prove page completeness."
         ),
         input_model=BatchObserveApplicationStatusInput,
         response_model=BatchObserveApplicationStatusResponse,
@@ -1146,6 +1224,8 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         description=(
             "Commit a model-interpreted canonical status only when it is bound to persisted "
             "Edge evidence and passes confidence, direction, URL and audit checks."
+            " Mail-only applications without a saved valid record_url cannot use page evidence; "
+            "valid mail evidence is handled separately through recruitment_mail_process."
         ),
         input_model=VerifyApplicationStatusEvidenceInput,
         response_model=VerifyApplicationStatusEvidenceResponse,
@@ -1249,6 +1329,17 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         read_only=False,
     ),
     MCPToolDefinition(
+        name="automation_schedule_delete",
+        description=(
+            "Permanently delete one local automation and its execution history only when the "
+            "user explicitly requests deletion. A currently running automation cannot be deleted."
+        ),
+        input_model=AutomationScheduleDeleteInput,
+        response_model=AutomationScheduleDeleteResponse,
+        operation=_automation_schedule_delete_operation,
+        read_only=False,
+    ),
+    MCPToolDefinition(
         name="application_capture",
         description="Match a browser page to a job and return an application approval preview.",
         input_model=ApplicationCaptureInput,
@@ -1337,11 +1428,25 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
     ),
     MCPToolDefinition(
         name="application_review_status",
-        description=("Read persisted current or recoverable official application-status review runs. No browser "
-                     "work is started. Omit run_id to discover candidates; use thread_id to narrow selection."),
+        description=("Read persisted current or recoverable official application-status review runs, or the latest "
+                     "terminal run if none are active/recoverable. No browser work is started. Omit run_id to "
+                     "discover candidates; use thread_id to narrow selection. Fetch names and outcomes with application_review_results."),
         input_model=ApplicationReviewStatusInput,
         response_model=ApplicationReviewStatusResponse,
         operation=_repository_operation(application_review_status),
+    ),
+    MCPToolDefinition(
+        name="application_review_results",
+        description=("Read a compact paginated list of official-review results with company/job names, saved "
+                     "progress URLs, reasons, check time and model/image dispositions. Read-only: never starts a review. "
+                     "Default scope=run selects the latest task; pass its run_id for a specific run. Default category=attention "
+                     "includes failures, login blocks and unresolved non-retained records. Use category=retained for retained "
+                     "stages, all for every result, or state/reason filters. Keep filters and returned cursor for each next "
+                     "page until has_more=false; preview rows are not a complete list. scope=latest explicitly reads "
+                     "each application's latest receipt across runs, never as a substitute for expired historical details."),
+        input_model=ApplicationReviewResultsInput,
+        response_model=ApplicationReviewResultsResponse,
+        operation=_repository_operation(application_review_results),
     ),
     MCPToolDefinition(
         name="application_review_control",
@@ -1361,7 +1466,12 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
                      "continuation_required=true, keep calling recruitment_mail_run_status with this run_id and "
                      "wait_ms=20000 until terminal; do not finish the reply with a background receipt or ask the user "
                      "to check later. Pass current thread_id/turn_id. "
-                     "Optional record_ids freeze a selected scope; absent IDs process pending mail after refresh."),
+                     "Optional record_ids freeze a selected scope; absent IDs process pending mail after refresh. "
+                     "Only on an explicit user retry request, set retry_failed=true with 1-50 selected failed "
+                     "record_ids. This grants one bounded new round per selected record, does not refresh the mailbox, "
+                     "and never repeats successful mail. Do not use it to loop automatically after a failure. "
+                     "Report model_attempted_count/model_call_count separately from sync freshness and "
+                     "historical_failure_count; inspect failure_results safe diagnostics before naming a cause."),
         input_model=RecruitmentMailRunStartInput,
         response_model=BackgroundTaskActionResponse,
         operation=recruitment_mail_run_start,
@@ -1373,7 +1483,9 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         name="recruitment_mail_run_status",
         description=("Read/wait for durable mail-processing results; never syncs mail, invokes a model, or starts a worker. "
                      "For a processing request use wait_ms=20000 repeatedly in the same assistant turn until terminal. "
-                     "For a user asking only for current progress use wait_ms=0. Never resume a paused task by polling."),
+                     "For a user asking only for current progress use wait_ms=0. Never resume a paused task by polling. "
+                     "failure_results.analysis_source=history is a reused failure, not a new failed model call; "
+                     "unknown or output/schema diagnostics do not prove provider unavailability."),
         input_model=RecruitmentMailRunStatusInput,
         response_model=BackgroundTaskResponse,
         operation=recruitment_mail_run_status,
@@ -1407,6 +1519,30 @@ TOOL_DEFINITIONS: tuple[MCPToolDefinition, ...] = (
         operation=recruitment_mail_binding_propose_operation,
         read_only=False,
         idempotent=False,
+    ),
+)
+
+TOOL_DEFINITIONS += (
+    MCPToolDefinition(
+        name="application_identity_candidates",
+        description=("Read page-scoped official application cards from the latest persisted successful observation. "
+                     "Use when a job title differs or identity is ambiguous and no candidate card is already shown. "
+                     "Display available candidates directly; do not first ask whether to list them. "
+                     "Never guess the binding or change a stage."),
+        input_model=ApplicationIdentityCandidatesInput,
+        response_model=ApplicationIdentityCandidatesResponse,
+        operation=application_identity_candidates_operation,
+    ),
+    MCPToolDefinition(
+        name="application_identity_propose",
+        description=("Propose a revocable official-card identity binding or unbinding for user confirmation. "
+                     "Use current candidates/revision/digest; user must click the approval card. Does not approve, "
+                     "update stage, or start review. Never auto-approve or ask users to type confirmation text "
+                     "or internal IDs."),
+        input_model=ApplicationIdentityProposeInput,
+        response_model=ApplicationIdentityProposeResponse,
+        operation=application_identity_propose_operation,
+        read_only=False, idempotent=False,
     ),
 )
 

@@ -7,15 +7,21 @@ import { pathToFileURL } from 'node:url';
 import { securePreferences, websiteUrl, isolatedApi, parseCommand, trustedSender, isPrivateHost } from './policy';
 import { browserIntegration, BackgroundPageLease } from './browser-contract';
 import { OwnedRuntime, runtimeLaunch, Launch } from './runtime-client';
-import { BrowserService, BrowserAdapter } from './browser-service';
+import { BrowserService, BrowserAdapter, waitForReviewAuthentication } from './browser-service';
+import { reviewDiagnosticSummary, reviewDiagnosticText, reviewDiagnosticUrl, reviewNavigationDiagnostics, ReviewObservationError, ReviewNavigationPolicy } from './review-readiness';
+import type { ReviewDiagnosticCallback } from './review-readiness';
 import { randomUUID } from 'node:crypto';
-import { DesktopBridge, desktopDeviceId, REVIEW_OPERATION_BUDGET_MS } from './bridge-client';
+import { DesktopBridge, desktopDeviceId, REVIEW_OPERATION_BUDGET_MS, REVIEW_VISION_BUDGET_MS } from './bridge-client';
+import { attachReviewVision } from './review-vision';
 import type { ReviewStage } from './bridge-client';
 import { packagedRuntimeLaunch } from './packaged-runtime';
 import { FillerService } from './filler-service';
 import { FillerStore, FillerSnapshot } from './filler-store';
+import { RecruitmentSessionStore } from './recruitment-session-store';
 import { FillerApplicationService, PendingRegistration, recruitCompanyCacheKey } from './filler-application-service';
 import type { ApplicationPage } from './filler-application-service';
+import { ReviewPageCache } from './review-page-cache';
+import type { ReviewReuseContext } from './review-page-cache';
 
 // A dedicated profile is selected before any Chromium session is created.
 // Portable launchers provide their own paths; direct EXE launches use a writable
@@ -34,6 +40,7 @@ if (app.isPackaged && packagedIsolationRoot && instanceDir) {
   process.env.RECRUITOPS_DESKTOP_DATA_DIR = instanceDir;
 }
 app.setPath('userData', instanceDir ? path.resolve(instanceDir) : path.join(app.getPath('appData'), 'RecruitOps-Desktop-Preview'));
+app.setPath('sessionData', app.getPath('userData'));
 const testMode = process.env.RECRUITOPS_DESKTOP_TEST === '1' && !!instanceDir && !app.isPackaged;
 const fixtureOrigin = testMode ? isolatedApi(process.env.RECRUITOPS_DESKTOP_FIXTURE_ORIGIN) : undefined;
 let api: string | undefined;
@@ -61,6 +68,9 @@ const shellUrl = pathToFileURL(path.join(__dirname, '../renderer/index.html')).h
 let window: BrowserWindow;
 let tray: Tray | undefined;
 let quitting = false;
+let recruitmentSessionStore: RecruitmentSessionStore | undefined;
+let quitPending: Promise<void> | undefined;
+let exitPrepared = false;
 let active: number | 'workbench' | null = null;
 let sequence = 0;
 let notice = '';
@@ -70,6 +80,7 @@ let workbenchLoading = false;
 let workbenchRequested = true;
 let workbenchAutoOpened = false;
 const tabs = new Map<number, { view: WebContentsView; title: string; error: string; resourceWarning: string; background: boolean }>();
+const reviewPageCache = new ReviewPageCache();
 const stateFile = path.join(app.getPath('userData'), 'window.json');
 const modeFile = path.join(app.getPath('userData'), 'desktop-mode.json');
 function readOnlyPreference() {
@@ -88,7 +99,7 @@ function state() {
     ? fillerStoreSnapshot!.settings.customAnswers.filter(value => value && typeof value === 'object').slice(-200) : [];
   return { active, notice, apiConfigured: !!api, configurationError,
     runtime: runtime?.state ?? { status: bootstrapStatus, stage: 'resources', writes: false },
-    browser: { ...browserIntegration, connected: !!browserService }, writesEnabled: runtime?.state.writes ?? false,
+    browser: { ...browserIntegration, connected: !!browserService, sessionPersistence: recruitmentSessionStore?.status() }, writesEnabled: runtime?.state.writes ?? false,
     bridge: bridge?.status ?? 'disabled',
     runtimeRestarting,
     workbenchLoading, workbenchRequested, workbenchError,
@@ -181,7 +192,8 @@ function startOwnedRuntime(launch: Launch) {
     api = runtime?.origin;
     if (!api && bridge) { bridge.stop(); bridge = undefined; }
     if (api && runtime?.state.websocket && browserService && !bridge) {
-      try { bridge = new DesktopBridge(runtime, desktopDeviceId(app.getPath('userData')), reviewPage, publish); bridge.connect(); }
+      try { bridge = new DesktopBridge(runtime, desktopDeviceId(app.getPath('userData')), reviewPage, publish,
+        {onReviewInvalidated: id => reviewPageCache.invalidate(id)}); bridge.connect(); }
       catch { notice = 'Browser bridge device identity unavailable.'; }
     }
     if (!api && workbench) { window.contentView.removeChildView(workbench); workbench.webContents.close(); workbench = undefined; if (active === 'workbench') active = null; }
@@ -283,20 +295,30 @@ function secureRecruitmentSession(s: Session) {
     })();
   });
 }
-function guardNavigation(view: WebContentsView, allow: (url: string) => boolean, ownedOrigin?: string) {
-  const allowed = (url: string, main: boolean) => allow(url) && (!main || !ownedOrigin || new URL(url).origin === ownedOrigin);
-  view.webContents.on('will-navigate', (event, url) => { if (!allowed(url, true)) event.preventDefault(); });
-  view.webContents.on('will-redirect', (event, url, _inPlace, main) => { if (!allowed(url, main)) event.preventDefault(); });
-  view.webContents.on('will-frame-navigate', (event) => { if (!allowed(event.url, event.isMainFrame)) event.preventDefault(); });
+function guardNavigation(view: WebContentsView, allow: (url: string) => boolean, ownedOrigin?: string, reviewPolicy?: ReviewNavigationPolicy) {
+  const allowed = (url: string, main: boolean, event: string) => {
+    const scopeAllowed = !main || !ownedOrigin || (reviewPolicy ? reviewPolicy.note(url, event) : new URL(url).origin === ownedOrigin);
+    return allow(url) && scopeAllowed;
+  };
+  view.webContents.on('will-navigate', (event, url) => { if (!allowed(url, true, 'will_navigate')) event.preventDefault(); });
+  view.webContents.on('will-redirect', (event, url, _inPlace, main) => { if (!allowed(url, main, 'will_redirect')) event.preventDefault(); });
+  view.webContents.on('will-frame-navigate', (event) => { if (!allowed(event.url, event.isMainFrame, 'will_navigate')) event.preventDefault(); });
   view.webContents.on('will-attach-webview', event => event.preventDefault());
 }
 function allowedSite(url: string) { try { websiteUrl(url, fixtureOrigin); return true; } catch { return false; } }
-function createTab(url: string, background = false): number {
+function createTab(url: string, background = false, reviewPolicy?: ReviewNavigationPolicy): number {
   url = websiteUrl(url, fixtureOrigin);
+  while (tabs.size >= 24 && reviewPageCache.size) reviewPageCache.evictOldest();
   if (tabs.size >= 24) throw new Error('Close a tab before opening another (limit 24)');
   const id = ++sequence;
   const view = new WebContentsView({ webPreferences: { ...securePreferences, partition: 'persist:recruitment',
     backgroundThrottling: !background, ...(background ? { offscreen: true } : {}) } });
+  if (!background) {
+    reviewPageCache.foregroundNavigated(view.webContents.session, url);
+    view.webContents.on('did-start-navigation', (_event, target, _inPlace, isMainFrame) => {
+      if (isMainFrame !== false) reviewPageCache.foregroundNavigated(view.webContents.session, target);
+    });
+  }
   filler?.attach(view.webContents);
   tabs.set(id, { view, title: new URL(url).hostname, error: '', resourceWarning: '', background });
   // Offscreen rendering supplies frames even while both view and window are hidden;
@@ -304,7 +326,7 @@ function createTab(url: string, background = false): number {
   // Hide before attaching so a visible workbench never exposes the review page.
   view.setVisible(false);
   window.contentView.addChildView(view);
-  guardNavigation(view, allowedSite, background ? new URL(url).origin : undefined);
+  guardNavigation(view, allowedSite, background ? new URL(url).origin : undefined, reviewPolicy);
   view.webContents.setWindowOpenHandler(({ url: target }) => {
     if (!background && allowedSite(target)) {
       notice = 'Popup opened as an isolated tab. Opener-dependent SSO may require a supported browser.';
@@ -336,8 +358,8 @@ function closeTab(id: number) {
   else layout();
 }
 // Main-process-only lease. Review views are hosted but never shown or focused.
-export function createBackgroundPage(url: string): BackgroundPageLease {
-  const id = createTab(url, true);
+export function createBackgroundPage(url: string, reviewPolicy?: ReviewNavigationPolicy): BackgroundPageLease {
+  const id = createTab(url, true, reviewPolicy);
   return { id, purpose: 'review', close: () => closeTab(id) };
 }
 // Trusted backend integration can call only typed actions; recruitment pages have no IPC.
@@ -371,38 +393,55 @@ async function waitForReviewLoad(wc: WebContents, deadline: number, signal?: Abo
 }
 
 export async function reviewPage(url: string, operationId: string, applicationIds: string[], signal?: AbortSignal,
-  deadline = Date.now() + REVIEW_OPERATION_BUDGET_MS, onStage?: (stage: ReviewStage) => void) {
+  deadline = Date.now() + REVIEW_OPERATION_BUDGET_MS, onStage?: (stage: ReviewStage) => void,
+  onDiagnostic?: ReviewDiagnosticCallback, includeVision = false, reuse?: ReviewReuseContext) {
   if (!browserService) throw new Error('browser_adapter_unavailable');
   if (signal?.aborted) throw new Error('browser_cancelled');
   // Leave a small margin to return a useful readiness error before the transport expires.
-  deadline = Math.min(deadline, Date.now() + REVIEW_OPERATION_BUDGET_MS) - 100;
+  deadline = Math.min(deadline, Date.now() + (includeVision ? REVIEW_VISION_BUDGET_MS : REVIEW_OPERATION_BUDGET_MS)) - 100;
   const targetUrl = websiteUrl(url, fixtureOrigin);
   const ownedOrigin = new URL(targetUrl).origin;
-  const lease = createBackgroundPage(targetUrl);
+  const recruitmentSession = session.fromPartition('persist:recruitment');
+  const scope = {url: targetUrl, applicationIds, reviewTaskId: reuse?.reviewTaskId || '', session: recruitmentSession,
+    profileEpoch: reviewPageCache.profileEpoch(recruitmentSession)};
+  const reused = includeVision && reuse?.reuseObservationOperationId && reuse.reviewTaskId
+    ? reviewPageCache.take(reuse.reuseObservationOperationId, scope, wc => !browserService!.isBusy(wc)) : undefined;
+  const reviewPolicy = reused?.policy || new ReviewNavigationPolicy(targetUrl);
+  const lease = reused?.lease || createBackgroundPage(targetUrl, reviewPolicy);
   const wc = tabs.get(lease.id)!.view.webContents;
-  const cancel = () => lease.close();
-  let pageNavigationAttempted = false;
-  let foreignRedirect = false;
-  const notePageNavigation = (_event: unknown, navigationUrl: string) => {
-    try { if (new URL(navigationUrl).origin !== ownedOrigin) pageNavigationAttempted = true; }
-    catch { pageNavigationAttempted = true; }
+  const callerSignal = signal;
+  const profileWatch = reused ? reviewPageCache.watchReusedProfile(recruitmentSession, targetUrl, reviewPolicy) : undefined;
+  if (profileWatch) signal = callerSignal ? AbortSignal.any([callerSignal, profileWatch.signal]) : profileWatch.signal;
+  let visionRequestStarted = false;
+  let lastReviewStage: ReviewStage | undefined;
+  const reportStage = (stage: ReviewStage) => {lastReviewStage = stage; onStage?.(stage);};
+  let retained = false;
+  const cancel = () => { reviewPageCache.invalidate(operationId); lease.close(); };
+  let lastObservation = reviewDiagnosticSummary();
+  let lastUrl = targetUrl;
+  const finalUrl = () => { if (!wc.isDestroyed()) lastUrl = wc.getURL(); return lastUrl; };
+  let reviewPhase: 'initial_load' | 'observation' | 'navigation_recovery' | 'vision_capture' = 'initial_load';
+  const navigation = () => {
+    const diagnostic = reviewPolicy.diagnostic(finalUrl());
+    return diagnostic ? {...diagnostic, phase: reviewPhase} : undefined;
   };
-  const noteRedirect = (_event: unknown, navigationUrl: string, _inPlace: boolean, isMainFrame: boolean) => {
-    if (isMainFrame === false) return;
-    try { if (new URL(navigationUrl).origin !== ownedOrigin) foreignRedirect = true; }
-    catch { foreignRedirect = true; }
+  const awaitAuthentication = async () => {
+    reportStage('WAITING_FOR_LOGIN');
+    onDiagnostic?.(lastObservation, navigation());
+    await waitForReviewAuthentication(wc, reviewPolicy, deadline, signal);
   };
-  wc.on('will-navigate', notePageNavigation);
-  wc.on('will-redirect', noteRedirect);
   signal?.addEventListener('abort', cancel, { once: true });
   try {
     try { await waitForReviewLoad(wc, deadline, signal); }
     catch (error) {
       if (signal?.aborted) throw error;
-      if (pageNavigationAttempted || foreignRedirect) throw new Error('browser_navigation_changed');
-      throw error;
+      if (reviewPolicy.denied) throw new Error('browser_navigation_changed');
+      if (reviewPolicy.authVisited) { await awaitAuthentication(); }
+      else throw error;
     }
-    if (pageNavigationAttempted || foreignRedirect) throw new Error('browser_navigation_changed');
+    if (reviewPolicy.denied) throw new Error('browser_navigation_changed');
+    profileWatch?.check();
+    if (reviewPolicy.awaitingAuthentication || reviewPolicy.isAuthUrl(wc.getURL())) await awaitAuthentication();
     if (tabs.get(lease.id)?.error) throw new Error('browser_load_failed');
     if (signal?.aborted) throw new Error('browser_cancelled');
     const loadedUrl = new URL(wc.getURL());
@@ -410,15 +449,76 @@ export async function reviewPage(url: string, operationId: string, applicationId
         loadedUrl.origin !== ownedOrigin) {
       throw new Error('browser_navigation_changed');
     }
-    const result = await browserService.observeForReview(wc, operationId, applicationIds,
-      { deadline, signal, onStage, ownedOrigin, requestedUrl: targetUrl });
-    if (pageNavigationAttempted || foreignRedirect) throw new Error('browser_navigation_changed');
+    let result: unknown;
+    while (true) {
+      try {
+        reviewPhase = 'observation';
+        result = await browserService.observeForReview(wc, operationId, applicationIds,
+          { deadline, signal, onStage: reportStage, ownedOrigin, requestedUrl: targetUrl,
+            stableReadableProof: reused?.stableProof,
+            onDiagnostic: (summary, browserNavigation) => {
+              lastObservation = summary;
+              const diagnostic = navigation() || browserNavigation;
+              if (diagnostic && browserNavigation?.reason && ['returned_to_home_without_application_records', 'application_record_entry_not_entered', 'application_record_home_redirect'].includes(browserNavigation.reason)) diagnostic.reason = browserNavigation.reason;
+              onDiagnostic?.(summary, diagnostic && {...diagnostic, phase: browserNavigation?.phase || reviewPhase});
+            } });
+        break;
+      } catch (error) {
+        if (reviewPolicy.denied || !reviewPolicy.authVisited || (error as Error).message !== 'browser_navigation_changed') throw error;
+        if (!reviewPolicy.claimObservationRecovery()) throw error;
+        reviewPhase = 'navigation_recovery';
+        await awaitAuthentication();
+      }
+    }
+    if (reviewPolicy.denied) throw new Error('browser_navigation_changed');
+    profileWatch?.check();
+    if (includeVision && runtime?.origin && runtime.allows(runtime.origin + '/api/browser/vision', 'POST')) {
+      reviewPhase = 'vision_capture';
+      // DOM readiness may already have entered VALIDATING. Never regress the
+      // persisted operation to EXTRACTING (that would disconnect the bridge).
+      reportStage('VALIDATING');
+      result = await attachReviewVision(wc, result, operationId, targetUrl, runtime.origin, runtime.authorization(), deadline, signal,
+        fetch, () => {profileWatch?.check(); visionRequestStarted = true;});
+    }
+    profileWatch?.check();
+    if (signal?.aborted) throw new Error('browser_cancelled');
+    if (!includeVision && reuse?.retainForVisionReuse) retained = reviewPageCache.retain(operationId,
+      lease, wc, reviewPolicy, result, scope, tabs.get(lease.id)?.background === true);
+    if (reused && result && typeof result === 'object' && 'result' in result) {
+      const captured = result as {result: Record<string, unknown>};
+      result = {...captured, result: {...captured.result, observation_reuse: {
+        source_operation_id: reuse!.reuseObservationOperationId, fresh_observation: true}}};
+    }
+    if (navigation() && result && typeof result === 'object' && 'result' in result) {
+      const captured = result as {result: Record<string, unknown>};
+      const browserNavigation = captured.result.navigation_diagnostics as {reason?: string} | undefined;
+      const diagnostic = navigation();
+      if (diagnostic && browserNavigation?.reason && ['returned_to_home_without_application_records', 'application_record_entry_not_entered', 'application_record_home_redirect'].includes(browserNavigation.reason)) diagnostic.reason = browserNavigation.reason;
+      return {...captured, result: {...captured.result, navigation_diagnostics: diagnostic}};
+    }
     return result;
+  } catch (error) {
+    if (profileWatch?.signal.aborted && !callerSignal?.aborted && !visionRequestStarted && deadline - Date.now() > 100) {
+      // One bounded cold read before any paid upload. The recursive call has no
+      // reuse capability, retains the original operation and cannot loop here.
+      profileWatch.dispose(); lease.close();
+      const coldReadStage = lastReviewStage === 'VALIDATING' ? () => onStage?.('VALIDATING') : onStage;
+      return await reviewPage(targetUrl, operationId, applicationIds, callerSignal, deadline + 100,
+        coldReadStage, onDiagnostic, includeVision, {reviewTaskId: reuse?.reviewTaskId});
+    }
+    const message = profileWatch?.signal.aborted && !callerSignal?.aborted ? 'browser_account_changed'
+      : error instanceof Error ? error.message : 'browser_observation_failed';
+    const summary = error instanceof ReviewObservationError ? error.lastObservation : {...lastObservation,
+      page: lastObservation.page || {url: reviewDiagnosticUrl(finalUrl()),
+        title: reviewDiagnosticText(wc.isDestroyed() || reviewPolicy.isAuthUrl(finalUrl()) ? '' : wc.getTitle(), 160), textSnippet: ''}};
+    const diagnostic = navigation() || (error instanceof ReviewObservationError ? error.navigation : undefined)
+      || (message === 'browser_navigation_changed' ? reviewNavigationDiagnostics(targetUrl, finalUrl(), undefined, 'loaded_origin_mismatch') : undefined);
+    throw new ReviewObservationError(message, summary, diagnostic && {...diagnostic,
+      phase: error instanceof ReviewObservationError && error.navigation?.phase || reviewPhase});
   } finally {
+    profileWatch?.dispose();
     signal?.removeEventListener('abort', cancel);
-    wc.removeListener('will-navigate', notePageNavigation);
-    wc.removeListener('will-redirect', noteRedirect);
-    lease.close();
+    if (!retained) lease.close();
   }
 }
 function showWorkbench() {
@@ -771,6 +871,7 @@ async function execute(raw: unknown) {
       const origin = new URL(wc.getURL()).origin;
       const { response } = await dialog.showMessageBox(window, { title: '清除此站登录', buttons: ['取消', '清除登录'], defaultId: 0, cancelId: 0, message: `确定退出登录并清除 ${origin} 的本地数据？`, detail: '其他单点登录站点的数据不会被清除。刷新后，未保存的表单内容将丢失。' });
       if (response === 1) {
+        reviewPageCache.profileChanged(wc.session);
         await wc.session.clearStorageData({ origin, storages: ['filesystem', 'indexdb', 'localstorage', 'serviceworkers', 'cachestorage'] });
         const host = new URL(origin).hostname;
         const cookies = await wc.session.cookies.get({});
@@ -778,6 +879,7 @@ async function execute(raw: unknown) {
           const domain = cookie.domain?.replace(/^\./, '');
           if (domain && (host === domain || host.endsWith('.' + domain))) await wc.session.cookies.remove(origin + cookie.path, cookie.name);
         }
+        await recruitmentSessionStore?.flush();
         wc.reload();
       }
     }
@@ -804,7 +906,17 @@ else {
     shellSession.webRequest.onBeforeRequest((details, callback) => callback({ cancel: ![shellUrl, pathToFileURL(path.join(__dirname, '../renderer/shell.js')).href, pathToFileURL(path.join(__dirname, '../renderer/styles.css')).href].includes(details.url) }));
     window.webContents.on('will-navigate', event => event.preventDefault());
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-    secureRecruitmentSession(session.fromPartition('persist:recruitment'));
+    const recruitmentSession = session.fromPartition('persist:recruitment');
+    secureRecruitmentSession(recruitmentSession);
+    recruitmentSessionStore = new RecruitmentSessionStore(app.getPath('userData'), recruitmentSession, {
+      available: () => safeStorage.isEncryptionAvailable()
+        && (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text'),
+      protect: text => safeStorage.encryptString(text),
+      unprotect: ciphertext => safeStorage.decryptString(ciphertext)
+    });
+    try { await recruitmentSessionStore.start(); }
+    catch { notice = '登录状态恢复不可用，仍可手动登录；本次不会覆盖浏览器已有登录。'; }
+    recruitmentSession.cookies.on('changed', (_event, cookie) => reviewPageCache.cookieChanged(recruitmentSession, cookie.name, cookie.httpOnly, cookie.domain));
     try {
       const adapterPath = app.isPackaged ? path.join(process.resourcesPath, 'desktop-browser', 'index.cjs') : path.resolve(__dirname, '../../../packages/desktop_browser/index.cjs');
       const adapter = require(adapterPath) as BrowserAdapter & { loadObservationResources(): unknown };
@@ -850,6 +962,10 @@ else {
       tray.on('double-click', () => window.show());
     } catch { notice = '系统托盘不可用，关闭窗口将退出软件。'; }
     window.on('resize', layout);
+    // Windows shutdown does not reliably emit app before-quit. Changed-cookie
+    // saves and periodic flushes cover that case; these hooks are best-effort.
+    window.on('query-session-end', () => { recruitmentSessionStore?.saveNow(); void recruitmentSessionStore?.flush(); });
+    window.on('session-end', () => { quitting = true; reviewPageCache.invalidate(); recruitmentSessionStore?.saveNow(); void recruitmentSessionStore?.flush(); });
     window.on('close', event => {
       if (!quitting && tray && !testMode) { event.preventDefault(); window.hide(); }
     });
@@ -858,12 +974,31 @@ else {
   });
   app.on('before-quit', event => {
     quitting = true;
-    if (runtime && !runtimeStopped) {
+    if (!exitPrepared) {
       event.preventDefault();
-      bridge?.stop();
-      void runtime.stop().then(() => { runtimeStopped = true; app.quit(); });
+      if (!quitPending) {
+        bridge?.stop();
+        recruitmentSessionStore?.saveNow();
+        const flushSession = () => new Promise<void>(resolve => {
+          const timer = setTimeout(resolve, 4000);
+          void (recruitmentSessionStore?.flush() ?? Promise.resolve()).finally(() => { clearTimeout(timer); resolve(); });
+        });
+        quitPending = Promise.allSettled([flushSession(), runtime && !runtimeStopped ? runtime.stop() : Promise.resolve()])
+          .then(async () => {
+            runtimeStopped = true;
+            // No page can write after this last flush; shutdown of the owned
+            // backend may have taken longer than the initial flush.
+            for (const tab of tabs.values()) if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+            tabs.clear();
+            if (workbench && !workbench.webContents.isDestroyed()) workbench.webContents.close();
+            workbench = undefined;
+            await flushSession();
+            recruitmentSessionStore?.saveNow(); exitPrepared = true; app.quit();
+          });
+      }
       return;
     }
+    recruitmentSessionStore?.stop();
     if (window && !window.isDestroyed()) { const [width, height] = window.getSize(); try { fs.writeFileSync(stateFile, JSON.stringify({ width, height })); } catch {} }
     for (const tab of tabs.values()) tab.view.webContents.close();
     tabs.clear(); workbench?.webContents.close(); tray?.destroy();

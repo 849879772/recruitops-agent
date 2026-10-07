@@ -189,6 +189,10 @@ def test_local_automation_routes_list_latest_execution_and_require_token_to_disa
             schedule.active = False
             return schedule
 
+        def delete(self, schedule_id):
+            assert schedule_id == schedule.id
+            return 1
+
     monkeypatch.setattr(api, "Storage", StorageFactory)
     monkeypatch.setattr(api, "AutomationStore", Store)
     monkeypatch.setattr(
@@ -213,6 +217,20 @@ def test_local_automation_routes_list_latest_execution_and_require_token_to_disa
     )
     assert disabled.status_code == 200
     assert disabled.json()["active"] is False
+    assert client.delete("/api/automations/automation-1").status_code == 401
+    deleted = client.delete(
+        "/api/automations/automation-1", headers={"Authorization": "Bearer secret"},
+    )
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True, "id": "automation-1", "deleted_executions": 1}
+    from packages.automation import AutomationRunningError
+    monkeypatch.setattr(Store, "delete", lambda self, schedule_id: (_ for _ in ()).throw(
+        AutomationRunningError("Automation is running")
+    ))
+    running = client.delete(
+        "/api/automations/automation-1", headers={"Authorization": "Bearer secret"},
+    )
+    assert running.status_code == 409
 
 
 def test_operational_report_is_read_only_and_returns_repair_candidates() -> None:

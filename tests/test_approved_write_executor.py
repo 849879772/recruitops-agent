@@ -47,6 +47,9 @@ class RecordingAdapter:
     def bind_recruitment_mail(self, payload):
         return self._record(OperationName.RECRUITMENT_MAIL_BINDING, payload)
 
+    def bind_application_identity(self, payload):
+        return self._record(OperationName.APPLICATION_IDENTITY_BINDING, payload)
+
 
 def _preview(operation: OperationName, key: str) -> ApprovalPreview:
     values: dict[str, object] = {

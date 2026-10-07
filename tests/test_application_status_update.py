@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event
@@ -17,10 +16,8 @@ from packages.recruitment_mail.model_analysis import MAIL_ANALYSIS_VERSION
 from packages.storage import ApplicationSnapshot, Storage
 from packages.tools.application_status_update import (
     ApplicationStatusUpdateInput,
-    _authenticated,
     update_application_status,
 )
-from packages.tools import application_status_update as status_update_module
 
 
 class Repo:
@@ -115,12 +112,14 @@ def _request(record_id):
 
 def test_mail_evidence_updates_and_replays_idempotently():
     app, repo, store, record = _setup()
+    assert app.record_url is None
     first = update_application_status(_request(record.id), repo, store)
     assert first.success and first.data.state == "updated"
     assert first.data.wrote
     with store.storage.session() as session:
         snapshot = session.get(ApplicationSnapshot, "8")
         assert snapshot.stage == "rejected"
+        assert snapshot.record_url is None
         assert snapshot.stage_history[-1]["source"] == "recruitment_mail"
     repo.application = app.model_copy(update={
         "stage": ApplicationStage.REJECTED,
@@ -139,35 +138,19 @@ def test_mail_exact_identity_does_not_update_another_job():
     assert result.error_code.value == "ambiguous_match"
 
 
-def test_mail_without_sender_authentication_is_linked_but_not_written():
+def test_mail_without_sender_authentication_can_update_when_evidence_matches():
     _app, repo, store, record = _setup(authenticated=False)
     result = update_application_status(_request(record.id), repo, store)
-    assert not result.success
-    assert result.error_code.value == "invalid_source"
-    assert result.retryable is False
+    assert result.success and result.data.wrote
     assert store.get(record_id=record.id).application_id == "8"
-    assert store.get(record_id=record.id).processing_status == "needs_auth_metadata"
+    with store.storage.session() as session:
+        assert session.get(ApplicationSnapshot, "8").stage == "rejected"
 
 
-def test_mail_update_backfills_authentication_once_before_writing(monkeypatch):
+def test_legacy_authentication_block_does_not_prevent_reprocessing():
     _app, repo, store, record = _setup(authenticated=False)
-    calls = []
-
-    def backfill(_settings, target_store, record_id):
-        calls.append(record_id)
-        target_store.update_source_metadata(record_id, {
-            "authentication_results": [{
-                "method": "dkim", "result": "pass", "authserv_id": "gzchengxin8",
-                "identity_domain": "shmail.ibeisen.com", "aligned": True,
-            }],
-        })
-
-    monkeypatch.setattr(status_update_module, "backfill_mail_authentication", backfill)
-    result = update_application_status(
-        _request(record.id), repo, store, settings=SimpleNamespace(mail_enabled=True)
-    )
-
-    assert calls == [record.id]
+    store.update_processing_status(record.id, "needs_auth_metadata")
+    result = update_application_status(_request(record.id), repo, store)
     assert result.success and result.data.wrote
 
 
@@ -263,22 +246,6 @@ def test_replay_with_stale_repository_snapshot_does_not_duplicate_history():
         assert len(history) == 1
         assert history[0]["audit_id"] == first.data.audit_id
     assert store.get(record_id=record.id).processing_status == "processed_updated"
-
-
-def test_authentication_requires_connector_provenance_and_authserv():
-    result = {"method": "dkim", "result": "pass", "authserv_id": "163.com", "aligned": True}
-    metadata = {"transport": {"authentication_results": [result]}}
-    assert not _authenticated(SimpleNamespace(source="local", raw_metadata=metadata))
-    result.pop("authserv_id")
-    assert not _authenticated(SimpleNamespace(source="imap_readonly", raw_metadata=metadata))
-
-
-def test_authentication_requires_aligned_dkim():
-    result = {"method": "dkim", "result": "pass", "authserv_id": "163.com", "aligned": False}
-    metadata = {"transport": {"authentication_results": [result]}}
-    assert not _authenticated(SimpleNamespace(source="imap_readonly", raw_metadata=metadata))
-    result.update(method="spf", aligned=True)
-    assert not _authenticated(SimpleNamespace(source="imap_readonly", raw_metadata=metadata))
 
 
 def test_mail_processing_failure_rolls_back_application_change():

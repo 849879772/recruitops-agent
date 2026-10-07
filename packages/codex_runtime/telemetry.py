@@ -11,7 +11,6 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
 from time import monotonic
 from typing import Any, Protocol
 from uuid import uuid4
@@ -19,6 +18,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from .events import CodexEvent, CodexEventType
+from .trace_retention import TRACE_MAX_BYTES, prune_locked, trace_lock
 
 
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -113,24 +113,43 @@ class InMemoryTraceRecorder:
 
 
 class JsonlTraceRecorder:
-    """Append structured traces to a local JSONL file."""
+    """Append best-effort diagnostics with bounded file size; never store business data."""
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
-        self._lock = Lock()
 
     def record(self, trace: CodexTrace) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, self.path.open("a", encoding="utf-8") as handle:
-            handle.write(trace.model_dump_json() + "\n")
+        try:
+            with trace_lock(self.path) as acquired:
+                if not acquired:
+                    return
+                if self.path.is_file() and self.path.stat().st_size >= TRACE_MAX_BYTES:
+                    prune_locked(self.path, max_bytes=TRACE_MAX_BYTES // 2)
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(trace.model_dump_json() + "\n")
+        except OSError:
+            # Telemetry storage failure must not abort a model turn.
+            return
 
     def read(self, *, limit: int = 200) -> list[CodexTrace]:
         """Return the newest valid records and ignore an incomplete last line."""
 
         if limit < 1 or not self.path.is_file():
             return []
-        with self._lock, self.path.open("r", encoding="utf-8") as handle:
-            lines = handle.readlines()
+        with trace_lock(self.path) as acquired:
+            if not acquired:
+                return []
+            with self.path.open("rb") as handle:
+                position = handle.seek(0, 2)
+                chunks, newlines = [], 0
+                while position > 0 and newlines <= limit:
+                    size = min(8192, position)
+                    position -= size
+                    handle.seek(position)
+                    chunk = handle.read(size)
+                    chunks.append(chunk)
+                    newlines += chunk.count(b'\n')
+                lines = b''.join(reversed(chunks)).splitlines()
         traces: list[CodexTrace] = []
         for line in lines[-limit:]:
             try:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from packages.domain.models import Company, JobPage
 from packages.reporting import (
     build_reporting_summary,
@@ -21,6 +23,28 @@ def _company_row(company_id: str, **overrides: object) -> dict[str, object]:
     }
     row.update(overrides)
     return row
+
+
+@pytest.mark.parametrize("status", [None, "completed", "succeeded"])
+def test_daily_summary_exposes_detail_failure_as_partial_and_keeps_write_receipts(status):
+    payload = {"new": 9, "failed_jobs": 1239, "scored": 1,
+               "job_write_statistics": {"inserted_count": 9, "new_failed_count": 9}}
+    if status:
+        payload["status"] = status
+    summary = daily_pipeline_summary(payload)
+    assert summary["status"] == "partial"
+    assert summary["completion_warnings"] == ["部分岗位详情尚未补全"]
+    assert summary["counts"]["new"] == 9
+    assert summary["counts"]["scored"] == 1
+    assert summary["job_write_statistics"] == payload["job_write_statistics"]
+
+
+def test_daily_summary_retains_prior_unresolved_company_failure():
+    summary = daily_pipeline_summary({"status": "completed", "failed_jobs": 0,
+        "failed_companies": 0, "companies": [{"status": "partial", "list_complete": True,
+            "detail_failure_count": 0, "failure_reason": "detail_capture_failed"}]})
+    assert summary["status"] == "partial"
+    assert summary["completion_warnings"]
 
 
 def test_daily_summary_is_json_safe_and_deterministically_sorted() -> None:

@@ -55,6 +55,9 @@ class DailyRecruitmentSyncInput(ToolInput):
 
 class DailyRecruitmentSyncData(ToolModel):
     run_id: str
+    task_id: str = TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value
+    thread_id: str | None = None
+    turn_id: str | None = None
     run_status: str
     dry_run: bool
     attempts: int = Field(ge=0)
@@ -104,7 +107,8 @@ def _compact_status_result(value: Any) -> Any:
         "source_partial", "warnings", "source_coverage",
     )
     compact = {key: pipeline[key] for key in scalar_keys if key in pipeline}
-    for key in ("rejection_reasons", "failure_reasons", "scoped_company_ids"):
+    for key in ("rejection_reasons", "failure_reasons", "scoped_company_ids",
+                "job_write_statistics", "write_statistics"):
         if key in pipeline:
             compact[key] = pipeline[key]
     companies = pipeline.get("companies")
@@ -125,6 +129,8 @@ def _compact_status_result(value: Any) -> Any:
         compact["run_status"] = value.get("status")
         compact["warnings"] = value.get("warnings") or []
         compact["error"] = value.get("error")
+        if "write_statistics" in value:
+            compact["write_statistics"] = value["write_statistics"]
     return compact
 
 
@@ -168,6 +174,9 @@ def run_daily_recruitment_sync(
         success=result.success,
         data=DailyRecruitmentSyncData(
             run_id=result.data.run_id,
+            task_id=result.data.task_id,
+            thread_id=result.data.thread_id,
+            turn_id=result.data.turn_id,
             run_status=result.data.run_status,
             dry_run=result.data.dry_run,
             attempts=result.data.attempts,
@@ -217,6 +226,9 @@ def get_daily_recruitment_sync_status(
         success=True,
         data=DailyRecruitmentSyncData(
             run_id=str(payload["run_id"]),
+            task_id=payload.get("task_id") or TaskType.DAILY_RECRUITMENT_INTELLIGENCE.value,
+            thread_id=payload.get("thread_id"),
+            turn_id=payload.get("turn_id"),
             run_status=str(payload["run_status"]),
             dry_run=bool(payload["dry_run"]),
             attempts=int(payload["attempts"]),

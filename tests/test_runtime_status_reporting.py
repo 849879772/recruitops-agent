@@ -366,3 +366,28 @@ def test_dry_run_does_not_claim_historical_inventory_as_new_writes(storage):
     assert result["persistence"]["source_record_count"] == 26
     assert result["write_statistics"]["source_registered_entry_count"] == 0
     assert AgentStateStore(storage).get_task_state("dry-run") is None
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_runtime_distinguishes_insert_update_and_unique_committed_rows(dry_run):
+    handlers = build_runtime_task_handlers(
+        settings=SimpleNamespace(mail_enabled=False), repository=SimpleNamespace(),
+        daily_sync=DailyRecruitmentSync(crawl=lambda _: {
+            "written": not dry_run, "new": 9, "failed_jobs": 0,
+            "dry_run": dry_run,
+            "job_write_statistics": {
+                "basis": "predicted_unique_candidates" if dry_run else "committed_insert_receipts",
+                "inserted_count": 9, "updated_count": 18, "unique_written_count": 27,
+                "new_complete_count": 9, "new_pending_count": 0, "new_failed_count": 0,
+            },
+        }),
+    )
+    result = handlers[TASK](TaskContext(
+        task_id=TASK, task_label="daily", scheduled_for=datetime.now(timezone.utc),
+        run_id="receipt-run", attempt=1, write_enabled=True,
+        metadata={"details": {"requested_dry_run": dry_run}},
+    ))
+    writes = result["write_statistics"]
+    assert writes["job_snapshot_insert_count"] == (0 if dry_run else 9)
+    assert writes["job_snapshot_update_count"] == (0 if dry_run else 18)
+    assert writes["job_snapshot_write_count"] == (0 if dry_run else 27)

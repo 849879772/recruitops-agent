@@ -219,6 +219,97 @@ def test_bound_update_keeps_identity_consistent_when_job_is_empty(storage):
     assert "changed" in (stale.error_message or "")
 
 
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"status": "completed"},
+        {"status": "ignored"},
+        {"status": "pending", "application_id": "app-1"},
+        {"note": "User-confirmed reminder"},
+        {"event_date": date(2026, 10, 1)},
+    ],
+)
+def test_bound_update_refreshes_stale_labels_without_changing_identity(storage, patch):
+    _seed_application(storage, company_name="Original company", job_title="软件工程师(深圳)")
+    created = schedule_manage(
+        _create_request(
+            application_id="app-1",
+            company_name="Original company",
+            job_title="软件工程师(深圳)",
+        ),
+        storage,
+        write_enabled=True,
+    )
+    assert created.data is not None
+    event = created.data.event
+    with storage.write_transaction() as session:
+        application = session.get(ApplicationSnapshot, "app-1")
+        application.company_name = "Current company"
+        application.job_title = "软件工程师（深圳）(J12262)"
+
+    updated = schedule_manage(
+        ScheduleManageInput(
+            action="update",
+            event_id=event.id,
+            expected_updated_at=event.updated_at,
+            **patch,
+        ),
+        storage,
+        write_enabled=True,
+    )
+    assert updated.success is True, updated.error_message
+    assert updated.data is not None
+    result = updated.data.event
+    assert result.application_id == "app-1"
+    assert result.company_name == "Current company"
+    assert result.job_title == "软件工程师（深圳）(J12262)"
+    assert (result.source, result.source_ref) == (event.source, event.source_ref)
+    for key, value in patch.items():
+        assert getattr(result, key) == value
+    with storage.session() as session:
+        assert session.get(ApplicationSnapshot, "app-1").stage == "applied"
+
+
+@pytest.mark.parametrize("patch", [{"company_name": "Other"}, {"job_title": "Other role"}])
+def test_bound_update_rejects_explicit_identity_mismatch(storage, patch):
+    _seed_application(storage)
+    created = schedule_manage(
+        _create_request(application_id="app-1"), storage, write_enabled=True,
+    )
+    assert created.data is not None
+    event = created.data.event
+    rejected = schedule_manage(
+        ScheduleManageInput(action="update", event_id=event.id, status="completed", **patch),
+        storage,
+        write_enabled=True,
+    )
+    assert rejected.success is False
+    assert rejected.error_code.value == "invalid_input"
+    with storage.session() as session:
+        row = session.get(ScheduleEventSnapshot, event.id)
+        assert row.status == "pending"
+        assert (row.company_name, row.job_title) == ("Acme", "Backend")
+
+
+def test_bound_update_rejects_rebinding_using_old_labels(storage):
+    _seed_application(storage)
+    _seed_application(storage, application_id="app-2", company_name="Other", job_title="Other role")
+    created = schedule_manage(
+        _create_request(application_id="app-1"), storage, write_enabled=True,
+    )
+    assert created.data is not None
+    event = created.data.event
+    rejected = schedule_manage(
+        ScheduleManageInput(action="update", event_id=event.id, application_id="app-2"),
+        storage,
+        write_enabled=True,
+    )
+    assert rejected.success is False
+    assert rejected.error_code.value == "invalid_input"
+    with storage.session() as session:
+        assert session.get(ScheduleEventSnapshot, event.id).application_id == "app-1"
+
+
 def test_storage_exception_response_is_generic_and_logged_without_secret(caplog):
     request = _create_request()
 

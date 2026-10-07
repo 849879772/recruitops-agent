@@ -40,7 +40,7 @@ def _analysis(**overrides: object) -> MailAnalysisProposal:
 
 
 def test_proposals_are_versioned_strict_and_missing_identity_stays_null() -> None:
-    assert MAIL_ANALYSIS_VERSION == "recruitops.mail_analysis.v2"
+    assert MAIL_ANALYSIS_VERSION == "recruitops.mail_analysis.v4"
 
     analysis = _analysis()
     assert analysis.company_name is None

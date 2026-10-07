@@ -1,8 +1,8 @@
 """Bounded model mail processing shared by conversational tools and schedules."""
 
 import json
-from datetime import datetime, timezone
-from time import monotonic
+from datetime import datetime, timedelta, timezone
+from time import monotonic, sleep
 from uuid import uuid4
 from hashlib import sha256
 from dataclasses import replace
@@ -10,7 +10,7 @@ from dataclasses import replace
 from sqlalchemy import select
 from pydantic import ValidationError
 
-from packages.matching.client import DeepSeekClient
+from packages.matching.client import DeepSeekClient, DeepSeekClientError
 from .analysis_store import save_model_analysis, get_model_analysis, sync_analysis_labels
 from .analysis_binding import parsed_model_evidence, model_application_matches
 from .model_analysis import (
@@ -27,6 +27,17 @@ from .models import ParsedRecruitmentEmail
 DONE = {"processed_updated", "processed_unchanged", "processed", "irrelevant", "ignored"}
 TARGETS = {"application_confirmation": "applied", "assessment": "applied",
            "written_test": "written", "interview": "interview1", "offer": "offer", "rejection": "rejected"}
+MAX_MODEL_PROCESSING_ATTEMPTS = 3
+MODEL_RETRY_BACKOFF_SECONDS = 0.5
+PROCESSING_RETRY_COOLDOWN_SECONDS = 30
+
+
+class _ProcessingStopped(Exception):
+    """Cooperative cancellation before another model call or business write."""
+
+
+class _ModelBudgetExhausted(Exception):
+    """A local bounded batch expired; not evidence of a provider outage."""
 
 
 def _decode_model_json(content):
@@ -51,6 +62,28 @@ def _analysis_proposal(content, spans=None):
 
 
 def _failure_diagnostic(exc):
+    if isinstance(exc, _ModelBudgetExhausted):
+        return {"kind": "budget", "code": "mail_analysis_time_budget", "retryable": True}
+    if isinstance(exc, DeepSeekClientError):
+        # Persist only our client's fixed error codes, never provider response text.
+        code = exc.code
+        http_status = (int(code[5:]) if isinstance(code, str) and len(code) == 8
+                       and code.startswith("http_") and code[5:].isdigit()
+                       and 100 <= int(code[5:]) <= 599 else None)
+        known = {"transport_failed", "response_empty", "response_invalid", "response_truncated",
+                 "response_refused", "structured_response_invalid", "provider_error"}
+        if code not in known and http_status is None:
+            code = "unknown_client_error"
+        retryable = code == "transport_failed" or http_status in {408, 429} or (
+            http_status is not None and http_status >= 500)
+        kind = ("model_transport" if code == "transport_failed" else
+                "model_rate_limit" if http_status == 429 else
+                "model_auth" if http_status in {401, 403} else
+                "model_service" if http_status is not None and http_status >= 500 else
+                "model_request" if http_status is not None else
+                "model_output" if code.startswith(("response_", "structured_")) else "model_client")
+        return {"kind": kind, "code": code, "retryable": retryable,
+                **({"http_status": http_status} if http_status is not None else {})}
     if isinstance(exc, ValidationError):
         # Never persist model values or raw validation messages containing mail content.
         local_cache = exc.title == "ParsedRecruitmentEmail"
@@ -75,14 +108,67 @@ def _attempt_current(record):
     return attempt if attempt.get("digest") == record.content_digest and attempt.get("version") == MAIL_ANALYSIS_VERSION else None
 
 
+def _legacy_model_failure(attempt):
+    return bool(attempt and attempt.get("state") == "failed_terminal"
+                and attempt.get("reason") in {"analysis_DeepSeekClientError", "triage_DeepSeekClientError"}
+                and (attempt.get("diagnostic") or {}).get("kind") == "DeepSeekClientError"
+                and not (attempt.get("diagnostic") or {}).get("code"))
+
+
+def retry_status(record):
+    """Read-only eligibility metadata; polling never retries or resets budgets."""
+    attempt = _attempt_current(record) or {}
+    count = max(0, int(attempt.get("attempt_count", 1 if attempt else 0)))
+    legacy = _legacy_model_failure(attempt)
+    limit = int(attempt.get("retry_limit", 2 if legacy else MAX_MODEL_PROCESSING_ATTEMPTS))
+    available = (record.processing_status not in DONE and attempt.get("state") == "failed_terminal"
+                 and (legacy or (attempt.get("diagnostic") or {}).get("retryable") is True)
+                 and count < limit)
+    after = attempt.get("next_retry_at") if available else None
+    return {"retryable": bool(available), "retry_ready": bool(available and (
+                not after or datetime.fromisoformat(after) <= datetime.now(timezone.utc))),
+            "next_retry_at": after, "processing_attempt_count": count,
+            "max_processing_attempts": limit, "legacy_retry": legacy}
+
+
+def historical_processing_result(record):
+    attempt = _attempt_current(record) or {}
+    receipt = (record.raw_metadata or {}).get("application_processing_receipt", {})
+    from .binding import binding_revision
+    receipt = receipt if (receipt.get("content_digest") == record.content_digest
+        and receipt.get("binding_revision") == binding_revision(record)) else {}
+    return {"record_id": record.id, "state": record.processing_status,
+            "reason": record.processing_error, "diagnostic": attempt.get("diagnostic"),
+            "analysis_source": "history", "model_attempted": False,
+            "last_analysis_at": attempt.get("finished_at") or attempt.get("started_at"),
+            **{key: receipt[key] for key in ("application_ids", "application_results", "schedule_item") if key in receipt},
+            **retry_status(record)}
+
+
+def _save_application_receipt(store, record, owner, application_ids, application_results, schedule_item):
+    """Checkpoint committed per-target outcomes before another target can fail."""
+    from .binding import binding_revision
+    with store.storage.write_transaction() as session:
+        current = session.scalar(select(RecruitmentMailRecord).where(
+            RecruitmentMailRecord.id == record.id).with_for_update())
+        attempt = (current.raw_metadata or {}).get("model_processing", {}) if current else {}
+        if current is None or current.content_digest != record.content_digest or attempt.get("owner") != owner:
+            raise ValueError("processing_claim_lost")
+        metadata = dict(current.raw_metadata or {})
+        metadata["application_processing_receipt"] = {"content_digest": record.content_digest,
+            "binding_revision": binding_revision(current), "application_ids": application_ids,
+            "application_results": application_results, "schedule_item": schedule_item}
+        current.raw_metadata = metadata
+
+
 def _input_digest(record, applications):
     from .identity import normalize_company_name, _CONTROLLED_COMPANY_ALIAS_GROUPS
-    from .binding import application_identity
+    from .binding import application_identity, bound_application_ids
     confirmed = (record.raw_metadata or {}).get("confirmed_application_binding") or {}
     body = normalize_company_name(f"{record.sender}\n{record.subject}\n{record.body_text}")
     # Invalidation depends on source/candidates, never on the proposal produced by this attempt.
     relevant = [a for a in applications if (
-        a.id == confirmed.get("application_id") or normalize_company_name(a.company_name) in body or any(
+        a.id in bound_application_ids(record) or normalize_company_name(a.company_name) in body or any(
             normalize_company_name(a.company_name) in group and any(alias in body for alias in group)
             for group in _CONTROLLED_COMPANY_ALIAS_GROUPS)
     )]
@@ -90,36 +176,57 @@ def _input_digest(record, applications):
         [(a.id, a.company_name, a.job_title, a.stage.value, str(a.source_status_synced_at)) for a in relevant]),
         "transport": (record.raw_metadata or {}).get("transport", {}),
         "confirmed_binding": confirmed,
-        "confirmed_application": next((application_identity(a) for a in relevant
-                                       if a.id == confirmed.get("application_id")), None)}
+        "confirmed_applications": [application_identity(a) for a in relevant
+                                   if a.id in bound_application_ids(record)]}
     return sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def _eligible(record, input_digest=None):
+def _eligible(record, input_digest=None, retry_request_id=None):
     if record.processing_status in DONE:
         return False
     attempt = _attempt_current(record)
+    if retry_request_id and attempt and attempt.get("manual_retry_request_id") == retry_request_id:
+        if attempt.get("state") not in {"running", "pending"}:
+            return False
+    if retry_request_id and record.processing_status in {"failed", "failed_terminal"}:
+        if not attempt or attempt.get("state") != "running":
+            return True
     if not attempt:
         return True
     if input_digest is not None and attempt.get("state") != "running" and attempt.get("inputs") != input_digest:
         return True
+    if attempt.get("state") == "pending":
+        return True
     if attempt.get("state") != "running":
-        return False
+        return retry_status(record)["retry_ready"]
     started = datetime.fromisoformat(attempt["started_at"])
     return (datetime.now(timezone.utc) - started).total_seconds() > 180
 
 
-def _claim(store, record, owner, input_digest):
+def _claim(store, record, owner, input_digest, retry_request_id=None):
     with store.storage.write_transaction() as session:
         current = session.scalar(select(RecruitmentMailRecord).where(
             RecruitmentMailRecord.id == record.id).with_for_update())
-        if current is None or current.content_digest != record.content_digest or not _eligible(current, input_digest):
+        if current is None or current.content_digest != record.content_digest or not _eligible(current, input_digest, retry_request_id):
             return False
         metadata = dict(current.raw_metadata)
+        previous = _attempt_current(current)
+        same_inputs = bool(previous and previous.get("inputs") == input_digest)
+        attempt_count = int(previous.get("attempt_count", 1)) + 1 if same_inputs else 1
+        retry_limit = int(previous.get("retry_limit", 2 if _legacy_model_failure(previous)
+                                      else MAX_MODEL_PROCESSING_ATTEMPTS)) if same_inputs else MAX_MODEL_PROCESSING_ATTEMPTS
+        manual_retry = bool(retry_request_id and current.processing_status in {"failed", "failed_terminal"}
+                            and (not previous or previous.get("manual_retry_request_id") != retry_request_id))
+        if manual_retry:
+            # Explicitly selected failure gets one new round, not a fresh auto-retry queue.
+            attempt_count, retry_limit = 1, 1
         metadata["model_processing"] = {
             "digest": current.content_digest, "version": MAIL_ANALYSIS_VERSION,
             "owner": owner, "state": "running", "inputs": input_digest,
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "attempt_count": attempt_count, "retry_limit": retry_limit,
+            "manual_retry_request_id": retry_request_id if manual_retry else (
+                previous.get("manual_retry_request_id") if previous else None),
         }
         current.raw_metadata = metadata
     return True
@@ -135,9 +242,13 @@ def _finish(store, record, owner, state, reason=None, inputs=None, diagnostic=No
         attempt = dict(metadata.get("model_processing", {}))
         if attempt.get("owner") != owner:
             raise ValueError("processing_claim_lost")
-        attempt.update(state=state, reason=reason)
+        attempt.update(state=state, reason=reason, finished_at=datetime.now(timezone.utc).isoformat())
+        attempt.pop("next_retry_at", None)
         if diagnostic is not None:
             attempt["diagnostic"] = diagnostic
+            if state == "failed_terminal" and diagnostic.get("retryable") is True:
+                attempt["next_retry_at"] = (datetime.now(timezone.utc) + timedelta(
+                    seconds=PROCESSING_RETRY_COOLDOWN_SECONDS * 2 ** min(attempt.get("attempt_count", 1) - 1, 3))).isoformat()
         if inputs is not None:
             attempt["inputs"] = inputs
         metadata["model_processing"] = attempt
@@ -153,10 +264,40 @@ def _mail_input(record):
             "body_text": record.body_text, "received_at": record.received_at}
 
 
-def _model_call(client, bundle, schema):
+def _model_call(client, bundle, schema, *, execution, record_ids, phase):
     structured = getattr(client, "complete_structured", None)
     kwargs = dict(system_prompt=bundle.system_prompt, user_prompt=bundle.user_prompt, max_tokens=4000)
-    return structured(schema=schema, **kwargs) if callable(structured) else client.complete(**kwargs)
+    for attempt in range(2):
+        if execution["should_stop"] and execution["should_stop"]():
+            raise _ProcessingStopped()
+        if monotonic() + min(float(getattr(client, "timeout", 25)), 25) > execution["deadline"]:
+            raise _ModelBudgetExhausted()
+        execution["record_ids"].update(record_ids)
+        execution["calls"] += 1
+        if execution["progress"]:
+            execution["progress"]({"phase": phase, "model_call": True, "record_ids": list(record_ids)})
+        try:
+            return structured(schema=schema, **kwargs) if callable(structured) else client.complete(**kwargs)
+        except DeepSeekClientError as exc:
+            if (attempt or not _failure_diagnostic(exc)["retryable"]
+                    or monotonic() + min(float(getattr(client, "timeout", 25)), 25)
+                       + MODEL_RETRY_BACKOFF_SECONDS > execution["deadline"]):
+                raise
+            # Only transient model transport/service errors, and always before writes.
+            sleep(MODEL_RETRY_BACKOFF_SECONDS)
+
+
+def _release_claim(store, record, owner):
+    _finish(store, record, owner, "pending")
+    with store.storage.write_transaction() as session:
+        row = session.get(RecruitmentMailRecord, record.id)
+        metadata = dict(row.raw_metadata)
+        attempt = dict(metadata["model_processing"])
+        if attempt.get("owner") == owner:
+            # A cooperative pause/time-budget release is not a failed retry round.
+            attempt["attempt_count"] = max(0, attempt.get("attempt_count", 1) - 1)
+            metadata["model_processing"] = attempt
+            row.raw_metadata = metadata
 
 
 def processing_status(store, *, limit=50, include_history=False):
@@ -169,6 +310,7 @@ def processing_status(store, *, limit=50, include_history=False):
             "items": [{"record_id": r.id, "subject": r.subject,
                         "processing_status": r.processing_status,
                         "eligible": _eligible(r), "reason": r.processing_error,
+                        **retry_status(r),
                         "diagnostic": (r.raw_metadata or {}).get("model_processing", {}).get("diagnostic"),
                         "action_summary": ((get_model_analysis(store, r.id) or {}).get("payload") or {}).get("action_summary")}
                        for r in records]}
@@ -189,12 +331,18 @@ def _mail_scope(store, record_ids):
     return records
 
 
-def _remaining_mail(store, applications, record_ids):
+def _remaining_mail(store, applications, record_ids, retry_request_id=None):
     return [r for r in _mail_scope(store, record_ids)
-            if _eligible(r, _input_digest(r, applications))]
+            if _eligible(r, _input_digest(r, applications), retry_request_id)]
 
 
 def _batch_outcome(summary, store, repository, record_ids):
+    execution = summary.pop("_execution", None)
+    if execution is not None:
+        summary.update(model_attempted_count=len(execution["record_ids"]), model_call_count=execution["calls"])
+        for result in summary["results"]:
+            attempted = result["record_id"] in execution["record_ids"]
+            result.update(model_attempted=attempted, analysis_source="current_run" if attempted else "not_attempted")
     items = [r["schedule_item"] for r in summary["results"] if r.get("schedule_item")]
     summary["schedule_items_created"] = sum(bool(item["created"]) for item in items)
     summary["schedule_items_time_unconfirmed"] = sum(item["time_kind"] == "unspecified" for item in items)
@@ -202,8 +350,14 @@ def _batch_outcome(summary, store, repository, record_ids):
     applications = repository.list_applications()
     remaining = [r for r in scope if _eligible(r, _input_digest(r, applications))]
     unfinished = sum(r.processing_status not in DONE for r in scope)
+    attempted_ids = {r["record_id"] for r in summary["results"]}
+    historical_failures = [r for r in scope if r.processing_status in {"failed", "failed_terminal"}
+                           and r.id not in attempted_ids and r not in remaining]
     summary.update(remaining_count=len(remaining), has_more=bool(remaining),
                    unfinished_count=unfinished,
+                   historical_failure_count=len(historical_failures),
+                   historical_failures=[historical_processing_result(r) for r in historical_failures[:10]],
+                   retry_pending_count=sum(retry_status(r)["retryable"] for r in scope),
                    next_record_ids=[r.id for r in remaining[:50]])
     summary["scope_complete"] = not unfinished and not summary["failed"] and not summary["unresolved"]
     if not summary["scope_complete"]:
@@ -212,11 +366,14 @@ def _batch_outcome(summary, store, repository, record_ids):
 
 
 def process_pending_mail(store, repository, settings, *, limit=20, record_ids=None, client=None,
-                         progress=None, should_stop=None, expected_digests=None):
+                         progress=None, should_stop=None, expected_digests=None, retry_request_id=None):
     summary = {"status": "completed", "processed": 0, "updated": 0, "unchanged": 0,
-               "irrelevant": 0, "unresolved": 0, "failed": 0, "notifications": 0, "reminders": 0, "results": []}
+               "irrelevant": 0, "unresolved": 0, "failed": 0, "notifications": 0, "reminders": 0,
+               "model_attempted_count": 0, "model_call_count": 0, "results": []}
     if not settings.write_enabled:
         return dict(summary, status="blocked", reason="write_disabled")
+    if retry_request_id and (not record_ids or len(record_ids) > 50):
+        raise ValueError("mail_retry_requires_explicit_records")
     if client is None:
         if not settings.llm_enabled or not settings.llm_api_key:
             return dict(summary, status="blocked", reason="mail_model_unavailable")
@@ -226,7 +383,7 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
                                 timeout=min(settings.llm_timeout_seconds, 25), max_attempts=1)
     limit = max(1, min(limit, 50))
     applications = repository.list_applications()
-    records = _remaining_mail(store, applications, record_ids)[:limit]
+    records = _remaining_mail(store, applications, record_ids, retry_request_id)[:limit]
     if expected_digests is not None:
         unchanged = []
         for record in records:
@@ -249,27 +406,39 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
     if summary["has_more"]:
         summary["status"] = "partial"
     # Claim only a small batch so an interrupted call cannot monopolize the mailbox.
-    records = [r for r in records[:10] if _claim(store, r, owner, _input_digest(r, applications))]
+    records = [r for r in records[:10] if _claim(store, r, owner, _input_digest(r, applications), retry_request_id)]
     if not records:
         return _batch_outcome(summary, store, repository, record_ids)
+    execution = {"record_ids": set(), "calls": 0, "progress": progress,
+                 "should_stop": should_stop, "deadline": started + 85}
+    summary["_execution"] = execution
     bundle = build_batch_triage_prompt([_mail_input(r) for r in records])
     if progress:
         progress({"phase": "triage", "record_ids": [r.id for r in records]})
     try:
-        raw = _model_call(client, bundle, TRIAGE_OUTPUT_SCHEMA)
+        raw = _model_call(client, bundle, TRIAGE_OUTPUT_SCHEMA, execution=execution,
+                          record_ids=[r.id for r in records], phase="triage")
         proposals = [MailTriageProposal.model_validate(x) for x in _decode_model_json(raw.content)]
         if len(proposals) != len(records) or {p.record_id for p in proposals} != {r.id for r in records}:
             raise ValueError("triage_records_mismatch")
         triage = {p.record_id: p for p in proposals}
         for record in records:
             validate_mail_proposal(triage[record.id], record)
+    except _ProcessingStopped:
+        for record in records:
+            _release_claim(store, record, owner)
+        return _batch_outcome(dict(summary, status="partial", reason="stop_requested"), store, repository, record_ids)
     except Exception as exc:
         diagnostic = _failure_diagnostic(exc)
         for record in records:
-            _finish(store, record, owner, "failed_terminal", "triage_" + type(exc).__name__, diagnostic=diagnostic)
+            reason = "triage_" + diagnostic.get("code", type(exc).__name__)
+            _finish(store, record, owner, "failed_terminal", reason, diagnostic=diagnostic)
+            result = {"record_id": record.id, "state": "failed_terminal", "reason": reason,
+                      "diagnostic": diagnostic, "model_attempted": True, "analysis_source": "current_run",
+                      **retry_status(store.get(record.id))}
+            summary["results"].append(result)
             if progress:
-                progress({"phase": "analysis", "result": {"record_id": record.id, "state": "failed_terminal",
-                          "reason": "triage_failed", "diagnostic": diagnostic}})
+                progress({"phase": "analysis", "result": result})
         return _batch_outcome(dict(summary, status="partial", failed=len(records),
                                    processed=len(records), reason="triage_failed"),
                               store, repository, record_ids)
@@ -295,18 +464,24 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
                 summary["irrelevant"] += 1
                 result = {"record_id": record.id, "state": "irrelevant", "reason": proposal.reason}
             else:
-                result = _analyze_one(store, repository, settings, client, record, applications, owner)
+                result = _analyze_one(store, repository, settings, client, record, applications, owner, execution)
                 bucket = result.get("summary_bucket") or {"processed_updated": "updated", "processed_unchanged": "unchanged",
                           "processed": "notifications"}.get(result["state"], "unresolved")
                 summary[bucket] += 1
             summary["results"].append(result)
+        except (_ProcessingStopped, _ModelBudgetExhausted):
+            _release_claim(store, record, owner)
+            summary["status"] = "partial"
+            continue
         except Exception as exc:
             diagnostic = _failure_diagnostic(exc)
             reason = "analysis_" + diagnostic.get("code", type(exc).__name__)
             _finish(store, record, owner, "failed_terminal", reason, diagnostic=diagnostic)
             summary["failed"] += 1
             summary["results"].append({"record_id": record.id, "state": "failed_terminal",
-                                       "reason": reason, "diagnostic": diagnostic})
+                                       "reason": reason, "diagnostic": diagnostic,
+                                       **retry_status(store.get(record.id))})
+        summary["results"][-1].update(model_attempted=True, analysis_source="current_run")
         summary["processed"] += 1
         if progress:
             progress({"phase": "analysis", "result": summary["results"][-1]})
@@ -315,10 +490,15 @@ def process_pending_mail(store, repository, settings, *, limit=20, record_ids=No
     return _batch_outcome(summary, store, repository, record_ids)
 
 
-def _analyze_one(store, repository, settings, client, record, applications, owner):
+def _analyze_one(store, repository, settings, client, record, applications, owner, execution=None):
     from packages.tools.application_status_update import ApplicationStatusUpdateInput, update_application_status
     from .association import find_stale_company_only_match
+    if execution is None:
+        execution = {"record_ids": set(), "calls": 0, "progress": None,
+                     "should_stop": None, "deadline": monotonic() + 85}
     def check_claim():
+        if execution["should_stop"] and execution["should_stop"]():
+            raise _ProcessingStopped()
         current = store.get(record_id=record.id)
         attempt = (current.raw_metadata or {}).get("model_processing", {}) if current else {}
         if (current is None or current.content_digest != record.content_digest
@@ -352,7 +532,7 @@ def _analyze_one(store, repository, settings, client, record, applications, owne
             "Select spans that explicitly support identity and event, not merely generic process descriptions.\n" +
             json.dumps(spans, ensure_ascii=True))
     for attempt in range(2):
-        response = _model_call(client, bundle, schema)
+        response = _model_call(client, bundle, schema, execution=execution, record_ids=[record.id], phase="analysis")
         check_claim()
         try:
             proposal = _analysis_proposal(response.content, spans)
@@ -373,12 +553,23 @@ def _analyze_one(store, repository, settings, client, record, applications, owne
     sync_analysis_labels(store, record.id)
     event = proposal.event_type.value
     from .scheduling import ensure_mail_schedule
-    from .binding import confirmed_binding_matches
+    from .binding import confirmed_binding_matches, bound_application_ids, _validate_group, BINDING_KEY
     matches = [a for a in applications if model_application_matches(record, proposal.model_dump(mode="json"), a)]
-    confirmed = len(matches) == 1 and confirmed_binding_matches(record, matches[0]) is True
+    confirmed = bool(matches) and all(confirmed_binding_matches(record, app) is True for app in matches)
+    bound_ids = bound_application_ids(record)
+    binding = (record.raw_metadata or {}).get(BINDING_KEY, {})
+    if binding.get("state") == "bound" and (not confirmed or set(bound_ids) != {app.id for app in matches}):
+        _finish(store, record, owner, "ambiguous_application", "confirmed_binding_changed")
+        return {"record_id": record.id, "state": "ambiguous_application", "reason": "confirmed_binding_changed",
+                "application_ids": bound_ids}
+    if confirmed:
+        _validate_group(record, matches, proposal.model_dump(mode="json"))
+        by_id = {application.id: application for application in matches}
+        matches = [by_id[identifier] for identifier in bound_ids]
     schedule_application = matches[0] if len(matches) == 1 and (proposal.job_title or proposal.job_code) and (
         confirmed or not proposal.candidate_application_id or proposal.candidate_application_id == matches[0].id) else None
-    schedule_item = ensure_mail_schedule(store, record, proposal, owner, schedule_application)
+    schedule_item = ensure_mail_schedule(store, record, proposal, owner, schedule_application,
+                                        applications=matches if confirmed else None)
     if event in {"information", "action_required", "application_confirmation"}:
         _finish(store, record, owner, "processed")
         return {"record_id": record.id, "state": "processed", "event_type": event,
@@ -386,7 +577,7 @@ def _analyze_one(store, repository, settings, client, record, applications, owne
                 "association_required": False,
                 "action_summary": proposal.action_summary, "deadline": proposal.deadline,
                 "schedule_item": schedule_item}
-    if event == "assessment" and not proposal.job_title and not proposal.job_code:
+    if event == "assessment" and not proposal.job_title and not proposal.job_code and not confirmed:
         _finish(store, record, owner, "processed")
         return {"record_id": record.id, "state": "processed", "event_type": event,
                 "summary_bucket": "reminders", "association_required": False,
@@ -396,7 +587,7 @@ def _analyze_one(store, repository, settings, client, record, applications, owne
     stale = find_stale_company_only_match(parsed, applications)
     if not matches and stale and "confirmed_application_binding" not in (record.raw_metadata or {}):
         matches = [stale]
-    if len(matches) != 1 or (not confirmed and proposal.candidate_application_id and proposal.candidate_application_id != matches[0].id):
+    if (not confirmed and len(matches) != 1) or (not confirmed and proposal.candidate_application_id and proposal.candidate_application_id != matches[0].id):
         reason = "multiple_candidates" if len(matches) > 1 else "no_verified_match"
         _finish(store, record, owner, "ambiguous_application", reason)
         return {"record_id": record.id, "state": "ambiguous_application", "reason": reason,
@@ -404,16 +595,47 @@ def _analyze_one(store, repository, settings, client, record, applications, owne
     if event not in TARGETS:
         _finish(store, record, owner, "pending_association", "event_unknown")
         return {"record_id": record.id, "state": "pending_association", "reason": "event_unknown"}
-    check_claim()
-    outcome = update_application_status(ApplicationStatusUpdateInput(
-        application_id=matches[0].id, evidence_type="mail", evidence_id=record.id,
-        target_status=TARGETS[event]), repository, store, settings=settings)
+    application_results = []
+    ids = [application.id for application in matches]
+    for index, application in enumerate(matches):
+        try:
+            check_claim()
+            outcome = update_application_status(ApplicationStatusUpdateInput(
+                application_id=application.id, evidence_type="mail", evidence_id=record.id,
+                target_status=TARGETS[event]), repository, store, settings=settings)
+        except (_ProcessingStopped, _ModelBudgetExhausted):
+            pending = [{"application_id": app.id, "company_name": app.company_name, "job_title": app.job_title,
+                        "state": "not_executed", "reason": "processing_stopped"} for app in matches[index:]]
+            _save_application_receipt(store, record, owner, ids, [*application_results, *pending], schedule_item)
+            raise
+        except Exception as exc:
+            application_results.append({"application_id": application.id, "company_name": application.company_name,
+                "job_title": application.job_title, "state": "blocked", "reason": "application_execution_failed",
+                "diagnostic": _failure_diagnostic(exc), "write_result": {"success": False}})
+            application_results.extend({"application_id": app.id, "company_name": app.company_name,
+                "job_title": app.job_title, "state": "not_executed", "reason": "previous_application_failure"}
+                for app in matches[index + 1:])
+            _save_application_receipt(store, record, owner, ids, application_results, schedule_item)
+            break
+        data = getattr(outcome, "data", None)
+        application_results.append({"application_id": application.id, "company_name": application.company_name,
+            "job_title": application.job_title, "state": data.state if data else "blocked",
+            "reason": data.reason_code if data else getattr(outcome, "error_message", None),
+            "write_result": outcome.model_dump(mode="json")})
+        _save_application_receipt(store, record, owner, ids, list(application_results), schedule_item)
     latest = store.get(record_id=record.id)
-    if not outcome.success and latest.processing_status in {"pending", "linked"}:
+    if len(matches) > 1 or any(row["reason"] == "application_execution_failed" for row in application_results):
+        failed = any(row["state"] not in {"updated", "unchanged"} for row in application_results)
+        state = "failed_terminal" if failed else "processed_updated" if any(row["state"] == "updated" for row in application_results) else "processed_unchanged"
+        store.update_processing_status(record.id, state, processing_error="partial_application_failure" if failed else None)
+        latest = store.get(record_id=record.id)
+    elif not outcome.success and latest.processing_status in {"pending", "linked"}:
         store.update_processing_status(record.id, "failed_terminal", processing_error="status_validation_failed")
         latest = store.get(record_id=record.id)
     _finish(store, record, owner, latest.processing_status, latest.processing_error,
             inputs=_input_digest(latest, repository.list_applications()))
     return {"record_id": record.id, "state": latest.processing_status,
-            "application_id": matches[0].id, "write_result": outcome.model_dump(mode="json"),
+            "application_id": matches[0].id, "write_result": application_results[0].get("write_result"),
+            "application_ids": ids, "application_results": application_results,
+            **({"summary_bucket": "failed"} if any(row["reason"] == "application_execution_failed" for row in application_results) else {}),
             "schedule_item": schedule_item}

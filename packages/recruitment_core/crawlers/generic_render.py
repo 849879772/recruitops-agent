@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, effective_crawl_timeout_seconds, launch_browser
 from .tonghuashun import TonghuashunCampusCrawler
+from .meituan import MeituanCrawler
 
 logger = logging.getLogger(__name__)
 
@@ -1412,8 +1413,12 @@ class GenericRenderCrawler(BaseCrawler):
         return observed
 
     def fetch(self) -> list[dict]:
-        if TonghuashunCampusCrawler.supports(self.careers_url):
-            adapter = TonghuashunCampusCrawler(self.company_name, self.careers_url)
+        adapter_class = next(
+            (adapter for adapter in (TonghuashunCampusCrawler, MeituanCrawler) if adapter.supports(self.careers_url)),
+            None,
+        )
+        if adapter_class is not None:
+            adapter = adapter_class(self.company_name, self.careers_url)
             jobs = adapter.fetch()
             for name in (
                 "resolved_source_url", "fetch_failed", "pagination_complete", "pages_seen",

@@ -8,8 +8,8 @@ const {createHash, randomUUID} = require("node:crypto");
 const RESOURCE_HASHES = Object.freeze({
   "protocol.js": "31d659d16741a19250ca5464ef9d9e6076546647d0859573516444cb4605b33e",
   "actions.js": "2fe91321c38236850c747fbfa812a8e3251d4c992beebf6be5bf40243d239386",
-  "application-records.js": "b919e120359b87a99f04353141168e3b88c830fad352e63562e61893b3eb7c67",
-  "content-script.js": "d4e75c50293fcbb7d9a4d4e1c103b11ec6f3a4915e310b94fce476966d22a558"
+  "application-records.js": "b847c60718972657f0226c42df20cc314e8cc8f4bbe59b474646deb75aa41bdc",
+  "content-script.js": "3ff409e77e856dd6b9fb6c1ab507a514b8f422d0a03c74f779a7926a4a4c8a80"
 });
 
 function loadObservationResources(directory) {
@@ -169,9 +169,19 @@ function normalizeFrameObservations(samples, context, skippedFrameCount = 0) {
     authorizedOrigin: topUrl.origin,
     frames: frames.map(f => ({frameId: f.frameId, frameUrl: f.frameUrl,
       recordCount: f.observation.result.application_records?.length || 0,
-      errorCode: f.observation.error_code || "", visibleTextLength: f.observation.result.diagnostics?.visibleTextLength || 0}))};
+      errorCode: f.observation.error_code || "", visibleTextLength: f.observation.result.diagnostics?.visibleTextLength || 0,
+      readyState: f.observation.result.diagnostics?.readyState || "unknown",
+      loadingVisible: /loading|please\s+wait|加载中|正在加载/i.test(f.observation.result.page?.text || ""),
+      contentFingerprint: createHash("sha256").update(JSON.stringify({
+        text: f.observation.result.page?.text || "", nodes: f.observation.result.semantic_nodes || []
+      })).digest("hex")}))};
   const finish = (observation, result) => {
     const output = {...observation, result: {...result, diagnostics}};
+    while (output.result.page_segments?.length && Buffer.byteLength(JSON.stringify(output), "utf8") > 262144) {
+      output.result.page_segments.pop();
+      diagnostics.textCoverage.frameSegments = output.result.page_segments.length;
+      diagnostics.textCoverage.truncated = true;
+    }
     if (Buffer.byteLength(JSON.stringify(output), "utf8") > 262144) throw new TypeError("Observation exceeds bridge payload limit");
     return output;
   };
@@ -187,9 +197,21 @@ function normalizeFrameObservations(samples, context, skippedFrameCount = 0) {
   // Empty helper frames cannot mask useful records or a real auth challenge.
   const pause = ["CAPTCHA_REQUIRED", "LOGIN_REQUIRED"].map(code => frames.find(f => f.observation.error_code === code)).find(Boolean);
   if (!records.length && pause) return finish({...top.observation, status: "STATE_UNCLEAR", error_code: pause.observation.error_code},
-    {...top.observation.result, requires_user_action: true});
+    {...top.observation.result, requires_user_action: true,
+      ...(pause.observation.result.auth_evidence ? {auth_evidence: pause.observation.result.auth_evidence} : {})});
   const result = {...top.observation.result, application_records: records,
     semantic_nodes: collect("semantic_nodes", 240), entries: collect("entries", 100)};
+  // Keep frame text separate: concatenating it can falsely join one role's
+  // title to another frame's status. The model cites these source boundaries.
+  result.page_segments = ranked.filter(f => f.observation.result.page).slice(0, 4).map(f => ({
+    frameId: f.frameId, frameUrl: f.frameUrl,
+    title: f.observation.result.page.title || "",
+    text: (f.observation.result.page.text || "").slice(0, 4000),
+    truncated: (f.observation.result.page.text || "").length > 4000,
+  }));
+  diagnostics.textCoverage = {frameSegments: result.page_segments.length,
+    truncated: ranked.filter(f => f.observation.result.page).length > 4 || result.page_segments.some(s => s.truncated),
+    paginationFollowed: false};
   const observation = {...top.observation};
   if (records.length) { observation.status = "SUCCEEDED"; delete observation.error_code; }
   return finish(observation, result);
@@ -490,11 +512,13 @@ const confidence = value => {
 };
 const statusSchema = {status: text(128), label: text(200), context: text(1000),
   evidence: text(2000), confidence};
-const recordSchema = {...statusSchema, title: text(200), applied_at: text(80),
+const recordSchema = {...statusSchema, title: text(200), raw_title: text(200), applied_at: text(80),
+  job_id: text(128), application_id: text(128), volunteer_index: text(32),
+  stage_labels: v => array(v, 30, text(200)), current_step_label: text(200),
   evidence_source: text(128), raw_status_labels: v => array(v, 100, text(200)),
   signals: v => fields(v, Object.fromEntries([
-    "unmapped_status", "has_date", "has_operation", "has_volunteer_index",
-    "has_explicit_status", "has_active_step", "conflicting_statuses"
+    "unmapped_status", "has_date", "has_operation", "has_volunteer_index", "context_truncated",
+    "has_explicit_status", "has_active_step", "conflicting_statuses", "has_progress_timeline", "current_step_identified"
   ].map(key => [key, boolean])))};
 const nodeSchema = {
   tag: text(24), role: text(64), ariaLabel: text(200), text: text(500),
@@ -524,7 +548,7 @@ function normalizeEvidence(raw, context, capture) {
   if (!capture && new Set(applicationIds).size !== applicationIds.length) {
     throw new TypeError("Expected unique application bindings");
   }
-  object(raw, ["protocolVersion", "type", "requestId", "ok", "data", "state", "pause", "error"], "observation");
+  object(raw, ["protocolVersion", "type", "requestId", "ok", "data", "state", "pause", "error", "auth_evidence"], "observation");
   if (Buffer.byteLength(JSON.stringify(raw), "utf8") > 256 * 1024) {
     throw new TypeError("Observation exceeds bridge payload limit");
   }
@@ -545,8 +569,26 @@ function normalizeEvidence(raw, context, capture) {
     const reason = raw.pause?.reason;
     const code = reasons[reason] || (["SOURCE_NOT_ALLOWED", "FRAME_NOT_ALLOWED"].includes(raw.error?.code)
       ? raw.error.code : "STATE_UNCLEAR");
+    const authEvidence = raw.auth_evidence ? fields(raw.auth_evidence, {
+      trigger: value => {
+        if (!["selector", "visible_text", "identity_gate", "overlay"].includes(value)) throw new TypeError("Invalid auth evidence trigger");
+        return value;
+      },
+      selector: value => {
+        if (!["", "iframe[src*='captcha']", "[data-captcha]", "[data-sitekey]", "[data-recruitops-auth='captcha']",
+          "input[type='password']", "input[autocomplete='username']", "[data-recruitops-auth='login']",
+          "input[name*='captcha' i]", "input[id*='captcha' i]", "input[placeholder*='验证码']",
+          "[aria-modal='true']", "[role='dialog']", "[data-recruitops-blocking-overlay]"].includes(value)) {
+          throw new TypeError("Invalid auth evidence selector");
+        }
+        return value;
+      },
+      text: value => clean(value, 240).replace(/https?:\/\/\S+/gi, "[redacted-url]")
+        .replace(/((?:password|passwd|token|secret|session|otp|验证码|校验码|密码)\s*[:=：]\s*)\S+/gi, "$1[redacted-secret]")
+        .replace(/\b\d{4,8}\b/g, "[redacted-code]")
+    }) : null;
     return {...envelope, status: code.endsWith("NOT_ALLOWED") ? "FAILED" : "STATE_UNCLEAR",
-      error_code: code, result: {...result, requires_user_action: true}};
+      error_code: code, result: {...result, requires_user_action: true, ...(authEvidence ? {auth_evidence: authEvidence} : {})}};
   }
   if (raw.type !== "extension.controlled_action_result") throw new TypeError("Invalid observation type");
   const data = object(raw.data, ["action", "selectorKey", "page", "semanticNodes", "applicationRecords",

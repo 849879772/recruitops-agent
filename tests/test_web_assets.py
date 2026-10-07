@@ -115,7 +115,7 @@ def test_company_ranking_is_not_overwritten_by_today_job_facets() -> None:
     js = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert "companySummaries: []" in js
-    assert 'if (state.jobBrowse.mode === "all") renderJobFacets(payload.facets);' in js
+    assert 'if (state.jobBrowse.mode === "all" && payload.facets) renderJobFacets(payload.facets);' in js
     assert "state.companySummaries.filter" in js
     assert 'api("/api/jobs/browse?limit=1&offset=0&sort=score")' in js
 
@@ -258,7 +258,7 @@ def test_assistant_persists_thread_and_recent_conversation_without_api_tokens() 
     assert "requestSessionToken" not in js
     assert '"/api/codex/threads?limit=20"' in js
     assert '/api/codex/threads/${encodeURIComponent(selectedThreadId)}' in js
-    assert '/api/codex/threads/${encodeURIComponent(selectedThreadId)}/resume' in js
+    assert '/api/codex/threads/${encodeURIComponent(threadId)}/resume' in js
     assert "/api/assistant" not in js
     assert 'id="conversation-list"' in html
     assert 'id="assistant-stop-button"' in html
@@ -266,7 +266,7 @@ def test_assistant_persists_thread_and_recent_conversation_without_api_tokens() 
     assert "state.apiToken" not in js
 
 
-def test_automations_view_reads_local_schedules_and_can_disable_them() -> None:
+def test_automations_view_reads_local_schedules_and_can_disable_or_delete_them() -> None:
     html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     js = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
     css = (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
@@ -277,6 +277,9 @@ def test_automations_view_reads_local_schedules_and_can_disable_them() -> None:
     assert 'api("/api/automations")' in js
     assert '/api/automations/${encodeURIComponent(scheduleId)}/disable' in js
     assert 'authHeaders("停用定时任务")' in js
+    assert 'data-automation-delete' in js
+    assert 'method: "DELETE"' in js
+    assert 'authHeaders("删除定时任务")' in js
     assert "renderAutomations" in js
     assert ".automation-item" in css
 
@@ -418,7 +421,8 @@ def test_codex_stream_uses_one_persistent_thread_and_real_event_deltas() -> None
     assert 'kind === "text_delta"' in js
     assert 'streamedAnswer += delta' in js
     assert 'codexThreadId' in js
-    assert 'thread_id: state.codexThreadId' in js
+    assert 'const requestThreadId = state.codexThreadId;' in js
+    assert 'thread_id: requestThreadId' in js
     assert 'data-codex-status="thread"' in html
     for status in ("turn", "item", "tool", "progress", "error"):
         assert f'data-codex-status="{status}"' in html
@@ -442,14 +446,16 @@ def test_codex_history_ui_selects_by_thread_id_without_creating_per_turn() -> No
     assert "next_cursor" in js
     assert "nextCursor" in js
     assert '/api/codex/threads/${encodeURIComponent(selectedThreadId)}' in js
-    assert '/api/codex/threads/${encodeURIComponent(selectedThreadId)}/resume' in js
+    assert '/api/codex/threads/${encodeURIComponent(threadId)}/resume' in js
     assert 'codexHistoryMessages(historyThread)' in js
     assert 'Array.isArray(thread?.turns)' in js
     assert 'state.conversations = state.codexThreadId' not in js
-    assert 'thread_id: state.codexThreadId' in js
+    assert 'thread_id: requestThreadId' in js
+    assert 'state.codexThreadId === requestThreadId' in js
     assert 'body: JSON.stringify({ text: message })' in js
-    assert "const loaded = await loadConversation(targetThreadId)" in js
-    assert "await loadConversation(firstThreadId)" in js
+    assert "await loadConversation(targetThreadId)" in js
+    assert "await loadConversation(firstThreadId)" not in js
+    assert "renderConversationRecovery" in js
     assert 'id="conversation-list"' in html
     assert 'id="conversation-list-controls"' in html
     assert 'id="conversation-load-more-button"' in html

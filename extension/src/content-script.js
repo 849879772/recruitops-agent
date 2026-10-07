@@ -26,6 +26,7 @@
   const MAX_LINKS = 200;
   const MAX_NETWORK_REQUESTS = 500;
   const seenActionTickets = new Set();
+  let currentAuthEvidence = null;
   const LOGIN_SELECTORS = Object.freeze([
     "input[type='password']",
     "input[autocomplete='username']",
@@ -208,63 +209,115 @@
       requestId,
       ok: false,
       state,
-      pause: state
+      pause: state,
+      ...(currentAuthEvidence ? {auth_evidence: currentAuthEvidence} : {})
     };
   }
 
   function safePageText() {
-    if (!document.body) {
-      return "";
+    return visibleText(document.body);
+  }
+
+  function visibleText(root) {
+    if (!root) return "";
+    const walker = document.createTreeWalker(root, globalThis.NodeFilter ? NodeFilter.SHOW_TEXT : 4);
+    const chunks = [];
+    let size = 0;
+    let visited = 0;
+    while (visited++ < 2000 && walker.nextNode()) {
+      const parent = walker.currentNode.parentElement;
+      if (!isVisible(parent) || parent.closest("script, style, input, textarea, select, iframe, object")) continue;
+      const text = String(walker.currentNode.nodeValue || "").trim();
+      if (!text) continue;
+      chunks.push(text);
+      size += text.length;
+      if (size >= MAX_TEXT_LENGTH) break;
     }
-    return redactSensitiveText(document.body.innerText || "");
+    return redactSensitiveText(chunks.join(" "));
+  }
+
+  function safeAuthText(value) {
+    return redactSensitiveText(String(value || ""))
+      .replace(/https?:\/\/\S+/gi, "[redacted-url]")
+      .replace(/((?:password|passwd|token|secret|session|otp|验证码|校验码|密码)\s*[:=：]\s*)\S+/gi, "$1[redacted-secret]")
+      .replace(/\b\d{4,8}\b/g, "[redacted-code]")
+      .slice(0, 240);
+  }
+
+  function authPause(reason, trigger, text = "", selector = "") {
+    currentAuthEvidence = {trigger, selector, text: safeAuthText(text)};
+    return reason;
   }
 
   function pagePauseReason() {
-    if (hasVisibleSelector(CAPTCHA_SELECTORS)) {
-      return protocol.pauseReasons.CAPTCHA_REQUIRED;
-    }
-    if (hasVisibleSelector(LOGIN_SELECTORS)) {
-      return protocol.pauseReasons.LOGIN_REQUIRED;
-    }
+    currentAuthEvidence = null;
     const text = safePageText();
-    const titleAndLead = `${document.title || ""} ${text.slice(0, 800)}`;
-    const captchaInput = hasVisibleSelector([
+    const leadText = text.slice(0, 800);
+    const captchaInput = visibleSelector([
       "input[name*='captcha' i]", "input[id*='captcha' i]", "input[placeholder*='验证码']"
     ]);
-    if (
-      /(?:captcha|验证码|人机验证|安全验证|滑块验证|verify you are human)/i.test(text) &&
-      (captchaInput || /(?:安全检查|完成.{0,8}验证|请.{0,8}验证|security check|verify you are human)/i.test(titleAndLead))
-    ) {
-      return protocol.pauseReasons.CAPTCHA_REQUIRED;
+    const codeControl = captchaInput || visibleSelector([
+      "input[type='tel']", "input[type='email']", "input[autocomplete='tel']",
+      "input[autocomplete='email']", "input[autocomplete='one-time-code']"
+    ]);
+    const codeLogin = Boolean(codeControl) && (/(?:短信|手机|邮箱|邮件|验证码)(?:快捷)?登录|(?:sms|email|code)\s+(?:sign.?in|log.?in)/i.test(leadText) || (
+      /登录|sign\s*in|log\s*in/i.test(leadText) && /(?:手机|短信|邮箱|邮件|phone|email)/i.test(leadText) &&
+      /(?:发送|获取|接收|输入)(?:短信|邮箱|邮件)?验证码|verification code|one.time code/i.test(leadText)
+    ));
+    const humanChallenge = value => /人机(?:验证|校验)|(?:图形|图片)验证码|滑块|滑动.{0,8}验证|拖动.{0,8}(?:验证|拼图)|请(?:先)?(?:完成|进行).{0,8}安全验证|安全检查|captcha|challenge|verify you are human|security check/i.test(value);
+    const captcha = visibleSelector(CAPTCHA_SELECTORS, element => {
+      const challengeText = visibleText(element);
+      if (humanChallenge(challengeText)) return true;
+      // ATS bundles often preload an empty, sized CAPTCHA host. Its presence
+      // does not establish an active challenge, nor does a code-login field.
+      return element.tagName === "IFRAME" || Boolean(visibleSelector(
+        ["canvas", "img", "iframe", "[role='slider']"], null, element
+      ));
+    });
+    if (captcha) {
+      return authPause(protocol.pauseReasons.CAPTCHA_REQUIRED, "selector", visibleText(captcha.element), captcha.selector);
+    }
+    const login = visibleSelector(LOGIN_SELECTORS);
+    if (login) {
+      return authPause(protocol.pauseReasons.LOGIN_REQUIRED, "selector", visibleText(login.element), login.selector);
+    }
+    if (humanChallenge(leadText) || (!codeLogin && captchaInput &&
+      visibleSelector(["img", "canvas"], null, captchaInput.element.parentElement))) {
+      return authPause(protocol.pauseReasons.CAPTCHA_REQUIRED, captchaInput ? "selector" : "visible_text", text.slice(0, 800), captchaInput?.selector || "");
+    }
+    if (codeLogin) {
+      return authPause(protocol.pauseReasons.LOGIN_REQUIRED, "visible_text", leadText);
     }
     if (/(?:请先登录|请登录|登录失效|重新登录|未登录|login required|session expired|sign in to|log in to)/i.test(text)) {
-      return protocol.pauseReasons.LOGIN_REQUIRED;
+      return authPause(protocol.pauseReasons.LOGIN_REQUIRED, "visible_text", text.slice(0, 800));
     }
     // Identity gates may use SMS/email without mentioning login (e.g. delivery queries).
     // Require an explicit request and verification context, not contact fields alone.
-    const leadText = text.slice(0, 800);
     if (
       /请(?:先)?(?:进行|完成)?身份(?:认证|验证)/.test(leadText) &&
       /(?:手机|短信|邮箱|邮件)/.test(leadText) &&
       /(?:(?:发送|获取)(?:短信|邮箱|邮件)?验证码|(?:使用|通过)(?:手机|短信|邮箱|邮件)验证)/.test(leadText)
     ) {
-      return protocol.pauseReasons.LOGIN_REQUIRED;
+      return authPause(protocol.pauseReasons.LOGIN_REQUIRED, "identity_gate", leadText);
     }
-    if (hasVisibleSelector(OVERLAY_SELECTORS)) {
-      return protocol.pauseReasons.STATE_UNCLEAR;
+    const overlay = visibleSelector(OVERLAY_SELECTORS);
+    if (overlay) {
+      return authPause(protocol.pauseReasons.STATE_UNCLEAR, "overlay", visibleText(overlay.element), overlay.selector);
     }
     return null;
   }
 
-  function hasVisibleSelector(selectors) {
+  function visibleSelector(selectors, predicate = null, root = document) {
+    let visited = 0;
     for (const selector of selectors) {
-      for (const element of document.querySelectorAll(selector)) {
-        if (isVisible(element)) {
-          return true;
+      for (const element of root.querySelectorAll(selector)) {
+        if (++visited > 100) return null;
+        if (isVisible(element) && (!predicate || predicate(element))) {
+          return {element, selector};
         }
       }
     }
-    return false;
+    return null;
   }
 
   function isVisible(element) {
@@ -275,8 +328,36 @@
     if (rect.width <= 0 || rect.height <= 0) {
       return false;
     }
-    const style = globalThis.getComputedStyle ? getComputedStyle(element) : null;
-    return !style || (style.visibility !== "hidden" && style.display !== "none");
+    const viewportWidth = document.documentElement.clientWidth;
+    const viewportHeight = document.documentElement.clientHeight;
+    let left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+    let right = Math.min(viewportWidth, rect.right), bottom = Math.min(viewportHeight, rect.bottom);
+    if (left >= right || top >= bottom) return false;
+    let depth = 0;
+    for (let current = element; current; current = current.parentElement) {
+      if (++depth > 64) return false;
+      if (current.hidden || current.inert || current.getAttribute("aria-hidden") === "true") return false;
+      const style = globalThis.getComputedStyle ? getComputedStyle(current) : null;
+      if (style && (style.visibility === "hidden" || style.visibility === "collapse" || style.display === "none"
+          || Number(style.opacity) === 0 || style.contentVisibility === "hidden")) return false;
+      if (style) {
+        const bounds = current.getBoundingClientRect();
+        if (/^inset\((?:100|[5-9]\d)%\)$/.test(style.clipPath || "") || /^circle\(0(?:px|%)?(?:\s+at\s+.*)?\)$/.test(style.clipPath || "")) return false;
+        if (current !== element && /hidden|clip|scroll|auto/.test(style.overflowX)) {
+          left = Math.max(left, bounds.left); right = Math.min(right, bounds.right);
+        }
+        if (current !== element && /hidden|clip|scroll|auto/.test(style.overflowY)) {
+          top = Math.max(top, bounds.top); bottom = Math.min(bottom, bounds.bottom);
+        }
+        const clip = style.clip?.match(/^rect\(([-\d.]+)px,?\s+([-\d.]+)px,?\s+([-\d.]+)px,?\s+([-\d.]+)px\)$/);
+        if (clip) {
+          top = Math.max(top, bounds.top + Number(clip[1])); right = Math.min(right, bounds.left + Number(clip[2]));
+          bottom = Math.min(bottom, bounds.top + Number(clip[3])); left = Math.max(left, bounds.left + Number(clip[4]));
+        }
+        if (left >= right || top >= bottom) return false;
+      }
+    }
+    return true;
   }
 
   function visibleMediaCount() {

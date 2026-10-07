@@ -74,6 +74,62 @@ def _review_input(run_id: str | None = None):
             else BatchObserveApplicationStatusInput(run_id=run_id))
 
 
+@pytest.mark.parametrize("explicit", [True, False])
+def test_resume_can_explicitly_enable_images_without_undoing_omitted_opt_out(tmp_path, monkeypatch, explicit):
+    monkeypatch.setattr(review, "_WAVE_PAGES", 10)
+    repository = _repository(tmp_path, 12)
+    choices = []
+
+    async def observe(request, *_):
+        choices.append(request.include_vision)
+        return _part(request, {item: ("unchanged", None) for item in request.application_ids})
+
+    monkeypatch.setattr(review, "batch_observe_application_status", observe)
+
+    async def run():
+        first = await review.continue_application_review(
+            BatchObserveApplicationStatusInput(all_non_terminal=True, include_vision=False), object(), repository)
+        assert choices == [False] * 10
+        options = {"include_vision": True} if explicit else {}
+        second = await review.continue_application_review(
+            BatchObserveApplicationStatusInput(run_id=first.summary["run_id"], **options), object(), repository)
+        assert second.summary["completed_count"] == 12
+        assert choices[10:] == [explicit] * 2
+        with repository.storage.session() as session:
+            state = session.get(ToolCall, first.summary["run_id"]).arguments
+            assert state["include_vision"] is explicit
+
+    asyncio.run(run())
+
+
+def test_image_attempt_count_survives_dom_only_successful_retry(tmp_path, monkeypatch):
+    repository = _repository(tmp_path, 1)
+    attempts = 0
+
+    async def observe(request, *_):
+        nonlocal attempts
+        attempts += 1
+        part = _part(request, {"0": ("failed", "vision_timeout") if attempts == 1 else ("unchanged", None)})
+        if attempts == 1:
+            part.failed[0].diagnostics = {"vision_operation_id": "visual-first",
+                "vision_provider_request_count": 1, "vision_analysis_count": 0, "vision_image_count": 2}
+        return part
+
+    monkeypatch.setattr(review, "batch_observe_application_status", observe)
+
+    async def run():
+        first = await review.continue_application_review(_review_input(), object(), repository)
+        assert first.summary["vision_provider_request_count"] == 1
+        second = await review.continue_application_review(_review_input(first.summary["run_id"]), object(), repository)
+        assert second.summary["completed_count"] == 1
+        assert len(second.unchanged) == 1
+        assert second.summary["vision_provider_request_count"] == 1
+        assert second.summary["vision_analysis_count"] == 0
+        assert second.summary["vision_image_count"] == 2
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("count", [0, 51, 86, 120])
 def test_full_review_scope_is_not_the_database_task_step_budget(tmp_path, monkeypatch, count):
     repository = _repository(tmp_path, count)
@@ -122,13 +178,14 @@ def test_review_wave_caps_global_concurrency_and_serializes_child_batches(tmp_pa
     monkeypatch.setattr(review, "batch_observe_application_status", observe)
     result = asyncio.run(review.continue_application_review(_review_input(), object(), repository))
 
-    assert peak == 4
+    assert peak == 6
     assert result.summary["processed_count"] == 10
     assert result.summary["scope_complete"] is True
     assert result.summary["verification_success_count"] == 10
 
 
-def test_review_resumes_across_ten_page_waves_with_unique_counts(tmp_path, monkeypatch):
+def test_review_resumes_at_page_safety_cap_with_unique_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(review, "_WAVE_PAGES", 10)
     repository = _repository(tmp_path, 12)
     visited = []
 

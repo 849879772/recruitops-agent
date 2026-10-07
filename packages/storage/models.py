@@ -283,6 +283,8 @@ class ApplicationSnapshot(AuditMixin, Base):
     source_stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_status: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source_status_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Overwritten on each check; never append unchanged checks to stage_history.
+    last_review: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class ScheduleEventSnapshot(AuditMixin, Base):
@@ -448,6 +450,23 @@ class BrowserOperation(Base):
     @property
     def state(self) -> str:
         return self.status
+
+
+class ApplicationIdentityBinding(Base):
+    """Revocable human confirmation of one application to one observed site card."""
+
+    __tablename__ = "application_identity_bindings"
+    application_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("application_snapshots.id", ondelete="CASCADE"), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    identity_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    page_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    card: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    approval_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
 
 class BrowserBridgeDevice(Base):
@@ -704,6 +723,7 @@ __all__ = [
     "BrowserOutboxCursor",
     "BrowserOutboxCursorRecord",
     "ApplicationSnapshot",
+    "ApplicationIdentityBinding",
     "ApplicationSnapshotRecord",
     "Base",
     "BrowserBridgeDevice",

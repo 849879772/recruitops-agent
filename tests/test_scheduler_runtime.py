@@ -89,6 +89,19 @@ def test_runtime_handlers_observe_agent_repository_without_source_writes() -> No
     )
 
 
+def test_runtime_progress_counts_mail_only_without_waiting_for_a_browser() -> None:
+    repo = Repository()
+    base = repo.list_applications()[0]
+    repo.list_applications = lambda: [base.model_copy(update={"record_url": None}),
+                                    base.model_copy(update={"id": "bad-url", "record_url": "mailto:a@example.test"})]
+    handlers = build_runtime_task_handlers(settings=SimpleNamespace(mail_enabled=False), repository=repo)
+    result = handlers[TaskType.APPLICATION_PROGRESS.value](_context(TaskType.APPLICATION_PROGRESS.value))
+    assert result["status"] == "no_reviewable_pages"
+    assert result["reviewable_page_count"] == 0 and result["excluded_mail_only"] == 2
+    assert result["browser_navigation_attempted"] is False
+    assert result["source_write_attempted"] is False
+
+
 def test_runtime_defaults_to_agent_postgres_repository(monkeypatch) -> None:
     calls: list[object] = []
 

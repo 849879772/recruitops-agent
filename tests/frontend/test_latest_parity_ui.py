@@ -188,8 +188,8 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
                 "detail_url": "https://example.test/job"}
             unrelated = {**relevant, "id": "excluded", "title": "Unrelated excluded position",
                 "analysis_status": "direction_out", "match_score": 90}
-            return route.fulfill(json={"items": [relevant, unrelated], "featured": [unrelated], "total": 1,
-                "stats": {"jobs": 1, "pending": 1},
+            return route.fulfill(json={"items": [relevant, unrelated], "featured": [unrelated], "total": 2,
+                "stats": {"jobs": 2, "pending": 1},
                 "facets": {"companies": [], "categories": {}, "platforms": []}})
         if url.path == "/api/local-ui/applications/fixture" and request.method == "PATCH":
             applications[0].update(json.loads(request.post_data))
@@ -260,14 +260,14 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         assert any(path == "/api/applications/page" for _, path, _ in calls)
         expect(page.locator(".application-card")).to_have_count(1)
         page.get_by_role("button", name="编辑 Example 的投递记录", exact=True).click()
-        editor = page.locator(".application-card").locator("form").first
+        editor = page.locator("#application-edit-dialog .application-editor").locator("form").first
         editor.locator("select").first.select_option("written")
         editor.get_by_role("button", name="更新", exact=True).click()
-        expect(page.get_by_role("button", name="编辑 Example 的投递记录", exact=True)).to_have_attribute("aria-expanded", "false")
-        expect(page.locator(".application-card").locator("form").first.locator("select").first).to_have_value("written")
+        expect(page.locator("#application-edit-dialog")).not_to_be_visible()
         assert applications[0]["stage"] == "written"
         page.get_by_role("button", name="编辑 Example 的投递记录", exact=True).click()
-        editor = page.locator(".application-card").locator("form").first
+        editor = page.locator("#application-edit-dialog .application-editor").locator("form").first
+        expect(editor.locator("select").first).to_have_value("written")
         editor.get_by_label("公司名称").fill("新的公司")
         editor.get_by_label("岗位名称").fill("新的岗位")
         editor.get_by_role("button", name="更新", exact=True).click()
@@ -351,8 +351,18 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
         expect(page.locator("#configuration-assistant-mode")).to_have_value("auto")
         expect(page.locator("#configuration-model-status")).to_have_text("待重启")
         expect(page.locator('[name="vision_enabled"]')).to_be_checked()
-        expect(page.locator("#configuration-runtime-status")).to_have_text("定时任务：已开启 · 浏览器截图识别：未启用 · 邮箱：未配置（可选）")
+        expect(page.locator("#configuration-runtime-status")).to_have_text("定时任务：已开启 · 浏览器截图识别：已保存，尚未生效（请应用配置或重启） · 邮箱：未配置（可选）")
         expect(page.locator("#configuration-message")).to_have_text("")
+        # An ordinary save and its readback retain the saved opt-in even while
+        # the startup mask still reports vision disabled. No implicit restart.
+        for _ in range(2):
+            page.locator('#configuration-industry-groups input').check()
+            page.locator("#configuration-save").click()
+            expect(page.locator("#configuration-save-result")).to_have_text("Saved fixture")
+            expect(page.locator('[name="vision_enabled"]')).to_be_checked()
+            saved_vision = json.loads([body for _, path, body in calls if path.endswith("/configuration/save")][-1])
+            assert saved_vision["settings"]["vision_enabled"] is True
+            assert page.evaluate("window.__applyCalls || 0") == 0
         page.locator('#configuration-industry-groups input').check()
         saves_before = sum(path.endswith("/configuration/save") for _, path, _ in calls)
         page.locator("#configuration-complete").click()
@@ -422,7 +432,8 @@ def test_manual_form_and_model_connections_offline(width, tmp_path):
             page.locator('[data-job-mode="today"]').click()
         expect(page.locator("#jobs-heading")).to_have_text("今日新增岗位")
         expect(page.locator("#jobs-table-body")).to_contain_text("Relevant unscored engineer")
-        expect(page.locator("#jobs-table-body")).not_to_contain_text("Unrelated excluded position")
+        expect(page.locator("#jobs-table-body")).to_contain_text("Unrelated excluded position")
+        expect(page.locator("#jobs-table-body")).to_contain_text("方向不符")
         expect(page.locator("#featured-job-list")).not_to_contain_text("Unrelated excluded position")
         with page.expect_response(lambda response: "/api/jobs/browse?" in response.url and "evaluation=unscored" in response.url):
             page.locator("#job-evaluation-filter").select_option("unscored")

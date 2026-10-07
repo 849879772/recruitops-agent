@@ -32,6 +32,7 @@ class OperationName(StrEnum):
     SCHEDULE_CREATE = "schedule_create"
     BROWSER_ACTION = "browser_action"
     RECRUITMENT_MAIL_BINDING = "recruitment_mail_binding"
+    APPLICATION_IDENTITY_BINDING = "application_identity_binding"
 
 
 class ApprovalStatus(StrEnum):
@@ -82,6 +83,7 @@ _OPERATION_ALIASES: dict[str, OperationName] = {
     "create_schedule": OperationName.SCHEDULE_CREATE,
     "browser_action": OperationName.BROWSER_ACTION,
     "recruitment_mail_binding": OperationName.RECRUITMENT_MAIL_BINDING,
+    "application_identity_binding": OperationName.APPLICATION_IDENTITY_BINDING,
 }
 
 

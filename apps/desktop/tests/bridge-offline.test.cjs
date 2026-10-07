@@ -4,6 +4,14 @@ const { EventEmitter } = require('node:events');
 const { DesktopBridge, safeReviewErrorCode } = require('../dist/bridge-client');
 const { ReviewObservationError, reviewDiagnosticSummary } = require('../dist/review-readiness');
 
+test('record-entry failures retain actionable codes across the desktop bridge', () => {
+  for (const code of ['APPLICATION_RECORD_ENTRY_NOT_ENTERED', 'APPLICATION_RECORD_HOME_REDIRECT']) {
+    assert.equal(safeReviewErrorCode(code), code);
+  }
+  assert.equal(safeReviewErrorCode('browser_account_changed'), 'DESKTOP_ACCOUNT_CHANGED');
+  assert.equal(safeReviewErrorCode('DESKTOP_ACCOUNT_CHANGED'), 'DESKTOP_ACCOUNT_CHANGED');
+});
+
 const wait = async predicate => {
   for (let n = 0; n < 200; n++) {
     if (predicate()) return;
@@ -70,6 +78,64 @@ test('failed review transports its sanitized last observation for persisted diag
   } finally {bridge.stop();}
 });
 
+test('scope and unavailable errors keep their explicit codes and never claim a database write',async()=>{
+  for(const code of ['FRAME_SCOPE_DENIED','APPLICATION_PAGE_UNAVAILABLE']) {
+    assert.equal(safeReviewErrorCode(code),code);
+    const {bridge,socket}=fixture(async()=>{throw new ReviewObservationError(code,reviewDiagnosticSummary());});
+    try {
+      socket.input(dispatch('classified-failure',1));
+      await wait(()=>socket.sent.some(message=>message.type==='result'));
+      const output=socket.sent.find(message=>message.type==='result');
+      assert.equal(output.error_code,code);
+      assert.equal(output.result.evidence_only,true);
+      assert.equal(output.result.database_updated,false);
+    } finally {bridge.stop();}
+  }
+});
+
+test('unparsed page preserves bound evidence and official auth errors become user-action results',async()=>{
+  const {bridge,socket}=fixture(async(_url,id)=>{
+    if(id==='unparsed')return {...result(id),status:'STATE_UNCLEAR',error_code:'UNPARSED_APPLICATION_PAGE',
+      result:{...result(id).result,application_records:[],semantic_nodes:[{text:'Application status'}]}};
+    throw new ReviewObservationError('LOGIN_REQUIRED',reviewDiagnosticSummary(),{reason:'will_redirect_official_sso',
+      sameOrigin:false,ssoCandidate:true,authNavigation:{provider:'huawei',hops:1,returnedToRecruitment:false}});
+  });
+  try {
+    socket.input(dispatch('unparsed',1));socket.input(dispatch('auth-pause',2));
+    await wait(()=>socket.sent.filter(message=>message.type==='result').length===2);
+    const unparsed=socket.sent.find(message=>message.type==='result'&&message.operation_id==='unparsed');
+    assert.equal(unparsed.error_code,'UNPARSED_APPLICATION_PAGE');
+    assert.equal(unparsed.status,'STATE_UNCLEAR');
+    assert.equal(unparsed.result.semantic_nodes.length,1);
+    const auth=socket.sent.find(message=>message.type==='result'&&message.operation_id==='auth-pause');
+    assert.equal(auth.status,'STATE_UNCLEAR');assert.equal(auth.error_code,'LOGIN_REQUIRED');
+    assert.equal(auth.result.requires_user_action,true);
+    assert.equal(auth.result.pause.reason,'login_required');
+    assert.equal(auth.result.auth_navigation.provider,'huawei');
+    assert.equal(auth.result.database_updated,false);
+    assert.equal(auth.result.page,undefined,'authentication content is never page evidence');
+  }finally{bridge.stop();}
+});
+
+test('transport deadline preserves the latest sanitized diagnostic callback',async()=>{
+  const summary=reviewDiagnosticSummary({result:{page:{page_url:'https://ats.example/applications?token=private',
+    title:'Applications',text:'Loading account person@example.test'},diagnostics:{readyState:'complete'}}});
+  const {bridge,socket}=fixture((_url,_id,_ids,_signal,_deadline,_stage,diagnostic)=>{
+    diagnostic(summary);
+    return new Promise(()=>{});
+  },{operationBudgetMs:35});
+  try {
+    socket.input(dispatch('outer-timeout',1));
+    await wait(()=>socket.sent.some(message=>message.type==='result'));
+    const output=socket.sent.find(message=>message.type==='result');
+    assert.equal(output.error_code,'DESKTOP_REVIEW_TIMEOUT');
+    assert.deepEqual(output.result.last_observation,summary);
+    assert.equal(output.result.database_updated,false);
+    assert.ok(!JSON.stringify(output).includes('person@'));
+    assert.ok(!JSON.stringify(output).includes('token=private'));
+  } finally {bridge.stop();}
+});
+
 test('accepts and drains a ten-operation wave with four active and FIFO queueing', async () => {
   const calls = [];
   let active = 0;
@@ -78,7 +144,7 @@ test('accepts and drains a ten-operation wave with four active and FIFO queueing
     active++;
     maxActive = Math.max(maxActive, active);
     calls.push({ id, finish: () => { active--; resolve(result(id)); } });
-  }));
+  }), {maxActive: 4});
   try {
     for (let n = 1; n <= 10; n++) socket.input(dispatch(`op-${n}`, n));
     await wait(() => calls.length === 4);
@@ -97,6 +163,26 @@ test('accepts and drains a ten-operation wave with four active and FIFO queueing
     assert.equal(socket.sent.filter(message => message.type === 'result' && message.operation_id === 'op-1').length, 2);
     assert.equal(maxActive, 4);
   } finally { bridge.stop(); }
+});
+test('default concurrency is six; completed cancellation and disconnect invalidate cached source pages', async () => {
+  const calls = [], invalidated = [];
+  const {bridge, socket} = fixture((_url, id, _ids, _signal, _deadline, _stage, _diagnostic, _vision, context) =>
+    new Promise(resolve => calls.push({id, context, finish: () => resolve(result(id))})),
+    {onReviewInvalidated: id => invalidated.push(id)});
+  try {
+    for (let n = 1; n <= 7; n++) {
+      const request = dispatch(`six-${n}`, n); request.payload.command.params = {review_task_id: 'review-run-1'};
+      socket.input(request);
+    }
+    await wait(() => calls.length === 6);
+    assert.equal(calls[0].context.reviewTaskId, 'review-run-1');
+    assert.equal(calls[0].context.retainForVisionReuse, true);
+    assert.equal(socket.sent.filter(message => message.status === 'DISPATCHED').length, 1);
+    calls[0].finish(); await wait(() => calls.length === 7);
+    socket.input({protocol_version: 1, type: 'operation.cancel', device_id: 'desktop-fixture', sequence: 8, operation_id: 'six-1'});
+    assert.ok(invalidated.includes('six-1'), 'cancellation after source completion still releases its cached renderer');
+    socket.close(); assert.ok(invalidated.includes(undefined), 'reconnect does not inherit old page capabilities');
+  } finally {bridge.stop();}
 });
 
 test('cancels queued work without later executing it, including a duplicate dispatch', async () => {
@@ -175,6 +261,7 @@ test('maps known lowercase browser errors and never forwards unknown messages', 
     assert.equal(outcome.error_code, 'DESKTOP_READINESS_TIMEOUT');
     assert.equal(safeReviewErrorCode(new Error('private page text')), 'DESKTOP_OBSERVATION_FAILED');
     assert.equal(safeReviewErrorCode('browser_load_timeout'), 'DESKTOP_LOAD_TIMEOUT');
+    assert.equal(safeReviewErrorCode('authentication_recovery_timeout'), 'AUTHENTICATION_RECOVERY_TIMEOUT');
   } finally { bridge.stop(); }
 });
 

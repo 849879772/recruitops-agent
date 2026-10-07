@@ -92,3 +92,31 @@ def test_company_progress_legacy_fallback_does_not_change_scoring_counts(tmp_pat
         with storage.write_transaction() as session:
             session.get(TaskRun, "run-count").status = "running"
         assert task_progress(storage)["run"]["completed"] == expected
+
+
+def test_review_progress_projects_mail_only_exclusions_separately(tmp_path, monkeypatch):
+    from packages.tools import application_review_tasks
+
+    storage = Storage.from_url(f"sqlite:///{tmp_path / 'mail-only-progress.db'}", initialize=True)
+    summary = {
+        "run_id": "review-mail-only", "thread_id": "thread", "run_status": "running",
+        "completed_count": 3, "scope_total": 5, "processed_count": 3,
+        "verification_success_count": 1, "failed": 0, "blocked": 0, "unresolved": 0,
+        "remaining_count": 2, "database_total": 5, "retryable_count": 0,
+        "excluded_terminal": 0, "excluded_mail_only": 2,
+        "updated_at": "2026-09-28T00:00:00+00:00",
+        "can_pause": True, "can_resume": False, "can_cancel": True,
+    }
+    monkeypatch.setattr(application_review_tasks, "review_runs", lambda *_args, **_kwargs: [summary])
+
+    run = task_progress(storage)["run"]
+
+    assert run["excluded_mail_only"] == 2
+    assert run["verified"] == 1
+    assert run["failed"] == run["blocked"] == run["unresolved"] == 0
+    assert run["completed"] == 3 and run["remaining"] == 2
+
+    summary.update(unresolved=2, retained_count=1, attention_required_count=1)
+    run = task_progress(storage)["run"]
+    assert run["retained"] == run["attention_required"] == 1
+    assert run["verified"] == 1 and run["unresolved"] == 2

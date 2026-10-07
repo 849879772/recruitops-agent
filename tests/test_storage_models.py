@@ -154,6 +154,7 @@ def test_schema_contains_agent_state_and_snapshot_tables() -> None:
         "job_snapshots",
         "job_analysis_snapshots",
         "application_snapshots",
+        "application_identity_bindings",
         "schedule_event_snapshots",
         "write_audits",
     } <= tables

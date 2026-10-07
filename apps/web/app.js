@@ -37,10 +37,11 @@
     try { recent = JSON.parse(readStorage(STORAGE_KEYS.recent) || "{}"); } catch (_) { recent = {}; }
     const codexThreadId = readStorage(STORAGE_KEYS.codexThread) || (typeof recent.codexThreadId === "string" ? recent.codexThreadId : "");
     if (codexThreadId) writeStorage(STORAGE_KEYS.codexThread, codexThreadId);
+    const sameThread = recent.codexThreadId === codexThreadId;
     return {
       codexThreadId,
-      messages: codexThreadId && Array.isArray(recent.messages) ? recent.messages : [],
-      tasks: codexThreadId && Array.isArray(recent.tasks) ? recent.tasks : [],
+      messages: codexThreadId && sameThread && Array.isArray(recent.messages) ? recent.messages : [],
+      tasks: codexThreadId && sameThread && Array.isArray(recent.tasks) ? recent.tasks : [],
     };
   }
 
@@ -74,8 +75,9 @@
     companyPage: 1,
     companyPageSize: 30,
     applications: [],
+    applicationIdentityQueue: { items: [], total: null, error: "" },
     applicationsRequestId: 0,
-    applicationBrowse: { pageSize: 50, total: 0, columns: {}, query: "" },
+    applicationBrowse: { pageSize: 50, total: 0, columns: {}, query: "", channel: "all" },
     applicationRequestController: null,
     jobRequestController: null,
     jobSummaryMode: null,
@@ -108,12 +110,16 @@
     codexThreadListError: "",
     codexHistoryLoading: false,
     codexHistoryError: "",
+    codexHistoryFailure: null,
+    codexResumePendingThreadId: "",
     codexHistoryRequestId: 0,
     codexPendingThreadId: "",
     codexTurnId: "",
     codexTurnReady: null,
     codexStopRequested: false,
     dailyNotices: loadDailyNotices(),
+    backgroundRunOwners: {},
+    taskProgressPayload: null,
     codexEventState: {},
     operationalReport: null,
     jobTotal: 0,
@@ -121,6 +127,19 @@
   };
 
   const $ = (id) => document.getElementById(id);
+  const assistantRuns = new Map();
+  const deletedConversationIds = new Set();
+  function syncAssistantRun() {
+    const run = assistantRuns.get(state.codexThreadId);
+    state.activeAssistantController = run?.controller || null;
+    state.codexTurnId = run?.turnId || "";
+    state.codexTurnReady = run?.turnReady || null;
+    state.codexStopRequested = Boolean(run?.stopRequested);
+    if ($("run-task-button")) $("run-task-button").disabled = Boolean(run);
+    if ($("assistant-stop-button")) $("assistant-stop-button").hidden = !run;
+    if ($("assistant-live-run")) $("assistant-live-run").hidden = !run;
+    renderDailyProgress(state.taskProgressPayload);
+  }
   const localDate = (value = new Date()) => {
     const pad = (part) => String(part).padStart(2, "0");
     return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
@@ -185,6 +204,12 @@
     { key: "closed", label: "已挂", stages: ["rejected", "withdrawn"] },
   ];
 
+  const APPLICATION_CHANNELS = { all: "全部", official_page: "可官网复核", mail_only: "仅邮件更新" };
+  const APPLICATION_CACHE_MS = 30_000;
+  const applicationReviewDateFormat = new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+
   const CODEX_STREAM_MAX_RECONNECTS = 2;
 
   // This is deliberately deterministic: the UI chooses an existing API task before making a request.
@@ -223,7 +248,14 @@
     const response = await fetch(path, { headers: { Accept: "application/json" }, ...options });
     let payload = null;
     try { payload = await response.json(); } catch (_) { payload = null; }
-    if (!response.ok) throw new Error(payload?.detail || `请求失败（${response.status}）`);
+    if (!response.ok) {
+      const detail = payload?.detail;
+      const error = new Error(typeof detail === "string" ? detail : detail?.message || `请求失败（${response.status}）`);
+      error.status = response.status;
+      error.code = detail?.code || "";
+      error.requestId = detail?.request_id || "";
+      throw error;
+    }
     return payload;
   };
 
@@ -277,20 +309,28 @@
     paused: "已暂停", stopped: "已中断", pending: "等待中",
     partial: "部分完成", skipped: "已跳过",
     awaiting_continuation: "等待助理继续下一批",
+    awaiting_confirmation: "等待你确认邮件关联",
   };
   const DAILY_MODE_NAMES = {
     full: "后台全量爬取", crawl_only: "后台岗位抓取",
     score_only: "后台岗位评分", resume: "后台任务续跑",
   };
   const AUTO_DAILY_REPORT_PREFIX = "[RecruitOps 自动任务汇报]";
+  const AUTO_MAIL_REPORT_PREFIX = "[RecruitOps 邮件确认后只读汇报]";
   const DAILY_REPORT_STATUSES = new Set(["completed", "succeeded", "failed", "partial", "timed_out", "stopped", "interrupted"]);
 
-  const ACTIVE_TASK_STATUSES = new Set(["accepted", "running", "pausing", "cancelling", "awaiting_continuation"]);
+  const ACTIVE_TASK_STATUSES = new Set(["accepted", "running", "pausing", "cancelling", "awaiting_continuation", "awaiting_confirmation"]);
+  function backgroundRunThread(run) {
+    return text(run?.thread_id || state.backgroundRunOwners[run?.run_id]
+      || (run?.task_kind === "daily" && state.dailyNotices[run?.run_id]?.thread_id), "");
+  }
   function renderDailyProgress(payload) {
+    state.taskProgressPayload = payload;
     const card = $("assistant-task-progress");
     if (!card) return;
     const runs = (Array.isArray(payload?.runs) ? payload.runs : payload?.run ? [payload.run] : [])
-      .filter(item => ACTIVE_TASK_STATUSES.has(item.status));
+      .filter(item => ACTIVE_TASK_STATUSES.has(item.status) && state.codexThreadId
+        && backgroundRunThread(item) === state.codexThreadId);
     const run = runs[0];
     const extra = $("assistant-more-task-progress");
     clear(extra);
@@ -306,6 +346,9 @@
   }
 
   function renderTaskProgressCard(card, run, primary) {
+    card.dataset.runId = run.run_id || "";
+    card.dataset.threadId = backgroundRunThread(run);
+    card.dataset.taskKind = run.task_kind || "daily";
     const heading = primary ? null : element("div", "assistant-task-progress-head");
     if (heading) card.appendChild(heading);
     const node = (suffix, tag, className = "") => {
@@ -334,6 +377,9 @@
       if (run.retry_pending > 0) detail += `（含待重试 ${run.retry_pending}）`;
       if (run.failed > 0) detail += `，失败 ${run.failed}${run.retry_pending > 0 ? "（含待重试）" : ""}`;
       if (run.blocked > 0) detail += `，待确认 ${run.blocked}`;
+      const excludedMailOnly = run.excluded_mail_only ?? run.summary?.excluded_mail_only ?? 0;
+      if (run.task_kind === "application_review" && excludedMailOnly > 0) detail += `，已跳过（仅邮件更新）${excludedMailOnly} 条`;
+      if (run.task_kind === "recruitment_mail" && run.sync_warning) detail += " · 同步未完成，仅处理本地已保存邮件";
     } else if (stage === "discovery") {
       completed = progress.pages_fetched; total = progress.pages_total;
       detail += ` · 已读取 ${completed ?? 0} 页${Number.isInteger(total) && total > 0 ? ` / ${total} 页` : ""}，发现 ${progress.records_seen ?? 0} 条来源`;
@@ -367,6 +413,10 @@
       button.addEventListener("click", () => void controlBackgroundTask(run, action, button));
       actions.appendChild(button);
     }
+    if (run.task_kind === "application_review") {
+      const details = element("button", "button button--ghost", "查看本轮复核明细"); details.type = "button";
+      details.addEventListener("click", () => void openReviewResults(run.run_id)); actions.appendChild(details);
+    }
   }
 
   async function controlBackgroundTask(run, action, button) {
@@ -394,13 +444,13 @@
     state.dailyNotices = Object.fromEntries(entries);
     writeStorage(STORAGE_KEYS.dailyNotices, JSON.stringify(state.dailyNotices));
   }
-  function rememberActiveDailyRuns(payload, bindThreadId = "", excludedRunIds = new Set()) {
+  function rememberActiveDailyRuns(payload) {
     const runs = Array.isArray(payload?.runs) ? payload.runs : payload?.run ? [payload.run] : [];
     let changed = false;
     for (const run of runs) {
       if (run?.task_kind !== "daily" || !ACTIVE_TASK_STATUSES.has(run.status) || typeof run.run_id !== "string") continue;
-      if (!run.thread_id && excludedRunIds.has(run.run_id)) continue;
-      const threadId = text(run.thread_id || bindThreadId, "").trim();
+      const threadId = backgroundRunThread(run).trim();
+      if (run.automation?.direct || run.report_persisted || state.conversations.some(thread => codexThreadIdOf(thread) === threadId && thread.automation?.direct)) continue;
       if (!threadId || state.dailyNotices[run.run_id]) continue;
       state.dailyNotices[run.run_id] = { thread_id: threadId, status: "active", observed_at: Date.now() };
       changed = true;
@@ -412,6 +462,9 @@
   }
   async function reportFinishedDailyRun(run, notice) {
     const runId = run.run_id;
+    if (state.conversations.some(thread => codexThreadIdOf(thread) === notice.thread_id && thread.automation?.direct)) {
+      notice.status = "reported"; persistDailyNotices(); return;
+    }
     if (dailyReportsInFlight.has(runId) || state.activeAssistantController) return;
     if (state.codexThreadId !== notice.thread_id) {
       if (!notice.deferred_notified) {
@@ -429,7 +482,7 @@
     $("assistant-stop-button").hidden = false;
     const summary = `${DAILY_MODE_NAMES[run.mode] || "后台爬取任务"}已结束，助理正在整理结果。`;
     const message = appendMessage("assistant", summary, null, { streaming: true });
-    const prompt = `${AUTO_DAILY_REPORT_PREFIX} 后台爬取任务已结束。这是应用自动生成的只读汇报请求，不是用户授权的新操作。请仅调用 daily_recruitment_sync_status(run_id="${runId}") 核对终态及真实入库结果，然后用简短中文告知用户完成、部分完成或失败的情况、岗位与评分成果及必要的下一步。不得启动、恢复、取消任务或写入数据；回复中不要显示运行编号。`;
+    const prompt = `${AUTO_DAILY_REPORT_PREFIX} 后台爬取任务已结束。这是应用自动生成的只读汇报请求，不是用户授权的新操作。请仅调用 daily_recruitment_sync_status(run_id="${runId}") 核对终态及真实入库结果，新增数使用实际插入回执，区分完整详情、待补详情和评分；详情失败不能称全量完成。然后用简短中文告知用户完成、部分完成或失败的情况、岗位与评分成果及必要的下一步。不得启动、恢复、取消任务或写入数据；回复中不要显示运行编号。`;
     try {
       const task = await runCodexAssistantQuery(prompt, "", message.id);
       if (state.codexThreadId === notice.thread_id) {
@@ -450,8 +503,7 @@
       notice.status = "reported";
       persistDailyNotices();
       dailyReportsInFlight.delete(runId);
-      $("run-task-button").disabled = false;
-      $("assistant-stop-button").hidden = true;
+      if (state.codexThreadId === notice.thread_id) syncAssistantRun();
     }
   }
   async function pollDailyRunNotices(activePayload) {
@@ -468,14 +520,17 @@
           });
         } catch (_) { continue; }
         const run = payload?.run;
-        if (!run || run.task_kind !== "daily") continue;
+        if (!run || run.run_id !== runId || run.task_kind !== "daily"
+          || run.thread_id && run.thread_id !== notice.thread_id) continue;
+        if (run.automation?.direct || run.report_persisted || state.conversations.some(thread => codexThreadIdOf(thread) === notice.thread_id && thread.automation?.direct)) {
+          notice.status = "reported"; persistDailyNotices(); continue;
+        }
         if (["paused", "cancelled"].includes(run.status)) {
           notice.status = "dismissed";
           persistDailyNotices();
           continue;
         }
         if (!DAILY_REPORT_STATUSES.has(run.status)) continue;
-        if (run.thread_id) notice.thread_id = run.thread_id;
         notice.status = "ready";
         notice.terminal_status = run.status;
         notice.mode = run.mode;
@@ -485,25 +540,29 @@
       void reportFinishedDailyRun({ run_id: runId, status: notice.terminal_status, mode: notice.mode }, notice);
     }
   }
-  async function refreshDailyProgress(bindThreadId = "", excludedRunIds = new Set()) {
+  async function refreshDailyProgress() {
     const requestId = ++taskProgressRequestId;
+    const requestThreadId = state.codexThreadId;
+    const conversationRequestId = state.codexHistoryRequestId;
     taskProgressController?.abort();
     taskProgressController = new AbortController();
     try {
       const result = await api("/api/local-ui/tasks/progress", { headers: authHeaders("daily-progress"), signal: taskProgressController.signal });
-      if (requestId !== taskProgressRequestId) return;
+      if (requestId !== taskProgressRequestId || requestThreadId !== state.codexThreadId
+        || conversationRequestId !== state.codexHistoryRequestId) return;
       renderDailyProgress(result);
-      rememberActiveDailyRuns(result, bindThreadId, excludedRunIds);
+      rememberActiveDailyRuns(result);
       try { await pollDailyRunNotices(result); } catch (_) { /* Keep the active card if a terminal receipt is temporarily unavailable. */ }
       // Approval proposals may arrive after the assistant has ended its reply.
       try {
         const approvals = await api("/api/approvals");
-        if (requestId !== taskProgressRequestId) return;
+        if (requestId !== taskProgressRequestId || requestThreadId !== state.codexThreadId) return;
         state.approvals = normalizeApprovals(approvals);
         renderMailBindingApprovals();
       } catch (_) { /* A failed approval refresh never hides real task progress. */ }
+      await refreshMailConfirmations();
     } catch (error) {
-      if (requestId !== taskProgressRequestId || error.name === "AbortError") return;
+      if (requestId !== taskProgressRequestId || requestThreadId !== state.codexThreadId || error.name === "AbortError") return;
       const card = $("assistant-task-progress");
       if (card && !card.hidden) setText("assistant-task-progress-state", "暂时无法刷新");
     }
@@ -918,9 +977,14 @@
     const threadId = codexThreadIdOf(thread) || state.codexThreadId || "thread";
     const records = [];
     const add = (role, body, key, timestamp) => {
-      const normalizedBody = codexContentText(body).trim();
+      let normalizedBody = codexContentText(body).trim();
+      if (role === "user") {
+        // The API appends routing context; it is not part of the user's visible message.
+        const footer = normalizedBody.lastIndexOf("\n\n[本轮页面上下文");
+        if (footer >= 0) normalizedBody = normalizedBody.slice(0, footer).trim();
+      }
       if (!normalizedBody) return;
-      if (role === "user" && normalizedBody.startsWith(AUTO_DAILY_REPORT_PREFIX)) return;
+      if (role === "user" && [AUTO_DAILY_REPORT_PREFIX, AUTO_MAIL_REPORT_PREFIX].some(prefix => normalizedBody.startsWith(prefix))) return;
       records.push({
         id: `codex-${threadId}-${key}`,
         role,
@@ -933,15 +997,20 @@
     };
     const turns = Array.isArray(thread?.turns) ? thread.turns : [];
     turns.forEach((turn, turnIndex) => {
+      const firstRecord = records.length;
+      let reviewSummary = null;
       const turnId = text(turn?.id, `turn-${turnIndex}`);
       const timestamp = turn?.createdAt ?? turn?.created_at ?? thread?.updatedAt ?? thread?.updated_at;
       const items = Array.isArray(turn?.items) ? turn.items : [];
       const autoPrompt = items.map((item) => codexContentText(item?.content ?? item?.text))
-        .find((body) => body.startsWith(AUTO_DAILY_REPORT_PREFIX)) || "";
+        .find((body) => [AUTO_DAILY_REPORT_PREFIX, AUTO_MAIL_REPORT_PREFIX].some(prefix => body.startsWith(prefix))) || "";
       const autoRunId = autoPrompt.match(/run_id="([a-f0-9]{32})"/)?.[1] || "";
       items.forEach((item, itemIndex) => {
         const kind = text(item?.type, "").replace(/[-_]/g, "").toLowerCase();
         const itemId = text(item?.id, `item-${itemIndex}`);
+        if (["mcptoolcall", "dynamictoolcall", "toolcall"].includes(kind) && ["completed", "success", "succeeded"].includes(item.status)) {
+          reviewSummary = reviewSummaryFromReceipt(item.tool || item.tool_name || item.name, item) || reviewSummary;
+        }
         if (kind === "usermessage" || kind === "user") {
           add("user", item.content ?? item.text, `${turnId}-${itemId}`, item?.createdAt ?? item?.created_at ?? timestamp);
         } else if (kind === "agentmessage" || kind === "assistant") {
@@ -950,13 +1019,27 @@
             `${turnId}-${itemId}`, item?.createdAt ?? item?.created_at ?? timestamp);
         }
       });
+      if (reviewSummary) {
+        let lastAssistant = records.slice(firstRecord).reverse().find(record => record.role === "assistant");
+        if (!lastAssistant) {
+          add("assistant", "官网复核结果已返回。", `${turnId}-review`, timestamp);
+          lastAssistant = records.at(-1);
+        }
+        lastAssistant.result = { review_summary: reviewSummary };
+      }
     });
-    if (!records.length && Array.isArray(thread?.messages)) {
+    if ((!records.length || thread?.automation?.direct) && Array.isArray(thread?.messages)) {
       thread.messages.forEach((message, index) => {
         const role = text(message?.role, "").toLowerCase() === "user" ? "user" : "assistant";
         add(role, message?.body ?? message?.text ?? message?.content, `message-${text(message?.id, index)}`, message?.createdAt ?? message?.created_at);
+        const record = records.at(-1);
+        if (record?.id === `codex-${threadId}-message-${text(message?.id, index)}`) {
+          record.task_id = message.task_id || null;
+          record.result = message.result || null;
+        }
       });
     }
+    if (thread?.automation?.direct) records.sort((left, right) => left.created_at.localeCompare(right.created_at));
     return records;
   }
 
@@ -970,8 +1053,11 @@
     const threadId = codexThreadIdOf(thread);
     if (!threadId) throw new Error("Codex 创建会话后没有返回 thread id。");
     state.codexThreadId = threadId;
+    syncAssistantRun();
     state.codexThreadMetadata = thread;
     state.codexHistoryError = "";
+    state.codexHistoryFailure = null;
+    state.codexResumePendingThreadId = "";
     writeStorage(STORAGE_KEYS.codexThread, threadId);
     resetCodexEventStatuses();
     persistConversation();
@@ -1065,8 +1151,9 @@
   }
 
   function visibleJobs(items) {
-    const excluded = new Set(["excluded", "direction_out", "doctorate_only", "internship", "cohort_unconfirmed"]);
-    return Array.isArray(items) ? items.filter((job) => job && !excluded.has(job.analysis_status)) : [];
+    // The browse API owns scope and explicit filters. Keep historical rows
+    // visible, including their saved exclusion status, without re-screening.
+    return Array.isArray(items) ? items.filter((job) => job) : [];
   }
 
   function renderJobs(items) {
@@ -1472,7 +1559,9 @@
   function renderFeaturedJobs(items = []) {
     const node = $("featured-job-list");
     clear(node);
-    state.featuredJobs = visibleJobs(items);
+    state.featuredJobs = visibleJobs(items).filter((job) =>
+      job.match_score != null && job.match_score >= 70
+      && (!job.analysis_status || job.analysis_status === "complete"));
     setText("featured-jobs-count", `${state.featuredJobs.length} 个岗位`);
     if (!state.featuredJobs.length) return empty(node, "暂无高匹配岗位", "当前范围内没有 70 分及以上的岗位。");
     state.featuredJobs.forEach((job) => {
@@ -1737,36 +1826,129 @@
     return { key: "record", label: "历史记录" };
   }
 
-  function renderApplications(payload = {}) {
-    state.applications = Array.isArray(payload.items) ? payload.items : [];
-    state.applicationBrowse.total = payload.total ?? state.applications.length;
+  function applicationProgressChannel(application) {
+    const candidate = typeof application.record_url === "string" ? application.record_url.trim() : "";
+    if (!/^https?:\/\/[^/\\\s?#]+/i.test(candidate)) return "mail_only";
+    try {
+      const url = new URL(candidate);
+      return ["http:", "https:"].includes(url.protocol) && url.hostname && !url.username && !url.password
+        ? "official_page" : "mail_only";
+    } catch (_) { return "mail_only"; }
+  }
+
+  function setApplicationChannel(channel) {
+    if (!Object.hasOwn(APPLICATION_CHANNELS, channel)) return;
+    state.applicationBrowse.channel = channel;
+    renderApplications();
+  }
+
+  function renderApplications(payload = null) {
+    if (payload) {
+      state.applications = Array.isArray(payload.items) ? payload.items : [];
+      state.applicationBrowse.total = payload.total ?? state.applications.length;
+      state.applicationBrowse.unfilteredTotal = payload.unfiltered_total ?? payload.total ?? state.applications.length;
+      state.applicationBrowse.stageCounts = payload.stage_counts || {};
+    }
+    const channel = state.applicationBrowse.channel || "all";
+    const incomplete = state.applicationBrowse.loading || state.applicationBrowse.error
+      || Object.values(state.applicationBrowse.columns).some(column => column.loading || column.error || column.offset < column.total)
+      || state.applications.length < state.applicationBrowse.total;
+    const channelCounts = { all: state.applications.length, official_page: 0, mail_only: 0 };
+    state.applications.forEach(application => { channelCounts[applicationProgressChannel(application)] += 1; });
+    const visibleApplications = channel === "all" ? state.applications
+      : state.applications.filter(application => applicationProgressChannel(application) === channel);
+    const channelFilter = $("application-channel-filter");
+    clear(channelFilter);
+    Object.entries(APPLICATION_CHANNELS).forEach(([key, label]) => {
+      const button = element("button", `segment-button${channel === key ? " is-active" : ""}`, `${label} ${channelCounts[key]}`);
+      button.type = "button";
+      button.dataset.applicationChannel = key;
+      button.setAttribute("aria-pressed", String(channel === key));
+      button.setAttribute("aria-label", `${label}，${incomplete ? "已加载 " : ""}${channelCounts[key]} 条`);
+      button.addEventListener("click", () => setApplicationChannel(key));
+      channelFilter.appendChild(button);
+    });
+    setText("application-channel-count-note", incomplete ? "分类计数为已加载记录，全部加载后更新" : "分类计数为当前搜索范围内记录");
     const summary = $("application-summary");
     const kanban = $("application-kanban");
     clear(summary);
-    clear(kanban);
+    // Keep column/card nodes: rebuilding hidden editors and histories on every
+    // page used to block the main thread and reset scroll/focus.
+    // Transient board placeholders must not occupy an extra grid cell. Only
+    // remove direct children; keep column empty states and existing cards.
+    kanban.querySelectorAll(":scope > .loading-rows, :scope > .error-state, :scope > .empty-state, :scope > .application-board-empty")
+      .forEach(node => node.remove());
     const filtered = Boolean($("application-search")?.value.trim());
-    setText("application-page-description", `${filtered ? "匹配" : "共"} ${state.applicationBrowse.total} 条 · 已显示 ${state.applications.length} 条`);
+    setText("application-page-description", channel === "all"
+      ? `${filtered ? "匹配" : "共"} ${state.applicationBrowse.total} 条 · 已显示 ${state.applications.length} 条`
+      : `${APPLICATION_CHANNELS[channel]} · ${incomplete ? "已加载" : filtered ? "匹配" : "共"} ${visibleApplications.length} 条${incomplete ? "（加载未完成）" : ""}`);
+    if (state.applicationBrowse.error && ($("application-search")?.value.trim() || "") !== state.applicationBrowse.query) {
+      setText("application-page-description", `搜索加载失败，保留上次结果 · 已显示 ${visibleApplications.length} 条`);
+    }
     APPLICATION_COLUMNS.forEach((column) => {
-      const applications = state.applications.filter((application) => column.stages.includes(application.stage));
-      const count = payload.stage_counts && Object.keys(payload.stage_counts).length
-        ? column.stages.reduce((sum, stage) => sum + (payload.stage_counts[stage] || 0), 0) : applications.length;
+      const applications = visibleApplications.filter((application) => column.stages.includes(application.stage));
+      const stageCounts = state.applicationBrowse.stageCounts || {};
+      const count = channel === "all" && Object.keys(stageCounts).length
+        ? column.stages.reduce((sum, stage) => sum + (stageCounts[stage] || 0), 0) : applications.length;
       const summaryItem = element("div", `application-summary-item application-summary-item--${column.key}`);
       const summaryIcon = appendUiIcon(element("span", "application-summary-icon"), column.key === "closed" ? "close" : column.key);
       const summaryCopy = element("div", "application-summary-copy");
-      summaryCopy.append(element("span", "", column.label), element("strong", "", count), element("small", "", "搜索范围内记录"));
+      summaryCopy.append(element("span", "", column.label), element("strong", "", count), element("small", "", channel !== "all" && incomplete ? "已加载记录" : "搜索范围内记录"));
       summaryItem.append(summaryIcon, summaryCopy);
       summary.appendChild(summaryItem);
 
-      const section = element("section", `kanban-column kanban-column--${column.key}`);
-      const header = element("header", "kanban-column-header");
-      header.append(element("h3", "", column.label), element("span", "kanban-count", count));
-      section.appendChild(header);
-      const list = element("div", "kanban-list");
+      let section = kanban.querySelector(`.kanban-column--${column.key}`);
+      if (!section) {
+        section = element("section", `kanban-column kanban-column--${column.key}`);
+        const header = element("header", "kanban-column-header");
+        header.append(element("h3", "", column.label), element("span", "kanban-count"));
+        section.append(header, element("div", "kanban-list"));
+        kanban.appendChild(section);
+      }
+      section.querySelector(".kanban-count").textContent = channel !== "all" && incomplete ? `已加载 ${count}` : count;
+      const list = section.querySelector(".kanban-list");
+      const existingCards = new Map(Array.from(list.querySelectorAll(":scope > .application-card"), card => [card.dataset.applicationId, card]));
+      list.querySelectorAll(":scope > .kanban-empty, :scope > [data-application-more]").forEach(node => node.remove());
+      let nextCard = list.firstElementChild;
+      const browse = state.applicationBrowse.columns[column.key];
+      if (browse && (browse.error || browse.offset < browse.total)) {
+        const more = element("button", "button button--ghost", browse.loading
+          ? `自动加载中（本列已加载 ${browse.items.length} / ${browse.total}）`
+          : `重试加载（本列已加载 ${browse.items.length} / ${browse.total}）`);
+        more.type = "button";
+        more.disabled = Boolean(browse.loading);
+        more.dataset.applicationMore = column.key;
+        more.setAttribute("aria-label", `加载更多${column.label}记录`);
+        more.addEventListener("click", async () => {
+          if (more.disabled) return;
+          more.disabled = true;
+          more.textContent = "加载中…";
+          try { await loadApplications({ moreColumn: column.key }); }
+          finally { more.disabled = false; }
+        });
+        // Keep retries inside the scrollable list, not clipped below its footer.
+        list.prepend(more);
+      }
       if (!applications.length) {
-        list.appendChild(element("div", "kanban-empty", "暂无记录"));
+        list.appendChild(element("div", "kanban-empty", browse?.error ? "加载未完成，请重试" : browse?.loading ? "记录加载中…" : "暂无记录"));
       } else {
         applications.forEach((application) => {
+          const signature = JSON.stringify(application);
+          const previousCard = existingCards.get(application.id);
+          existingCards.delete(application.id);
+          const placeCard = (card) => {
+            if (card !== nextCard) list.insertBefore(card, nextCard);
+            nextCard = card.nextElementSibling;
+          };
+          if (previousCard?.applicationSignature === signature) {
+            placeCard(previousCard);
+            return;
+          }
           const card = element("article", "application-card");
+          card.dataset.applicationId = application.id;
+          card.applicationSignature = signature;
+          const progressChannel = applicationProgressChannel(application);
+          card.dataset.applicationChannel = progressChannel;
           const heading = element("div", "application-card-heading");
           const companyName = text(application.company_name, "公司待确认");
           const avatarName = companyName.replace(/^加入/, "").replace(/^(深圳市|北京市|上海市|杭州市)/, "").replace(/(科技|集团|股份|有限|公司).*$/, "") || companyName;
@@ -1777,15 +1959,12 @@
           identity.append(element("strong", "", application.job_title), element("p", "application-company", companyName));
           const menu = appendUiIcon(element("button", "application-card-menu"), "more");
           menu.type = "button";
-          menu.title = "展开编辑";
+          menu.title = "编辑投递";
           menu.setAttribute("aria-label", `编辑 ${companyName} 的投递记录`);
-          menu.setAttribute("aria-expanded", "false");
-          const editor = applicationEditor(application);
+          menu.setAttribute("aria-haspopup", "dialog");
           menu.addEventListener("click", (event) => {
             event.stopPropagation();
-            editor.hidden = !editor.hidden;
-            menu.setAttribute("aria-expanded", String(!editor.hidden));
-            menu.title = editor.hidden ? "展开编辑" : "收起编辑";
+            openApplicationEditor(application.id);
           });
           heading.append(avatar, identity, menu);
 
@@ -1800,12 +1979,24 @@
 
           const actions = element("div", "application-card-actions");
           const links = element("div", "application-card-links");
-          if (application.record_url) {
+          if (progressChannel === "official_page") {
             const record = element("a", "text-action", "查看投递进度 ›");
             record.href = application.record_url;
             record.target = "_blank";
             record.rel = "noreferrer";
             links.appendChild(record);
+            const binding = element("button", "text-action", "修改对应");
+            binding.type = "button";
+            binding.addEventListener("click", () => void openApplicationIdentityBinding(application.id));
+            links.appendChild(binding);
+          } else {
+            const addLink = element("button", "text-action", "补充官网链接");
+            addLink.type = "button";
+            addLink.dataset.applicationAddLink = application.id;
+            addLink.addEventListener("click", () => {
+              openApplicationEditor(application.id, true);
+            });
+            links.appendChild(addLink);
           }
           if (application.job_id) {
             const job = element("button", "text-action", "岗位详情");
@@ -1814,62 +2005,82 @@
             links.appendChild(job);
           }
           card.append(heading, status);
+          if (application.last_review?.checked_at) {
+            const review = application.last_review;
+            const label = review.presentation_state === "retained" ? "保留原阶段（未核验）" : ({
+              updated: "已更新", unchanged: "官网已核验", excluded: "已跳过", blocked: "需登录或验证",
+              unresolved: "需确认", failed: "复核失败",
+            }[review.state] || "已检查");
+            const checkedDate = new Date(review.checked_at);
+            const checkedTime = Number.isNaN(checkedDate.getTime()) ? "时间待确认" : applicationReviewDateFormat.format(checkedDate);
+            card.appendChild(element("p", "application-channel-note", `最近复核：${checkedTime} · ${label}`));
+          }
+          card.appendChild(element("span", `application-channel-tag application-channel-tag--${progressChannel}`, APPLICATION_CHANNELS[progressChannel]));
+          if (progressChannel === "mail_only") card.appendChild(element("p", "application-channel-note", "没有官网进度链接，不参与官网复核，通过邮件更新。"));
           if (application.note) card.appendChild(element("p", "application-note", application.note));
           if (historyItems.length) {
             const history = document.createElement("details");
             history.className = "application-history";
             const historySummary = element("summary", "", `阶段历史 (${historyItems.length})`);
             history.appendChild(historySummary);
-            const historyList = document.createElement("ol");
-            historyItems.slice().reverse().forEach((entry) => {
-              const stage = applicationStageLabel(entry.stage || entry.to_stage || entry.status);
-              const parts = [stage];
-              if (entry.result) parts.push(entry.result);
-              parts.push(compactDate(entry.changed_at || entry.at || entry.created_at || entry.date));
-              const historyItem = element("li", "application-history-entry");
-              historyItem.append(
-                element("span", "application-history-copy", parts.join(" · ")),
-                element("span", `history-source history-source--${applicationHistorySource(entry).key}`, `来源：${applicationHistorySource(entry).label}`),
-              );
-              historyList.appendChild(historyItem);
+            history.addEventListener("toggle", () => {
+              if (!history.open || history.querySelector("ol")) return;
+              const historyList = document.createElement("ol");
+              historyItems.slice().reverse().forEach((entry) => {
+                const stage = applicationStageLabel(entry.stage || entry.to_stage || entry.status);
+                const parts = [stage];
+                if (entry.result) parts.push(entry.result);
+                parts.push(compactDate(entry.changed_at || entry.at || entry.created_at || entry.date));
+                const historyItem = element("li", "application-history-entry");
+                historyItem.append(
+                  element("span", "application-history-copy", parts.join(" · ")),
+                  element("span", `history-source history-source--${applicationHistorySource(entry).key}`, `来源：${applicationHistorySource(entry).label}`),
+                );
+                historyList.appendChild(historyItem);
+              });
+              history.appendChild(historyList);
             });
-            history.appendChild(historyList);
             links.appendChild(history);
           }
           actions.appendChild(links);
           card.appendChild(actions);
-          card.appendChild(editor);
-          list.appendChild(card);
+          if (previousCard) {
+            if (nextCard === previousCard) nextCard = previousCard.nextElementSibling;
+            previousCard.replaceWith(card);
+          }
+          placeCard(card);
         });
       }
-      section.appendChild(list);
-      const browse = state.applicationBrowse.columns[column.key];
-      if (browse && browse.offset < browse.total) {
-        const more = element("button", "button button--ghost", `加载更多（已显示 ${applications.length} / ${browse.total}）`);
-        more.type = "button";
-        more.dataset.applicationMore = column.key;
-        more.setAttribute("aria-label", `加载更多${column.label}记录`);
-        more.addEventListener("click", async () => {
-          if (more.disabled) return;
-          more.disabled = true;
-          more.textContent = "加载中…";
-          try { await loadApplications({ moreColumn: column.key }); }
-          finally { more.disabled = false; more.textContent = `加载更多（已显示 ${applications.length} / ${browse.total}）`; }
-        });
-        section.appendChild(more);
-      }
-      kanban.appendChild(section);
+      existingCards.forEach(card => card.remove());
     });
-    setText("nav-application-count", payload.unfiltered_total ?? payload.total ?? state.applications.length);
-    if (!state.applications.length) empty(kanban, "没有匹配的投递记录", filtered ? "试试其他公司或岗位名称，或清除筛选条件。" : "可以手动添加投递，或在招聘官网记录投递。");
+    setText("nav-application-count", state.applicationBrowse.unfilteredTotal ?? state.applicationBrowse.total);
+    if (!visibleApplications.length && !incomplete) {
+      const notice = element("div", "application-board-empty");
+      empty(notice, "没有匹配的投递记录", channel !== "all" ? "当前分类暂无记录，可以切换分类或清除搜索条件。" : filtered ? "试试其他公司或岗位名称，或清除筛选条件。" : "可以手动添加投递，或在招聘官网记录投递。");
+      kanban.prepend(notice);
+    }
     kanban.dataset.state = "ready";
+  }
+
+  function openApplicationEditor(applicationId, focusLink = false) {
+    const application = state.applications.find(item => item.id === applicationId);
+    const dialog = $("application-edit-dialog");
+    if (!application || !dialog) return;
+    // One editor is created only after an explicit click. Board refreshes never
+    // replace it, so in-progress typing is preserved (server version checks still apply).
+    const body = $("application-edit-body");
+    clear(body);
+    body.appendChild(applicationEditor(application));
+    setText("application-edit-heading", `${application.company_name} · ${application.job_title}`);
+    if (!dialog.open) dialog.showModal();
+    if (focusLink) body.querySelector('input[type="url"]')?.focus();
   }
 
   function applicationEditor(application) {
     const editor = element("div", "application-editor");
-    editor.hidden = true;
     const field = (form, label, control) => {
       const wrapper = element("label", "application-editor-field", label);
+      control.setAttribute("aria-label", label);
       wrapper.appendChild(control);
       form.appendChild(wrapper);
       return control;
@@ -1923,6 +2134,7 @@
       await request("PATCH", { company_name: companyName.value.trim(), job_title: jobTitle.value.trim(),
         stage: stage.value, result: result.value, note: note.value, expected_updated_at: application.updated_at });
       showToast("投递记录已更新", "success");
+      $("application-edit-dialog")?.close();
       await loadApplications();
     });
     editor.appendChild(form);
@@ -1933,8 +2145,10 @@
     recordUrl.maxLength = 2048;
     recordUrl.value = application.record_url || "";
     submit(linkForm, "保存进度页链接", async () => {
+      if (applicationProgressChannel({ record_url: recordUrl.value }) !== "official_page") throw new Error("请填写有效的 HTTP(S) 官网进度链接，且不能包含用户名或密码。");
       await request("PATCH", { record_url: recordUrl.value.trim(), expected_updated_at: application.updated_at }, "/record-url");
       showToast("进度页链接已保存，投递阶段未改变", "success");
+      $("application-edit-dialog")?.close();
       await loadApplications();
     });
     editor.appendChild(linkForm);
@@ -2001,6 +2215,7 @@
         await request("DELETE", { expected_updated_at: application.updated_at });
         showToast("投递记录已删除", "success");
         deleteConfirmation.hidden = true;
+        $("application-edit-dialog")?.close();
         await Promise.all([loadApplications(), loadFullSchedule()]);
       } catch (error) {
         deleteError.textContent = `删除未完成：${error.message}`;
@@ -2023,53 +2238,97 @@
     return editor;
   }
 
-  function applicationBrowseQuery(column, offset = 0) {
+  function applicationBrowseQuery(column, offset = 0, query = $("application-search")?.value.trim()) {
     const params = new URLSearchParams({ limit: String(state.applicationBrowse.pageSize), offset: String(offset) });
-    const query = $("application-search")?.value.trim();
     if (query) params.set("query", query);
     column.stages.forEach(stage => params.append("stages", stage));
     return params;
   }
 
-  async function loadApplications({ moreColumn = null } = {}) {
+  async function loadApplications({ moreColumn = null, useCache = false } = {}) {
     const query = $("application-search")?.value.trim() || "";
-    if (query !== state.applicationBrowse.query) moreColumn = null;
-    const columns = moreColumn ? APPLICATION_COLUMNS.filter(column => column.key === moreColumn) : APPLICATION_COLUMNS;
+    const sameQuery = query === state.applicationBrowse.query;
+    if (!sameQuery) moreColumn = null;
+    if (useCache && sameQuery && (state.applicationBrowse.loading
+      || (!state.applicationBrowse.error && Date.now() - (state.applicationBrowse.loadedAt || 0) < APPLICATION_CACHE_MS))) return true;
+    const cachedItems = sameQuery ? state.applications : [];
+    let columns = moreColumn ? APPLICATION_COLUMNS.filter(column => column.key === moreColumn) : APPLICATION_COLUMNS;
     const requestId = ++state.applicationsRequestId;
     state.applicationRequestController?.abort();
     const controller = new AbortController();
     state.applicationRequestController = controller;
-    try {
+    state.applicationBrowse.loading = true;
+    state.applicationBrowse.error = false;
+    renderApplications();
+    let firstWave = true;
+    let summaryPayload = sameQuery ? state.applicationBrowse.payload : null;
+    let failed = false;
+    while (columns.length) {
       const pages = await Promise.all(columns.map(async column => {
         const offset = moreColumn ? state.applicationBrowse.columns[column.key]?.offset || 0 : 0;
-        const payload = await api(`/api/applications/page?${applicationBrowseQuery(column, offset)}`, { signal: controller.signal });
-        return { column, offset, payload };
+        const nextOffset = firstWave ? offset : state.applicationBrowse.columns[column.key]?.offset || 0;
+        try {
+          const payload = await api(`/api/applications/page?${applicationBrowseQuery(column, nextOffset, query)}`, { signal: controller.signal });
+          return { column, offset: nextOffset, payload };
+        } catch (error) { return { column, error }; }
       }));
       if (requestId !== state.applicationsRequestId) return false;
-      if (!moreColumn) state.applicationBrowse.columns = {};
-      state.applicationBrowse.query = query;
-      for (const { column, offset, payload } of pages) {
-        const previous = moreColumn ? state.applicationBrowse.columns[column.key]?.items || [] : [];
+      if (controller.signal.aborted) return false;
+      const successful = pages.filter(page => !page.error);
+      if (firstWave && !moreColumn && successful.length) state.applicationBrowse.columns = {};
+      if (successful.length) state.applicationBrowse.query = query;
+      if (firstWave && successful.length) summaryPayload = successful[0].payload;
+      if (summaryPayload) state.applicationBrowse.payload = summaryPayload;
+      const remaining = [];
+      for (const { column, offset, payload, error } of pages) {
+        if (error) {
+          failed = true;
+          const browse = state.applicationBrowse.columns[column.key];
+          if (browse) { browse.loading = false; browse.error = true; }
+          else if (summaryPayload) state.applicationBrowse.columns[column.key] = {
+            items: [], offset: 0, loading: false, error: true,
+            total: column.stages.reduce((sum, stage) => sum + (summaryPayload.stage_counts?.[stage] || 0), 0),
+          };
+          showToast(`投递记录加载失败：${error.message}`, "error");
+          continue;
+        }
+        const previous = state.applicationBrowse.columns[column.key]?.items || [];
         const items = Array.isArray(payload.items) ? payload.items : [];
+        const total = payload.total || 0;
+        const noProgress = !items.length && offset < total;
+        const loading = !noProgress && offset + items.length < total;
         state.applicationBrowse.columns[column.key] = {
           items: [...new Map([...previous, ...items].map(item => [item.id, item])).values()],
-          offset: offset + items.length, total: payload.total || 0,
+          offset: offset + items.length, total, loading, error: noProgress,
         };
+        if (noProgress) {
+          failed = true;
+          showToast(`${column.label}记录加载未推进，请重试。`, "error");
+        } else if (loading) remaining.push(column);
       }
-      const payload = pages[0].payload;
-      const stageCounts = payload.stage_counts || {};
-      renderApplications({ ...payload, stage_counts: stageCounts,
+      if (!summaryPayload) {
+        state.applicationBrowse.loading = false;
+        state.applicationBrowse.error = true;
+        renderApplications();
+        // A transport error must not erase records that were already visible.
+        return false;
+      }
+      const stageCounts = summaryPayload.stage_counts || {};
+      state.applicationBrowse.loading = remaining.length > 0;
+      state.applicationBrowse.error = failed;
+      renderApplications({ ...summaryPayload, stage_counts: stageCounts,
         total: Object.keys(stageCounts).length ? Object.values(stageCounts).reduce((sum, count) => sum + count, 0)
           : Object.values(state.applicationBrowse.columns).reduce((sum, column) => sum + column.total, 0),
-        items: [...new Map(Object.values(state.applicationBrowse.columns).flatMap(column => column.items).map(item => [item.id, item])).values()],
+        items: [...new Map([
+          ...(remaining.length || failed ? cachedItems : []),
+          ...Object.values(state.applicationBrowse.columns).flatMap(column => column.items),
+        ].map(item => [item.id, item])).values()],
       });
-      return true;
-    } catch (error) {
-      if (requestId !== state.applicationsRequestId || error.name === "AbortError") return false;
-      if (!moreColumn) empty($("application-kanban"), "投递记录加载失败", error.message);
-      showToast(`投递记录加载失败：${error.message}`, "error");
-      return false;
+      columns = remaining;
+      firstWave = false;
     }
+    if (!failed) state.applicationBrowse.loadedAt = Date.now();
+    return !failed;
   }
 
   function safeScheduleHref(value) {
@@ -2119,10 +2378,12 @@
     const copy = element("div", "schedule-item-copy");
     copy.appendChild(element("strong", "schedule-item-title", scheduleEventTitle(event)));
     const meta = element("div", "schedule-item-meta");
-    [event.event_type, event.company_name, event.job_title, SCHEDULE_TIME_KIND_LABELS[normalizeScheduleTimeKind(event.time_kind)]]
+    const associatedJobs = Array.isArray(event.associated_jobs) ? event.associated_jobs : [];
+    [event.event_type, event.company_name, associatedJobs.length > 1 ? `关联 ${associatedJobs.length} 个岗位` : event.job_title, SCHEDULE_TIME_KIND_LABELS[normalizeScheduleTimeKind(event.time_kind)]]
       .filter(Boolean)
       .forEach((value) => meta.appendChild(element("span", "schedule-meta-tag", value)));
     copy.appendChild(meta);
+    if (associatedJobs.length > 1) copy.appendChild(element("p", "schedule-item-note", `关联岗位：${associatedJobs.map(job => job.job_title).filter(Boolean).join("；")}`));
     if (event.note) copy.appendChild(element("p", "schedule-item-note", event.note));
     if (locationValue && !href) copy.appendChild(element("p", "schedule-item-location", locationValue));
 
@@ -2333,6 +2594,16 @@
       "schedule-note": event?.note || "",
     };
     Object.entries(values).forEach(([id, value]) => { if ($(id)) $(id).value = value; });
+    const sharedMail = event?.source === "recruitment_mail_schedule" && event.application_ids?.length > 1;
+    for (const id of ["schedule-application-id", "schedule-company-name", "schedule-job-title"]) {
+      if ($(id)) $(id).disabled = Boolean(sharedMail);
+    }
+    $("schedule-shared-association-note")?.remove();
+    if (sharedMail) {
+      const note = element("p", "schedule-item-note", `此日程关联 ${event.application_ids.length} 条投递。修改时间或备注会保留全部关联；如需更换岗位，请从来源邮件修改关联。`);
+      note.id = "schedule-shared-association-note";
+      $("schedule-editor-form").appendChild(note);
+    }
     setText("schedule-editor-submit", event ? "保存修改" : "添加日程");
     const dialog = $("schedule-editor-dialog");
     if (typeof dialog.showModal === "function") dialog.showModal();
@@ -2374,6 +2645,16 @@
       const payload = scheduleFormPayload();
       const existing = state.allSchedules.find((event) => text(event.id, "") === state.scheduleEditingId);
       if (existing) {
+        if (existing.source === "recruitment_mail_schedule" && existing.application_ids?.length > 1) {
+          // Shared mail identity belongs to the approved mail binding, not this
+          // single-application editor. Omit it when editing time/title/notes.
+          for (const field of ["application_id", "company_name", "job_title"]) delete payload[field];
+        }
+        if (payload.application_id === (text(existing.application_id, "").trim() || null)) {
+          for (const field of ["company_name", "job_title"]) {
+            if (payload[field] === text(existing[field], "").trim()) delete payload[field];
+          }
+        }
         payload.status = normalizeScheduleStatus(existing.status);
         payload.expected_updated_at = existing.updated_at;
       }
@@ -2408,10 +2689,14 @@
       .filter(Boolean)
       .forEach((value) => meta.appendChild(element("span", "table-tag", value)));
     content.appendChild(meta);
+    const targets = mailAssociatedApplications(payload?.data || payload);
+    const associations = targets.length ? targets : mailAssociatedApplications(summary);
     const target = [message.company_candidates?.[0]?.value || summary.company_name, message.job_candidates?.[0]?.value || summary.job_title]
       .filter(Boolean)
       .join(" · ");
-    if (target) content.appendChild(element("p", "mail-detail-target", `投递目标：${target}`));
+    if (associations.length) {
+      content.appendChild(element("p", "mail-detail-target", `关联 ${associations.length} 条投递：${associations.map(item => [item.company_name, item.job_title].filter(Boolean).join(" · ")).join("；")}`));
+    } else if (target) content.appendChild(element("p", "mail-detail-target", `投递目标：${target}`));
     content.appendChild(element("pre", "mail-detail-body", message.body_text || message.text || "邮件正文未提供。"));
     const actions = element("div", "job-detail-actions");
     const openMailbox = element("button", "button button--ghost", "打开招聘邮箱");
@@ -2451,29 +2736,472 @@
 
   function mailBindingCard(approval) {
     const preview = approval.preview || {};
-    const after = preview.after || {};
     const card = element("article", "approval-card");
-    card.appendChild(element("strong", "", after.action === "unbind" ? "确认解除这封邮件的关联" : "确认邮件关联"));
+    card.appendChild(element("strong", "", "邮件关联待确认"));
     card.appendChild(element("p", "", `邮件：${preview.before?.subject || "招聘邮件"}`));
-    card.appendChild(element("p", "", `发件人：${preview.before?.sender || "待核验"}`));
-    card.appendChild(element("p", "", after.action === "unbind" ? "解除关联，保留邮件与已有业务记录。" : `关联到：${after.company_name || "—"} · ${after.job_title || "—"}`));
-    card.appendChild(element("small", "", "仅确认本封邮件与投递的对应关系；不会发送邮件，也不会直接更改投递阶段。后续处理仍检查发件人和事件证据。"));
-    const actions = element("div", "inline-actions");
-    const confirm = element("button", "button button--primary", after.action === "unbind" ? "确认解除" : "确认关联");
-    confirm.type = "button";
-    confirm.addEventListener("click", () => void confirmMailBinding(approval, confirm));
-    const reject = element("button", "button button--ghost", "拒绝"); reject.type = "button";
-    reject.addEventListener("click", () => void decideApproval(approval.token_id, "reject"));
-    actions.append(confirm, reject); card.appendChild(actions);
+    const open = element("button", "button button--secondary", "选择岗位并确认"); open.type = "button";
+    open.addEventListener("click", () => void openMailBinding(preview.target_id || preview.before?.record_id));
+    card.appendChild(open);
     return card;
+  }
+
+  let mailConfirmationRuns = [], mailConfirmationThread = "", mailConfirmationLoading = false;
+  let mailBindingSequence = 0, mailBindingBusy = false, mailReportBusy = false;
+  const seenMailQueues = new Set();
+  try { JSON.parse(localStorage.getItem("recruitops.mail.seen-confirmation-runs") || "[]").slice(-100).forEach(key => seenMailQueues.add(key)); } catch (_) { /* IDs only; unavailable storage must not block confirmation. */ }
+  function rememberMailQueue(key) {
+    seenMailQueues.add(key);
+    try { localStorage.setItem("recruitops.mail.seen-confirmation-runs", JSON.stringify([...seenMailQueues].slice(-100))); } catch (_) { /* Optional UX state. */ }
+  }
+  function mailConfirmationItems() {
+    const seen = new Set();
+    return mailConfirmationRuns.flatMap(run => (run.items || []).map(item => ({ ...item, run_id: run.run_id, thread_id: run.thread_id })))
+      .filter(item => { if (seen.has(item.record_id)) return false; seen.add(item.record_id); return true; });
   }
 
   function renderMailBindingApprovals() {
     const target = $("assistant-mail-binding-approvals");
     if (!target) return;
     clear(target);
-    state.approvals.filter(item => item.operation === "recruitment_mail_binding" && ["pending", "approved"].includes(item.status))
-      .forEach(item => target.appendChild(mailBindingCard(item)));
+    const items = mailConfirmationThread === state.codexThreadId ? mailConfirmationItems() : [];
+    for (const run of mailConfirmationRuns.filter(run => run.thread_id === state.codexThreadId && run.report_pending)) {
+      const key = `${run.run_id}:${run.confirmation_version}`;
+      if (!failedMailReports.has(key)) continue;
+      const retry = element("button", "button button--ghost", "重新汇报邮件处理结果"); retry.type = "button";
+      retry.addEventListener("click", () => { failedMailReports.delete(key); void reportConfirmedMailRun(run); }); target.appendChild(retry);
+    }
+    // Unscoped historical approval cards stay in the approval center, never in another chat.
+    if (!items.length) return;
+    const entry = element("button", "button button--secondary", `待确认 ${items.length} 封邮件 · 打开处理`);
+    entry.type = "button"; entry.addEventListener("click", () => void openMailBinding(items[0].record_id));
+    target.appendChild(entry);
+  }
+
+  async function refreshMailConfirmations({ autoOpen = false } = {}) {
+    const threadId = state.codexThreadId;
+    if (!threadId || mailConfirmationLoading) return;
+    mailConfirmationLoading = true;
+    try {
+      const data = await api(`/api/local-ui/mail-confirmations?thread_id=${encodeURIComponent(threadId)}`, { headers: authHeaders("邮件待确认") });
+      if (state.codexThreadId !== threadId) return;
+      mailConfirmationThread = threadId; mailConfirmationRuns = data.runs || [];
+      renderMailBindingApprovals();
+      const items = mailConfirmationItems();
+      if (items.length && !state.activeAssistantController) setAssistantStatus(`等待确认：${items.length} 封邮件`, "warn");
+      const key = `${threadId}:${[...new Set(items.map(item => item.run_id))].sort().join(",")}`;
+      if (autoOpen && items.length && !seenMailQueues.has(key) && !$("mail-binding-dialog")?.open) {
+        rememberMailQueue(key); void openMailBinding(items[0].record_id);
+      }
+      if (!state.activeAssistantController) {
+        const report = mailConfirmationRuns.find(run => run.report_pending && !["accepted", "running", "pausing", "cancelling"].includes(run.status));
+        if (report) void reportConfirmedMailRun(report);
+      }
+    } catch (_) { /* Keep the last known pending queue; do not fabricate completion on read failure. */ }
+    finally { mailConfirmationLoading = false; }
+  }
+
+  const failedMailReports = new Set();
+  async function reportConfirmedMailRun(run) {
+    const key = `${run.run_id}:${run.confirmation_version}`;
+    if (mailReportBusy || mailBindingBusy || state.activeAssistantController || state.codexThreadId !== run.thread_id
+        || !state.codexReady || failedMailReports.has(key)) return;
+    mailReportBusy = true;
+    const threadId = run.thread_id;
+    let claim = null, message = null;
+    const report = action => api(`/api/local-ui/mail-confirmations/${encodeURIComponent(run.run_id)}/report`, {
+      method: "POST", headers: authHeaders("邮件处理结果汇报", { "Content-Type": "application/json" }),
+      body: JSON.stringify({ thread_id: threadId, version: run.confirmation_version, action, claim_token: claim?.claim_token || null }),
+    });
+    try {
+      claim = await report("claim");
+      if (!claim?.claimed) return;
+      if (threadId !== state.codexThreadId || state.activeAssistantController) { await report("release"); return; }
+      $("run-task-button").disabled = true;
+      message = appendMessage("assistant", "确认后的邮件已继续处理，正在整理本轮结果。", null, { streaming: true });
+      const prompt = `${AUTO_MAIL_REPORT_PREFIX} 用户已在确认窗口完成邮件对应关系的选择，原任务处理已结束或再次等待确认。请仅调用 recruitment_mail_run_status(run_id="${run.run_id}", wait_ms=0) 读取本轮真实结果，说明更新的投递、生成的日程、失败或剩余待确认邮件。不能重新启动或恢复处理、不能写数据，不能把历史结果当本轮；无需用户再说继续。不展示内部编号。`;
+      const task = await runCodexAssistantQuery(prompt, "", message.id);
+      if (task.error || !task.answer?.trim() || task.answer.trim() === "Codex 未返回文本。") throw new Error(task.error || "未生成邮件处理摘要");
+      if (threadId === state.codexThreadId) {
+        task.user_request = "邮件确认后结果汇报";
+        task.answer = task.answer.replaceAll(run.run_id, "本次任务");
+        updateMessage(message.id, task.answer, task, false);
+      }
+      await report("complete");
+      setAssistantStatus(run.status === "awaiting_confirmation" ? "等待剩余邮件关联确认" : "邮件处理结果已汇报", run.status === "awaiting_confirmation" ? "warn" : "ok");
+      await Promise.allSettled([loadRecruitmentMails({ showLoading: false }), loadApplications(), loadFullSchedule(), refreshConversationList()]);
+    } catch (error) {
+      failedMailReports.add(key);
+      if (message && threadId === state.codexThreadId) updateMessage(message.id, `邮件处理结果已保存，但助理汇报暂不可用：${localizeCodexRuntimeMessage(error.message)}。可点击“重新汇报”，不会重跑邮件。`, null, false);
+      if (claim?.claimed) { try { await report("release"); } catch (_) { /* Server claim lease expires without repeating writes. */ } }
+    } finally {
+      mailReportBusy = false;
+      if (!state.activeAssistantController) $("run-task-button").disabled = false;
+      renderMailBindingApprovals();
+    }
+  }
+
+  const applicationIdentityQueueEntries = new Set();
+  let applicationIdentityQueueRequest = null, applicationIdentityQueueSequence = 0, applicationIdentityQueueRender = 0;
+
+  function identityQueueEntry() {
+    const button = element("button", "text-action", "查看待核对"); button.type = "button";
+    button.addEventListener("click", () => void openApplicationIdentityQueue());
+    applicationIdentityQueueEntries.add(button);
+    updateIdentityQueueCounts();
+    return button;
+  }
+
+  function updateIdentityQueueCounts() {
+    const total = state.applicationIdentityQueue.total;
+    const label = Number.isInteger(total) ? `待核对 ${total} 项` : "查看待核对";
+    setText("application-identity-queue-button", label);
+    setText("application-identity-queue-heading", label);
+    for (const entry of applicationIdentityQueueEntries) entry.textContent = label;
+  }
+
+  async function loadApplicationIdentityQueue({ force = false } = {}) {
+    if (applicationIdentityQueueRequest && !force) return applicationIdentityQueueRequest;
+    const sequence = ++applicationIdentityQueueSequence;
+    const request = (async () => {
+      try {
+        const result = await api("/api/applications/identity-queue");
+        if (sequence !== applicationIdentityQueueSequence) return;
+        if (!Array.isArray(result.items) || !Number.isInteger(result.total)) throw new Error("待核对列表暂时不可用");
+        state.applicationIdentityQueue = { items: result.items, total: result.total, error: "" };
+      } catch (error) {
+        if (sequence !== applicationIdentityQueueSequence) return;
+        state.applicationIdentityQueue.error = error.message;
+      }
+      if (sequence === applicationIdentityQueueSequence) renderApplicationIdentityQueue();
+    })();
+    applicationIdentityQueueRequest = request;
+    try { await request; }
+    finally { if (applicationIdentityQueueRequest === request) applicationIdentityQueueRequest = null; }
+  }
+
+  async function openApplicationIdentityQueue() {
+    switchView("applications");
+    $("application-identity-queue-panel").hidden = false;
+    await loadApplicationIdentityQueue();
+  }
+
+  function renderApplicationIdentityQueue() {
+    const node = $("application-identity-queue-list");
+    if (!node) return;
+    const version = ++applicationIdentityQueueRender;
+    clear(node); updateIdentityQueueCounts();
+    const queue = state.applicationIdentityQueue;
+    if (queue.error) { empty(node, "待核对列表读取失败", "请刷新后重试。"); return; }
+    if (!queue.items.length) { empty(node, "暂无待核对事项", "已确认的对应关系不会因旧消息重新出现。"); return; }
+    for (const item of queue.items) {
+      const card = element("article", "identity-queue-card");
+      const local = element("div", "identity-queue-local");
+      local.append(element("small", "muted-label", "本地投递"), element("strong", "", item.job_title),
+        element("p", "", item.company_name));
+      if (item.current_title) local.appendChild(element("p", "", `已有对应：${item.current_title}`));
+      const official = element("div", "identity-queue-official");
+      official.appendChild(element("strong", "", "选择官网岗位"));
+      if (item.captured_at) official.appendChild(element("small", "muted-label", `页面读取于：${mailDateTime(item.captured_at)}`));
+      const actions = element("div", "inline-actions");
+      const confirm = element("button", "button button--primary", "确认对应"); confirm.type = "button"; confirm.disabled = true;
+      const note = element("p", "muted-label", "请先选择与左侧投递对应的官网岗位。仅保存对应关系，不修改岗位名称和投递阶段。");
+      let selected = null, retryOf = null, busy = false, closed = false;
+      const choices = [];
+      const current = () => version === applicationIdentityQueueRender && card.parentNode === node;
+      for (const candidate of item.candidates || []) {
+        const row = element("label", "identity-queue-choice");
+        const input = document.createElement("input"); input.type = "radio"; input.name = `identity-${item.application_id}`;
+        input.checked = false; input.autocomplete = "off";
+        input.disabled = !candidate.selectable; choices.push(input);
+        const detail = element("span", "");
+        detail.appendChild(element("strong", "", candidate.raw_title));
+        if (candidate.evidence_source === "vision") detail.appendChild(element("small", "", "来自本次官网截图识别，请核对岗位名称"));
+        if (candidate.evidence_source === "page_text") detail.appendChild(element("small", "", "来自官网投递成功记录"));
+        if (candidate.external_job_id) detail.appendChild(element("small", "", `官网岗位编号：${candidate.external_job_id}`));
+        if (candidate.external_application_id) detail.appendChild(element("small", "", `官网申请编号：${candidate.external_application_id}`));
+        if (candidate.context) detail.appendChild(element("small", "", candidate.context));
+        if (!candidate.selectable) detail.appendChild(element("small", "", "存在同名记录，暂时不能唯一确认"));
+        input.addEventListener("change", () => {
+          if (busy || !current() || !candidate.selectable) return;
+          selected = candidate; retryOf = null; confirm.disabled = false; confirm.textContent = "确认对应";
+          note.textContent = `将“${item.job_title}”对应到“${candidate.raw_title}”。仅保存对应关系，不修改岗位名称和投递阶段。`;
+        });
+        row.append(input, detail); official.appendChild(row);
+      }
+      if (!item.candidates?.length) {
+        const reason = item.unavailable_reason || "application_records_missing";
+        const explanation = reason.includes("expired")
+          ? "页面证据已过期或已按保留期清理，请重新读取该岗位。"
+          : reason.startsWith("observation_not_found")
+            ? "尚无可用的官网页面证据，请重新读取该岗位。"
+            : "页面已读取，但尚未提取到可选择的官网岗位；这不代表证据已过期。请重新读取或打开官网查看。";
+        official.appendChild(element("p", "", explanation));
+      }
+      const reread = element("button", "button button--ghost", "重新读取该岗位"); reread.type = "button";
+      reread.addEventListener("click", async () => {
+        if (busy || !current()) return;
+        busy = true; reread.disabled = true; confirm.disabled = true;
+        choices.forEach(input => { input.disabled = true; });
+        reread.textContent = "正在读取…";
+        note.textContent = "正在重新读取官网证据，不修改投递阶段；截图识别遵循配置开关。";
+        try {
+          await api(`/api/applications/${encodeURIComponent(item.application_id)}/identity-reread`, {
+            method: "POST", headers: authHeaders("重新读取官网岗位证据", { "Content-Type": "application/json" }),
+            body: JSON.stringify({ request_id: crypto.randomUUID() }),
+          });
+          forgetApplicationIdentityCandidates(item.application_id);
+          if (!current()) return;
+          await loadApplicationIdentityQueue({ force: true });
+          showToast("页面证据已更新，投递阶段未修改", "success");
+        } catch (error) {
+          if (current()) {
+            note.textContent = error.message;
+            closed = error.code === "application_closed";
+            showToast(error.message, closed ? "info" : "error");
+            if (closed) {
+              forgetApplicationIdentityCandidates(item.application_id);
+              await loadApplicationIdentityQueue({ force: true });
+            }
+          }
+        } finally {
+          busy = false;
+          if (current() && !closed) {
+            reread.disabled = false; reread.textContent = "重新读取该岗位"; confirm.disabled = !selected;
+            choices.forEach((input, index) => { input.disabled = !item.candidates[index].selectable; });
+          }
+        }
+      });
+      confirm.addEventListener("click", async () => {
+        if (busy || !current() || !selected || confirm.disabled) return;
+        busy = true; confirm.disabled = true; reread.disabled = true; choices.forEach(input => { input.disabled = true; });
+        const candidate = selected;
+        try {
+          const response = await api(`/api/applications/${encodeURIComponent(item.application_id)}/identity-proposals`, {
+            method: "POST", headers: authHeaders("确认官网岗位对应关系", { "Content-Type": "application/json" }),
+            body: JSON.stringify({ application_id: item.application_id, action: "bind", identity_digest: item.identity_digest,
+              binding_revision: item.binding_revision, operation_id: item.operation_id, candidate_id: candidate.candidate_id,
+              ...(retryOf ? { retry_of: retryOf } : {}) }),
+          });
+          if (!current()) return;
+          if (!response.success || !response.data?.approval_id) {
+            if (response.data?.retry_of) {
+              retryOf = response.data.retry_of; confirm.textContent = "重新确认对应";
+              note.textContent = "上次确认已拒绝或过期。核对后点击重新确认，才会创建新的确认请求。";
+              return;
+            }
+            throw new Error("投递或官网证据已变化，请刷新待核对列表");
+          }
+          const approval = response.data;
+          if (approval.approval_status !== "approved") {
+            const decision = await api(`/api/approvals/${encodeURIComponent(approval.approval_id)}/approve`, {
+              method: "POST", headers: authHeaders("确认官网岗位对应关系"),
+            });
+            if (!decision.allowed || decision.status !== "approved") {
+              retryOf = approval.approval_id; confirm.textContent = "重新确认对应";
+              note.textContent = "确认已过期，请重新核对后再确认。"; return;
+            }
+          }
+          if (!current()) return;
+          const audit = await api(`/api/approvals/${encodeURIComponent(approval.approval_id)}/execute`, {
+            method: "POST", headers: authHeaders("保存官网岗位对应关系", { "Content-Type": "application/json" }),
+            body: JSON.stringify({ operator: "local-ui-user" }),
+          });
+          if (!audit.success) throw new Error("未保存，投递或页面证据已变化，请刷新后重新核对");
+          forgetApplicationIdentityCandidates(item.application_id);
+          showToast("对应关系已保存，岗位名称和投递阶段保留", "success");
+          await loadApplicationIdentityQueue({ force: true });
+          try { state.approvals = normalizeApprovals(await api("/api/approvals")); renderApprovals(); } catch (_) { /* The confirmed binding remains saved. */ }
+        } catch (error) {
+          if (current()) {
+            note.textContent = error.message;
+            closed = error.code === "application_closed";
+            showToast(error.message, closed ? "info" : "error");
+            if (closed) {
+              forgetApplicationIdentityCandidates(item.application_id);
+              await loadApplicationIdentityQueue({ force: true });
+            }
+          }
+        }
+        finally {
+          busy = false;
+          if (current() && !closed) { reread.disabled = false; confirm.disabled = !selected; choices.forEach((input, index) => { input.disabled = !item.candidates[index].selectable; }); }
+        }
+      });
+      if (item.candidates?.length) actions.appendChild(confirm);
+      actions.appendChild(reread);
+      const pageUrl = safeScheduleHref(item.page_url);
+      if (pageUrl) {
+        const openPage = element("a", "text-action", "打开官网");
+        openPage.href = pageUrl; openPage.target = "_blank"; openPage.rel = "noreferrer"; actions.appendChild(openPage);
+      }
+      official.append(actions, note); card.append(local, official); node.appendChild(card);
+    }
+  }
+
+  function applicationIdentityCard(approval, { onApplied, onRejected, onInvalidated, isCurrent = () => true } = {}) {
+    const preview = approval.preview || {}, before = preview.before || {}, after = preview.after || {};
+    const card = element("article", "approval-card");
+    card.append(element("strong", "", after.action === "unbind" ? "解除官网岗位对应关系" : "确认官网岗位对应关系"),
+      element("p", "", `投递记录：${before.company_name || "—"} · ${before.job_title || "—"}`),
+      element("p", "", `官网岗位：${after.action === "unbind" ? before.official_title || "—" : after.official_title || "—"}`),
+      element("p", "", `记录页：${before.page_url || "—"}`),
+      element("small", "", "只确认对应关系，不会修改投递阶段。下次复核仍需读取官网当前状态；可随时解除。"));
+    if (after.official_job_id) card.appendChild(element("p", "", `官网岗位编号：${after.official_job_id}`));
+    if (after.official_application_id) card.appendChild(element("p", "", `官网申请编号：${after.official_application_id}`));
+    const actions = element("div", "inline-actions");
+    const confirm = element("button", "button button--primary", after.action === "unbind" ? "确认解除" : "确认是同一岗位");
+    confirm.type = "button";
+    confirm.addEventListener("click", async () => {
+      if (confirm.disabled || !isCurrent()) return;
+      confirm.disabled = true; reject.disabled = true;
+      try {
+        if (approval.status !== "approved") {
+          const decision = await api(`/api/approvals/${encodeURIComponent(approval.token_id)}/approve`, {
+            method: "POST", headers: authHeaders("确认官网岗位对应关系"),
+          });
+          if (!decision.allowed || decision.status !== "approved") {
+            approval.status = "expired"; onInvalidated?.();
+            throw new Error("预览已失效，请重新核对");
+          }
+          approval.status = "approved";
+        }
+        if (!isCurrent()) return;
+        const audit = await api(`/api/approvals/${encodeURIComponent(approval.token_id)}/execute`, {
+          method: "POST", headers: authHeaders("保存官网岗位对应关系", { "Content-Type": "application/json" }),
+          body: JSON.stringify({ operator: "local-ui-user" }),
+        });
+        if (!audit.success) {
+          approval.status = "expired"; onInvalidated?.();
+          throw new Error("未保存，投递或页面证据已变化，请重新核对");
+        }
+        approval.status = "executed";
+        showToast(after.action === "unbind" ? "对应关系已解除，投递和历史记录保留" : "对应关系已保存；可让助理重新复核该岗位", "success");
+        onApplied?.();
+        void loadApplicationIdentityQueue({ force: true });
+        try {
+          state.approvals = normalizeApprovals(await api("/api/approvals")); renderApprovals();
+        } catch (_) { showToast("对应关系已保存，但审批列表刷新失败，请稍后刷新", "info"); }
+      } catch (error) { showToast(error.message, "error"); }
+      finally { confirm.disabled = reject.disabled = !["pending", "approved"].includes(approval.status) || !isCurrent(); }
+    });
+    const reject = element("button", "button button--ghost", "拒绝"); reject.type = "button";
+    reject.addEventListener("click", async () => {
+      if (reject.disabled || !isCurrent()) return;
+      confirm.disabled = true; reject.disabled = true;
+      try {
+        const decision = await api(`/api/approvals/${encodeURIComponent(approval.token_id)}/reject`, {
+          method: "POST", headers: authHeaders("拒绝官网岗位对应关系"),
+        });
+        if (decision.status !== "rejected") throw new Error("未能拒绝该预览，请刷新后重试");
+        approval.status = "rejected"; onRejected?.();
+        showToast("已拒绝对应关系，保留原阶段", "info");
+        try { state.approvals = normalizeApprovals(await api("/api/approvals")); renderApprovals(); }
+        catch (_) { showToast("已拒绝，但审批列表刷新失败，请稍后刷新", "info"); }
+      } catch (error) { showToast(error.message, "error"); }
+      finally { confirm.disabled = reject.disabled = !["pending", "approved"].includes(approval.status) || !isCurrent(); }
+    });
+    confirm.disabled = reject.disabled = !["pending", "approved"].includes(approval.status);
+    actions.append(confirm, reject); card.appendChild(actions); return card;
+  }
+
+  const applicationIdentityCandidateLoads = new Map();
+  function forgetApplicationIdentityCandidates(applicationId) {
+    for (const key of applicationIdentityCandidateLoads.keys()) {
+      if (JSON.parse(key)[0] === applicationId) applicationIdentityCandidateLoads.delete(key);
+    }
+  }
+
+  async function renderApplicationIdentityCandidates(body, applicationId, { current, operationId, onApplied } = {}) {
+    loading(body);
+    try {
+      const key = JSON.stringify([applicationId, operationId || null]);
+      if (!applicationIdentityCandidateLoads.has(key)) {
+        const query = operationId ? `?operation_id=${encodeURIComponent(operationId)}` : "";
+        const request = api(`/api/applications/${encodeURIComponent(applicationId)}/identity-candidates${query}`);
+        applicationIdentityCandidateLoads.set(key, request);
+        request.then(() => { if (!operationId) applicationIdentityCandidateLoads.delete(key); },
+          () => applicationIdentityCandidateLoads.delete(key));
+      }
+      const result = await applicationIdentityCandidateLoads.get(key);
+      if (!current()) return;
+      clear(body);
+      if (operationId && result.operation_id !== operationId) {
+        body.appendChild(element("p", "", "本轮官网页面证据已失效，请重新复核后确认；保留原阶段。"));
+        return;
+      }
+      body.append(element("p", "", `投递记录：${result.company_name} · ${result.job_title}`),
+        element("p", "", `以下是${operationId ? "本轮" : "最近一次"}官网复核实际读取的岗位。名称不同请自行核对；选择后还需确认，不会立即更改阶段。`));
+      if (result.captured_at) body.appendChild(element("small", "", `页面读取于：${mailDateTime(result.captured_at)}`));
+      const preview = element("div", "");
+      const invalidate = () => {
+        forgetApplicationIdentityCandidates(applicationId);
+        if (current()) {
+          clear(body); body.appendChild(element("p", "", "投递或页面证据已变化，请重新复核后确认；保留原阶段。"));
+        }
+      };
+      let proposalSequence = 0;
+      const propose = async (candidate, action, button) => {
+        if (button.disabled || !current() || (action === "bind" && !candidate?.selectable)) return;
+        const proposal = ++proposalSequence;
+        clear(preview);
+        button.disabled = true;
+        try {
+          const response = await api(`/api/applications/${encodeURIComponent(applicationId)}/identity-proposals`, {
+            method: "POST", headers: authHeaders("核对官网岗位", { "Content-Type": "application/json" }),
+            body: JSON.stringify({ application_id: applicationId, action, identity_digest: result.identity_digest,
+              binding_revision: result.binding_revision, operation_id: action === "bind" ? result.operation_id : null,
+              candidate_id: candidate?.candidate_id || null }),
+          });
+          if (!current() || proposal !== proposalSequence) return;
+          if (!response.success || !response.data?.approval_id) {
+            invalidate(); throw new Error("无法生成确认预览，请重新核对页面证据");
+          }
+          clear(preview); preview.appendChild(applicationIdentityCard({ token_id: response.data.approval_id,
+            status: response.data.approval_status, operation: "application_identity_binding", preview: response.data.preview },
+            { isCurrent: () => current() && proposal === proposalSequence && preview.parentNode === body,
+              onApplied: () => {
+                forgetApplicationIdentityCandidates(applicationId);
+                if (current() && proposal === proposalSequence) onApplied?.();
+              },
+              onRejected: () => {
+                if (current() && proposal === proposalSequence) {
+                  clear(preview); preview.appendChild(element("p", "", "已拒绝本次对应关系，保留原阶段。可重新选择官网岗位。"));
+                }
+              }, onInvalidated: () => { if (current() && proposal === proposalSequence) invalidate(); } }));
+        } catch (error) {
+          if (current() && proposal === proposalSequence) { invalidate(); showToast(error.message, "error"); }
+        }
+        finally { button.disabled = false; }
+      };
+      if (result.binding_state === "bound") {
+        body.appendChild(element("p", "", `已有对应：${result.current_title || "—"}${result.binding_valid ? "" : "（投递信息已变化，需重新确认）"}`));
+        const unbind = element("button", "button button--ghost", "解除已有对应关系"); unbind.type = "button";
+        unbind.addEventListener("click", () => void propose(null, "unbind", unbind)); body.appendChild(unbind);
+      }
+      for (const candidate of result.candidates || []) {
+        const row = element("article", "approval-card");
+        row.append(element("strong", "", candidate.raw_title), element("p", "", candidate.context));
+        if (candidate.external_job_id) row.appendChild(element("p", "", `官网岗位编号：${candidate.external_job_id}`));
+        if (candidate.external_application_id) row.appendChild(element("p", "", `官网申请编号：${candidate.external_application_id}`));
+        const choose = element("button", "button button--secondary", candidate.selectable ? "选择并查看确认预览" : "存在同名记录，尚不能唯一确认");
+        choose.type = "button"; choose.disabled = !candidate.selectable;
+        choose.addEventListener("click", () => void propose(candidate, "bind", choose)); row.appendChild(choose); body.appendChild(row);
+      }
+      if (!result.candidates?.length) body.appendChild(element("p", "", "暂无可确认的近期官网记录，当前无法绑定，保留原阶段。请先让助理复核该岗位；登录或验证码需在招聘浏览器里完成。"));
+      body.appendChild(preview);
+    } catch (error) { if (current()) empty(body, "读取失败", error.message); }
+  }
+
+  let applicationIdentityDialogSequence = 0;
+  async function openApplicationIdentityBinding(applicationId) {
+    const sequence = ++applicationIdentityDialogSequence;
+    const dialog = $("job-detail-dialog"), content = $("job-detail-content");
+    setText("job-detail-company", "官网投递对应关系"); setText("job-detail-title", "核对是否为同一岗位");
+    clear(content);
+    const body = element("div", ""); content.appendChild(body);
+    if (!dialog.open) { if (dialog.showModal) dialog.showModal(); else dialog.setAttribute("open", ""); }
+    const current = () => sequence === applicationIdentityDialogSequence && body.parentNode === content && dialog.open;
+    await renderApplicationIdentityCandidates(body, applicationId, { current, onApplied: () => dialog.close?.() });
   }
 
   async function confirmMailBinding(approval, button) {
@@ -2491,63 +3219,346 @@
         body: JSON.stringify({ operator: "local-ui-user" }),
       });
       if (!audit.success) throw new Error("关联未保存，邮件或投递可能已变化，请重新确认");
-      state.approvals = normalizeApprovals(await api("/api/approvals"));
-      renderApprovals();
-      await Promise.all([loadRecruitmentMails({ showLoading: false }), loadFullSchedule()]);
-      showToast(approval.preview?.after?.action === "unbind" ? "关联已解除，邮件及已有记录已保留" : "关联已保存；需要更新阶段或日程时，可让助理继续处理邮件", "success");
-      $("job-detail-dialog")?.close?.();
-    } catch (error) { showToast(error.message, "error"); }
+      return true;
+    } catch (error) { showToast(error.message, "error"); return false; }
     finally { if (button) button.disabled = false; }
   }
 
   async function openMailBinding(recordId) {
-    const dialog = $("job-detail-dialog");
-    setText("job-detail-company", "邮件关联"); setText("job-detail-title", "选择对应的投递记录");
-    const content = $("job-detail-content"); clear(content);
+    if (!recordId || mailBindingBusy) return;
+    const sequence = ++mailBindingSequence;
+    const dialog = $("mail-binding-dialog"), content = $("mail-binding-content");
+    if (!dialog || !content) return;
+    clear(content);
+    const originThread = state.codexThreadId;
+    const waiting = mailConfirmationThread === originThread ? mailConfirmationItems() : [];
+    const context = waiting.find(item => item.record_id === recordId);
+    if (context) rememberMailQueue(`${originThread}:${[...new Set(waiting.map(item => item.run_id))].sort().join(",")}`);
+    setText("mail-binding-position", context ? `等待确认 · 第 ${waiting.indexOf(context) + 1} / ${waiting.length} 封` : "邮件关联 · 手动选择");
+    const summary = element("div", "mail-binding-summary"); content.appendChild(summary);
     const input = element("input", ""); input.type = "search"; input.placeholder = "搜索公司或岗位名称";
     input.setAttribute("aria-label", "搜索要关联的投递记录");
     const search = element("button", "button button--secondary", "搜索"); search.type = "submit";
     const form = element("form", "application-filter-bar"); form.append(input, search);
-    const candidates = element("div", ""); const previewNode = element("div", "");
-    content.append(element("p", "", "名称不一致时可搜索实际投递。选择后请核对邮件主题、发件人与岗位，再确认关联。"), form, candidates, previewNode);
+    const candidates = element("fieldset", "mail-binding-candidates");
+    const pages = element("div", "inline-actions");
+    const notice = element("p", "", "确认本封邮件对应的投递，不会发送邮件。确认后继续原任务，逐岗校验证据并更新进度，不回退更高阶段；同一次笔试或测评只生成一条日程。稍后处理会保留待办。");
+    if (!context) notice.textContent = "仅保存这封邮件与投递的对应关系；没有关联的待确认任务时，不会自动创建处理任务。";
+    const errorNode = element("p", "form-error"); errorNode.setAttribute("role", "alert");
+    const selection = new Map();
+    const selectionPanel = element("section", "mail-binding-selection");
+    const selectionCount = element("strong", "", "已选择 0 条投递"); selectionCount.setAttribute("aria-live", "polite");
+    const selectedList = element("ul", "mail-binding-selected");
+    selectionPanel.append(selectionCount, selectedList);
+    const actions = element("div", "inline-actions");
+    const confirm = element("button", "button button--primary", context ? "确认关联并继续处理" : "确认关联"); confirm.type = "button"; confirm.disabled = true;
+    const reject = element("button", "button button--ghost", "本封不关联"); reject.type = "button";
+    const later = element("button", "button button--ghost", "稍后处理"); later.type = "button";
+    later.addEventListener("click", () => { if (!mailBindingBusy) dialog.close(); });
+    actions.append(confirm);
+    if (context) actions.appendChild(reject);
+    actions.appendChild(later);
+    content.append(notice, form, candidates, pages, selectionPanel, errorNode, actions);
     if (!dialog.open) { if (dialog.showModal) dialog.showModal(); else dialog.setAttribute("open", ""); }
-    let sequence = 0;
+    const current = () => dialog.open && sequence === mailBindingSequence && originThread === state.codexThreadId;
+    let requestSequence = 0, offset = 0, result = null, savedBinding = false, selectionInitialized = false;
+    let sourceVersion = "", allowsMultiple = false;
+    const currentIds = (data) => Array.isArray(data?.current_application_ids) ? data.current_application_ids : data?.current_application_id ? [data.current_application_id] : [];
+    const updateSelection = () => {
+      selectionCount.textContent = `已选择 ${selection.size} 条投递`;
+      clear(selectedList);
+      for (const [id, item] of selection) {
+        const row = element("li", "");
+        row.appendChild(element("span", "", [item.company_name, item.job_title, APPLICATION_STAGE_LABELS[item.stage] || item.stage].filter(Boolean).join(" · ") || "已保存的关联投递"));
+        const remove = element("button", "button button--ghost", "移除"); remove.type = "button";
+        remove.setAttribute("aria-label", `移除关联：${item.job_title || "已选投递"}`);
+        remove.disabled = mailBindingBusy || savedBinding;
+        remove.addEventListener("click", () => {
+          if (mailBindingBusy || savedBinding) return;
+          selection.delete(id); updateSelection();
+        });
+        row.appendChild(remove); selectedList.appendChild(row);
+      }
+      candidates.querySelectorAll('input[name="mail-binding-application"]').forEach(control => { control.checked = selection.has(control.value); });
+      confirm.disabled = !result || (!selection.size && !savedBinding);
+    };
     const load = async () => {
-      const request = ++sequence; clear(previewNode); loading(candidates);
+      if (mailBindingBusy) return;
+      const request = ++requestSequence; result = null; confirm.disabled = true; clear(pages); loading(candidates);
       try {
-        const result = await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}/binding-candidates?query=${encodeURIComponent(input.value || "")}`);
-        if (request !== sequence || content.firstChild == null) return;
-        clear(candidates);
-        const propose = async (applicationId, action, button) => {
-          button.disabled = true;
-          try {
-            const response = await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}/binding-proposals`, {
-              method: "POST", headers: authHeaders("提出邮件关联", { "Content-Type": "application/json" }),
-              body: JSON.stringify({ record_id: recordId, application_id: applicationId, action,
-                content_digest: result.content_digest, binding_revision: result.binding_revision }),
-            });
-            if (!response.success || !response.data?.approval_id) throw new Error("无法生成确认预览");
-            clear(previewNode);
-            previewNode.appendChild(mailBindingCard({ token_id: response.data.approval_id, status: response.data.approval_status,
-              operation: "recruitment_mail_binding", preview: response.data.preview }));
-          } catch (error) { showToast(error.message, "error"); }
-          finally { button.disabled = false; }
-        };
+        const data = await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}/binding-candidates?query=${encodeURIComponent(input.value || "")}&offset=${offset}`);
+        if (!current() || request !== requestSequence) return;
+        result = data;
+        if (context && (context.source_changed || result.content_digest !== context.content_digest)) {
+          selection.clear(); updateSelection(); confirm.disabled = true;
+          empty(candidates, "邮件内容已变化", "为避免将旧任务绑定到新内容，本轮不能继续确认。请取消旧任务后重新处理该邮件。");
+          return;
+        }
+        const version = `${result.content_digest}:${result.binding_revision}`;
+        if (sourceVersion && sourceVersion !== version) {
+          selection.clear(); errorNode.textContent = "邮件内容或关联已变化，请重新选择后确认。";
+        }
+        sourceVersion = version;
+        allowsMultiple = result.allows_multiple === true;
+        if (!selectionInitialized) {
+          const savedItems = [...(result.current_applications || []), ...(result.candidates || [])];
+          for (const id of currentIds(result)) selection.set(id, savedItems.find(item => item.application_id === id) || {});
+          selectionInitialized = true;
+        }
+        if (!allowsMultiple && selection.size > 1) selection.clear();
         for (const item of result.candidates || []) {
-          const row = element("div", "approval-card");
-          row.appendChild(element("p", "", `${item.company_name} · ${item.job_title}`));
-          const button = element("button", "button button--ghost", "选择并查看确认预览"); button.type = "button";
-          button.addEventListener("click", () => void propose(item.application_id, result.current_application_id ? "correct" : "bind", button));
-          row.appendChild(button); candidates.appendChild(row);
+          if (selection.has(item.application_id)) selection.set(item.application_id, item);
+        }
+        clear(summary); summary.appendChild(element("h3", "", result.subject || context?.subject || "招聘邮件"));
+        if (result.received_at) summary.appendChild(element("small", "", `收到时间：${mailDateTime(result.received_at)}`));
+        if (result.excerpt) {
+          const details = element("details", "mail-binding-excerpt");
+          details.append(element("summary", "", "查看邮件内容摘要"), element("pre", "", result.excerpt)); summary.appendChild(details);
+        }
+        clear(candidates);
+        candidates.appendChild(element("legend", "", allowsMultiple ? "公司通用笔试 / 测评：可选择多个投递岗位" : result.selection_scope === "job_specific" ? "岗位专属通知：请选择对应投递" : "请选择一条投递记录"));
+        for (const item of result.candidates || []) {
+          const row = element("label", "mail-binding-option");
+          const control = element("input", ""); control.type = allowsMultiple ? "checkbox" : "radio"; control.name = "mail-binding-application"; control.value = item.application_id;
+          control.disabled = item.selectable === false;
+          control.addEventListener("change", () => {
+            if (mailBindingBusy || savedBinding || control.disabled) return;
+            if (control.checked) {
+              if (!allowsMultiple) selection.clear();
+              if (selection.size >= 50 && !selection.has(item.application_id)) { control.checked = false; errorNode.textContent = "一封邮件最多关联 50 条投递。"; return; }
+              selection.set(item.application_id, item);
+            } else selection.delete(item.application_id);
+            updateSelection();
+          });
+          const copy = element("span", ""); copy.append(element("strong", "", `${item.company_name} · ${item.job_title}`),
+            element("small", "", [item.city, APPLICATION_STAGE_LABELS[item.stage] || item.stage,
+              ({ confirmed_binding: "当前已确认关联", ats_identity_candidate: "招聘编号与公司相符", company_and_title: "公司与岗位名称相符", company_candidate: "公司相符，请核对岗位", manual_selection: "搜索结果，需你核对" })[item.reason] || "候选投递"].filter(Boolean).join(" · ")));
+          row.append(control, copy); candidates.appendChild(row);
         }
         if (!result.candidates?.length) empty(candidates, "暂无匹配投递", "输入公司或岗位名称搜索，也可以暂不关联。");
-        if (result.current_application_id) {
-          const unbind = element("button", "button button--ghost", "解除当前关联"); unbind.type = "button";
-          unbind.addEventListener("click", () => void propose(null, "unbind", unbind)); candidates.appendChild(unbind);
+        const recommendations = (result.candidates || []).filter(item => item.selectable !== false && (item.recommended || result.recommended_application_ids?.includes(item.application_id)));
+        if (recommendations.length) {
+          const choose = element("button", "button button--secondary", allowsMultiple ? "选择本页推荐岗位" : "选择推荐岗位"); choose.type = "button";
+          choose.addEventListener("click", () => {
+            if (mailBindingBusy || savedBinding) return;
+            if (!allowsMultiple) selection.clear();
+            for (const item of allowsMultiple ? recommendations : recommendations.slice(0, 1)) {
+              if (selection.size < 50 || selection.has(item.application_id)) selection.set(item.application_id, item);
+            }
+            updateSelection();
+          }); candidates.appendChild(choose);
         }
-      } catch (error) { if (request === sequence) empty(candidates, "读取失败", error.message); }
+        for (const [label, delta, disabled] of [["上一页", -20, offset === 0], ["下一页", 20, !result.has_more]]) {
+          const button = element("button", "button button--ghost", label); button.type = "button"; button.disabled = disabled;
+          button.addEventListener("click", () => { if (!mailBindingBusy) { offset += delta; void load(); } }); pages.appendChild(button);
+        }
+        pages.appendChild(element("small", "", `共 ${result.total || 0} 条候选`));
+        if (currentIds(result).length) {
+          const unbind = element("button", "button button--ghost", "解除当前关联"); unbind.type = "button";
+          unbind.addEventListener("click", () => {
+            if (window.confirm("仅解除本封邮件的关联，保留邮件和已有业务记录？")) void save("unbind");
+          }); candidates.appendChild(unbind);
+        }
+        updateSelection();
+      } catch (error) { if (current() && request === requestSequence) empty(candidates, "读取失败", error.message); }
     };
-    form.addEventListener("submit", event => { event.preventDefault(); void load(); });
+    const finishItem = async () => {
+      await refreshMailConfirmations();
+      try { state.approvals = normalizeApprovals(await api("/api/approvals")); renderApprovals(); }
+      catch (_) { showToast("操作已成功，审批列表暂时无法刷新", "info"); }
+      void loadRecruitmentMails({ showLoading: false });
+      if (!current()) return;
+      const next = mailConfirmationItems().find(item => item.record_id !== recordId);
+      if (next) { mailBindingBusy = false; void openMailBinding(next.record_id); }
+      else dialog.close();
+    };
+    const save = async (action = currentIds(result).length ? "correct" : "bind") => {
+      if (!current() || mailBindingBusy || !result || (action !== "unbind" && !selection.size && !savedBinding)) return;
+      const applicationIds = action === "unbind" ? [] : [...selection.keys()].sort();
+      mailBindingBusy = true; actions.querySelectorAll("button").forEach(button => { button.disabled = true; }); form.inert = true; candidates.disabled = true;
+      selectionPanel.inert = true;
+      errorNode.textContent = "";
+      try {
+        if (!savedBinding) {
+          const response = await api(`/api/recruitment-mails/${encodeURIComponent(recordId)}/binding-proposals`, {
+            method: "POST", headers: authHeaders("确认邮件关联", { "Content-Type": "application/json" }),
+            body: JSON.stringify({ record_id: recordId, application_ids: applicationIds, application_id: applicationIds.length === 1 ? applicationIds[0] : null, action, content_digest: result.content_digest, binding_revision: result.binding_revision }),
+          });
+          if (!current()) throw new Error("确认窗口已变化，请重新打开核对");
+          if (!response.success || !response.data?.approval_id) throw new Error("无法生成确认预览，请重新打开后选择");
+          if (!await confirmMailBinding({ token_id: response.data.approval_id, status: response.data.approval_status, preview: response.data.preview })) return;
+          savedBinding = true;
+        }
+        if (context && action !== "unbind") {
+          await api(`/api/local-ui/mail-confirmations/${encodeURIComponent(context.run_id)}/resolve`, {
+            method: "POST", headers: authHeaders("确认后继续邮件处理", { "Content-Type": "application/json" }),
+            body: JSON.stringify({ thread_id: originThread, record_id: recordId, action: "confirmed", content_digest: result.content_digest }),
+          });
+          setAssistantStatus("关联已确认，正在继续处理原邮件任务");
+        }
+        showToast(action === "unbind" ? "关联已解除，原有数据已保留" : "关联已保存", "success");
+        await finishItem();
+      } catch (error) {
+        errorNode.textContent = savedBinding ? `关联已保存，续办尚未启动：${error.message}。点击重试续办，不会重复绑定。` : error.message;
+        if (savedBinding) confirm.textContent = "重试续办";
+      } finally {
+        mailBindingBusy = false;
+        actions.querySelectorAll("button").forEach(button => { button.disabled = false; });
+        updateSelection(); form.inert = savedBinding; candidates.disabled = savedBinding; selectionPanel.inert = savedBinding;
+      }
+    };
+    confirm.addEventListener("click", () => void save());
+    reject.addEventListener("click", async () => {
+      if (!current() || mailBindingBusy || !result) return;
+      mailBindingBusy = true; reject.disabled = true;
+      try {
+        await api(`/api/local-ui/mail-confirmations/${encodeURIComponent(context.run_id)}/resolve`, {
+          method: "POST", headers: authHeaders("本封邮件不关联", { "Content-Type": "application/json" }),
+          body: JSON.stringify({ thread_id: originThread, record_id: recordId, action: "rejected", content_digest: result.content_digest }),
+        });
+        await finishItem();
+      } catch (error) { errorNode.textContent = error.message; }
+      finally { mailBindingBusy = false; reject.disabled = false; }
+    });
+    form.addEventListener("submit", event => { event.preventDefault(); if (!mailBindingBusy) { offset = 0; void load(); } });
+    await load();
+  }
+
+  let reviewResultsSequence = 0;
+  async function openReviewResults(runId = "") {
+    const dialog = $("review-results-dialog"), content = $("review-results-content");
+    if (!dialog || !content) return;
+    const sequence = ++reviewResultsSequence; clear(content);
+    const filter = element("select", ""); filter.setAttribute("aria-label", "筛选复核结果");
+    for (const [value, label] of [["attention", "失败 / 需处理"], ["retained", "未发现新进展，保留原阶段"], ["all", "全部结果"], ["failed", "执行失败"], ["blocked", "需要登录或验证"], ["unresolved", "无法确认（含保留）"], ["unchanged", "官网核验未变化"], ["updated", "已更新"], ["excluded", "已跳过"]]) {
+      const option = element("option", "", label); option.value = value; filter.appendChild(option);
+    }
+    filter.value = "attention";
+    const scope = element("select", ""); scope.setAttribute("aria-label", "复核明细范围");
+    for (const [value, label] of [["run", runId ? "指定这一轮任务" : "最近一轮任务"], ["latest", "各投递最近一次结果（跨任务）"]]) {
+      const option = element("option", "", label); option.value = value; scope.appendChild(option);
+    }
+    scope.value = "run";
+    const controls = element("div", "application-filter-bar"); controls.append(scope, filter);
+    const summary = element("p", ""); const rows = element("div", ""); const actions = element("div", "inline-actions");
+    const more = element("button", "button button--secondary", "加载更多"); more.type = "button";
+    const reload = element("button", "button button--ghost", "从第一页刷新"); reload.type = "button"; actions.append(more, reload);
+    content.append(controls, summary, rows, actions);
+    if (!dialog.open) dialog.showModal();
+    let cursor = null, selectedRun = runId, requestId = 0;
+    const loadedItems = new Map();
+    const rechecks = new Map();
+    const renderRows = () => {
+      clear(rows);
+      const loginGroups = new Map();
+      for (const item of loadedItems.values()) {
+        if (item.state === "blocked" || item.reason === "authentication_recovery_timeout") {
+          const href = safeScheduleHref(item.record_url);
+          const host = href ? new URL(href).host : "";
+          const key = `${item.company_name || item.company_id || item.application_id}|${host}`;
+          if (!loginGroups.has(key)) loginGroups.set(key, { key, company: item.company_name || "公司名称不可用", host, href, items: [] });
+          loginGroups.get(key).items.push(item);
+          continue;
+        }
+        const row = element("article", "review-result-row");
+        row.append(element("strong", "", `${item.company_name || "公司名称不可用"} · ${item.job_title || "岗位名称不可用"}`),
+          element("p", "", `${reviewStateLabel(item)} · ${reviewReasonLabel(item.navigation_reason) || reviewReasonLabel(item.reason) || item.reason || "未记录具体原因"}`));
+        row.appendChild(element("small", "", `检查时间：${item.checked_at ? mailDateTime(item.checked_at) : "未记录"}${item.name_source === "application_snapshot_fallback" ? " · 名称取自当前投递记录" : ""}`));
+        const evidenceLabel = reviewEvidenceLabel(item);
+        if (evidenceLabel) row.appendChild(element("p", "", evidenceLabel));
+        if (["returned_to_home_without_application_records", "application_record_home_redirect"].includes(item.navigation_reason || item.reason)
+            || item.diagnostics?.navigation_diagnostics?.reason === "returned_to_home_without_application_records") {
+          row.appendChild(element("p", "", "官网返回了首页，未读取到投递记录；首页的登录入口不能证明登录已失效。"));
+        }
+        const href = safeScheduleHref(item.record_url);
+        if (href) { const link = element("a", "button button--ghost", "打开官网进度页"); link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer"; row.appendChild(link); }
+        rows.appendChild(row);
+      }
+      for (const group of loginGroups.values()) {
+        const row = element("article", "review-result-row review-login-group");
+        const recoveryOnly = group.items.every(item => item.reason === "authentication_recovery_timeout");
+        row.append(element("strong", "", `${group.company} · 本组已加载 ${group.items.length} 个岗位`),
+          element("p", "", [...new Set(group.items.map(item => reviewReasonLabel(item.reason) || "官网要求登录或验证"))].join("；")));
+        if (group.host) row.appendChild(element("small", "", `官网：${group.host} · ${recoveryOnly ? "认证回跳尚未完成，可手动打开官网检查" : "登录一次后可重新复核下列岗位"}`));
+        const jobs = element("ul", "review-login-jobs");
+        for (const item of group.items) jobs.appendChild(element("li", "", `${item.job_title || "岗位名称不可用"}${item.checked_at ? ` · ${mailDateTime(item.checked_at)}` : ""}`));
+        row.appendChild(jobs);
+        const groupActions = element("div", "review-login-actions");
+        if (group.href) {
+          const link = element("a", "button button--secondary", recoveryOnly ? "打开官网检查认证" : "打开官网登录"); link.href = group.href; link.target = "_blank"; link.rel = "noopener noreferrer";
+          groupActions.appendChild(link);
+        }
+        const retry = element("button", "button button--ghost", recoveryOnly ? "检查后重新复核此公司" : "登录后重新复核此公司"); retry.type = "button";
+        const ids = [...new Set(group.items.map(item => item.application_id).filter(Boolean))];
+        const pending = rechecks.get(group.key);
+        retry.disabled = Boolean(pending?.pending || pending?.complete) || !group.href || !ids.length || ids.length > 50;
+        if (pending?.pending || pending?.complete) retry.textContent = pending.complete ? "复核完成" : "正在复核";
+        const note = element("p", "review-login-note", pending?.pending ? "正在复核本公司列出的岗位，请等待本次任务结果。"
+          : ids.length > 50 ? "本组超过 50 条，请按投递范围分批复核。" : recoveryOnly
+            ? "可手动检查官网认证跳转，再点击复核本组岗位；当前未判定登录失效。"
+            : "完成官网登录后点击，仅重新复核本组列出的岗位。");
+        retry.addEventListener("click", async () => {
+          if (retry.disabled || !dialog.open || sequence !== reviewResultsSequence) return;
+          const transaction = rechecks.get(group.key) || {request_id:crypto.randomUUID(),application_ids:[...ids]};
+          transaction.pending = true; rechecks.set(group.key, transaction); retry.disabled = true;
+          retry.textContent = "正在复核"; note.textContent = "正在复核本组岗位…";
+          try {
+            let receipt;
+            do {
+              const response = await api("/api/applications/review-results/recheck", {
+                method: "POST", headers: authHeaders("登录后重新复核公司岗位", { "Content-Type": "application/json" }),
+                body: JSON.stringify({request_id:transaction.request_id, ...(transaction.run_id ? {run_id:transaction.run_id} : {application_ids:transaction.application_ids})}),
+              });
+              receipt = response.data || response;
+              if (response.success === false || !receipt.run_id) throw new Error(response.message || "复核任务未启动，请稍后重试。");
+              if (transaction.run_id && transaction.run_id !== receipt.run_id) throw new Error("复核任务范围发生变化，请刷新后检查原任务。");
+              transaction.run_id = receipt.run_id;
+              if (receipt.continuation_required !== true && receipt.scope_complete !== true && receipt.summary?.scope_complete !== true) {
+                throw new Error(receipt.message || "本组复核尚未完成，进度已保存，请重试或检查任务状态。");
+              }
+              note.textContent = receipt.message || (receipt.continuation_required ? "本批已完成，正在继续复核本组剩余岗位…" : "本组岗位复核完成。");
+            } while (receipt.continuation_required === true);
+            transaction.pending = false; transaction.complete = true; retry.textContent = "复核完成";
+            rechecks.delete(group.key);
+            if (dialog.open && sequence === reviewResultsSequence) {
+              selectedRun = transaction.run_id; scope.value = "run"; filter.value = "all"; cursor = null; await load();
+            } else showToast(`${group.company}的 ${transaction.application_ids.length} 条岗位已完成重新复核`, "success");
+          } catch (error) {
+            transaction.pending = false; retry.disabled = false; retry.textContent = "重试本组复核";
+            note.textContent = `复核未完成：${error.message}。重试会继续首次选定的 ${transaction.application_ids.length} 条岗位和同一任务。`;
+          }
+        });
+        groupActions.appendChild(retry); row.append(groupActions, note); rows.prepend(row);
+      }
+    };
+    const load = async (append = false) => {
+      const request = ++requestId; more.disabled = true;
+      const query = new URLSearchParams({ scope: scope.value, category: filter.value, limit: ["attention", "blocked"].includes(filter.value) ? "50" : "20" });
+      if (scope.value === "run" && selectedRun) query.set("run_id", selectedRun);
+      if (append && cursor) query.set("cursor", cursor);
+      if (!append) loading(rows);
+      try {
+        const data = await api(`/api/applications/review-results?${query}`);
+        if (sequence !== reviewResultsSequence || request !== requestId || !dialog.open) return;
+        if (!append) loadedItems.clear();
+        if (scope.value === "run") selectedRun = data.run_id || selectedRun;
+        summary.textContent = data.details_expired ? "该轮详细诊断已按保留期清理，历史汇总仍保留。可切换各投递最近结果，但不是该历史轮次的明细。"
+          : `${scope.value === "latest" ? "各投递最近一次结果，可能来自不同任务" : "本轮结果"} · 当前分类 ${data.total ?? 0} 条`;
+        for (const item of data.items || []) loadedItems.set(item.application_id || `${item.company_name}|${item.job_title}`, item);
+        renderRows();
+        if (!rows.children.length && !data.details_expired) rows.appendChild(element("p", "", "此分类没有记录。"));
+        cursor = data.next_cursor || null; more.hidden = !data.has_more; more.disabled = !data.has_more;
+      } catch (error) {
+        if (sequence !== reviewResultsSequence || request !== requestId) return;
+        if (!append) empty(rows, "无法读取复核明细", error.message);
+        else showToast(`后续明细读取失败：${error.message}。已显示的记录保留。`, "error");
+        more.disabled = !cursor;
+      }
+    };
+    more.addEventListener("click", () => void load(true));
+    reload.addEventListener("click", () => { cursor = null; void load(); });
+    filter.addEventListener("change", () => { cursor = null; void load(); });
+    scope.addEventListener("change", () => { cursor = null; selectedRun = runId; void load(); });
     await load();
   }
 
@@ -2704,6 +3715,11 @@
         disable.setAttribute("aria-label", `停用定时任务：${text(automation.task_label)}`);
         actions.appendChild(disable);
       }
+      const remove = element("button", "button button--ghost", "删除任务");
+      remove.type = "button";
+      remove.dataset.automationDelete = automation.id;
+      remove.setAttribute("aria-label", `删除定时任务：${text(automation.task_label)}`);
+      actions.appendChild(remove);
       item.append(heading, timing, detail, actions);
       node.appendChild(item);
     });
@@ -2740,6 +3756,22 @@
     }
   }
 
+  async function deleteAutomation(scheduleId) {
+    const automation = state.automations.find((item) => item.id === scheduleId);
+    if (!automation) return;
+    if (!window.confirm(`确定永久删除“${text(automation.task_label, "这个定时任务")}”及其执行记录吗？此操作不能恢复；正在执行的任务需先结束。`)) return;
+    try {
+      await api(`/api/automations/${encodeURIComponent(scheduleId)}`, {
+        method: "DELETE",
+        headers: authHeaders("删除定时任务"),
+      });
+      await loadAutomations();
+      showToast("定时任务已删除", "success");
+    } catch (error) {
+      showToast(`删除失败：${error.message}`, "error");
+    }
+  }
+
   const MAIL_CATEGORY_LABELS = {
     application_confirmation: "投递确认",
     assessment: "测评",
@@ -2753,7 +3785,7 @@
   const MAIL_PROCESSING_STATUS_LABELS = {
     ambiguous_application: "多个候选，待确认",
     failed_terminal: "处理失败，需检查",
-    needs_auth_metadata: "发件人验证信息不足",
+    needs_auth_metadata: "待重新处理",
     pending: "待处理",
     processed_updated: "已更新投递阶段",
     processed_unchanged: "已核对，无变化",
@@ -2766,7 +3798,7 @@
     ignored: "已忽略",
   };
 
-  const MAIL_FRESHNESS_STATUSES = new Set(["synced", "cached", "failed", "disabled"]);
+  const MAIL_FRESHNESS_STATUSES = new Set(["synced", "cached", "syncing", "failed", "disabled"]);
 
   function normalizeMailStatus(value) {
     return String(value || "").trim().toLowerCase();
@@ -2785,12 +3817,20 @@
     return "pending";
   }
 
+  function mailAssociatedApplications(mail) {
+    return Array.isArray(mail?.applications) ? mail.applications : [];
+  }
+
+  function mailHasAssociation(mail) {
+    return Boolean(mail?.application_id || mail?.application_ids?.length || mailAssociatedApplications(mail).length);
+  }
+
   function mailAssociationState(mail) {
     if (mail?.binding_state === "stale") return { key: "review", label: "原关联需重新确认" };
     if (mail?.binding_state === "unbound") return { key: "muted", label: "用户已解除" };
     if (mail?.binding_state === "confirmed") return { key: "linked", label: "用户已确认" };
     if (mail?.association_required === false) return { key: "muted", label: "无需关联" };
-    if (mail?.application_id) return { key: "linked", label: "已关联" };
+    if (mailHasAssociation(mail)) return { key: "linked", label: "已关联" };
     const processing = normalizeMailStatus(mail?.processing_status);
     if (processing === "pending_association") return { key: "pending", label: "待关联" };
     if (["irrelevant", "ignored"].includes(processing)) return { key: "muted", label: "不适用" };
@@ -2840,6 +3880,9 @@
     } else if (status === "cached") {
       setText("mail-freshness-title", "当前显示本地缓存");
       setText("mail-freshness-detail", freshness.synced_at ? `最近一次同步于 ${mailDateTime(freshness.synced_at)}，尚未确认最新邮件。` : "尚未确认最新邮件，当前列表来自本地缓存。");
+    } else if (status === "syncing") {
+      setText("mail-freshness-title", "邮箱正在同步");
+      setText("mail-freshness-detail", "已有同步正在进行，当前显示本地邮件；请稍后再次点击同步查看结果。");
     } else if (status === "failed") {
       setText("mail-freshness-title", "同步失败，当前显示缓存");
       setText("mail-freshness-detail", state.mails.length ? `${mailFreshnessError(freshness)}；邮件列表可能不是最新。` : `${mailFreshnessError(freshness)}；暂无可用的本地邮件缓存。`);
@@ -2883,7 +3926,7 @@
     setText("nav-mail-count", state.mails.length);
     setText("mail-total-count", state.mails.length);
     setText("mail-confirm-count", state.mails.filter((item) => item.requires_confirmation).length);
-    setText("mail-linked-count", state.mails.filter((item) => item.application_id).length);
+    setText("mail-linked-count", state.mails.filter(mailHasAssociation).length);
     setText("mail-list-count", `${state.mails.length} 封`);
     if (unavailable && !state.mails.length) {
       if (state.mailFreshness.status === "failed") return errorState(node, "招聘邮件读取失败", "无法确认最新邮件，当前没有可用的本地缓存。");
@@ -2907,25 +3950,62 @@
       const sender = document.createElement("span"); sender.className = "mail-sender"; sender.textContent = text(mail.sender, "发件人待确认");
       main.append(title, meta, sender);
       const target = [mail.company_name, mail.job_title].filter(Boolean).join(" · ");
-      if (target) main.appendChild(element("span", "mail-target", `投递目标：${target}`));
+      const associations = mailAssociatedApplications(mail);
+      if (associations.length > 1) main.appendChild(element("span", "mail-target", `关联 ${associations.length} 条投递：${associations.map(application => application.job_title).filter(Boolean).join("；")}`));
+      else if (target) main.appendChild(element("span", "mail-target", `投递目标：${target}`));
       const actions = element("div", "mail-row-actions");
       const open = element("button", "button button--ghost", "查看邮件");
       open.type = "button"; open.dataset.mailOpenId = text(mail.id, "");
       const review = element("button", "button button--secondary", "生成关联预览");
       review.type = "button"; review.dataset.mailReviewId = text(mail.id, "");
-      const bindMail = element("button", "button button--ghost", mail.application_id ? "修改关联" : "关联投递");
+      const bindMail = element("button", "button button--ghost", mailHasAssociation(mail) ? "修改关联" : "关联投递");
       bindMail.type = "button"; bindMail.addEventListener("click", () => void openMailBinding(mail.id));
       actions.append(open, bindMail, review);
+      if (["failed", "failed_terminal"].includes(processingStatus)) {
+        const retry = element("button", "button button--secondary", "重试分析"); retry.type = "button";
+        retry.disabled = mailAnalysisRetries.has(mail.id);
+        const progress = element("section", "assistant-task-progress"); progress.hidden = true;
+        retry.addEventListener("click", () => void retryRecruitmentMailAnalysis(mail, retry, progress));
+        actions.appendChild(retry); main.appendChild(progress);
+      }
       item.append(main, actions); node.appendChild(item);
     });
     node.dataset.state = "ready";
   }
 
-  async function loadRecruitmentMails({ showLoading = true } = {}) {
+  const mailAnalysisRetries = new Set();
+  async function retryRecruitmentMailAnalysis(mail, button, progress) {
+    if (button.disabled || mailAnalysisRetries.has(mail.id) || !["failed", "failed_terminal"].includes(normalizeMailStatus(mail.processing_status))) return;
+    mailAnalysisRetries.add(mail.id); button.disabled = true; button.textContent = "分析中…";
+    try {
+      let run = await api(`/api/recruitment-mails/${encodeURIComponent(mail.id)}/retry`, {
+        method: "POST", headers: authHeaders("重试邮件分析"),
+      });
+      if (!run?.run_id || run.task_kind !== "recruitment_mail") throw new Error("未能读取本次分析进度，请刷新后查看");
+      const runId = run.run_id;
+      const showProgress = () => { clear(progress); progress.hidden = false; renderTaskProgressCard(progress, run, false); };
+      showProgress();
+      while (ACTIVE_TASK_STATUSES.has(run.status)) {
+        const result = await api(`/api/local-ui/tasks/progress?run_id=${encodeURIComponent(runId)}`, { headers: authHeaders("邮件分析进度") });
+        if (!result?.run || result.run.run_id !== runId || result.run.task_kind !== "recruitment_mail") throw new Error("本次分析进度暂时不可用，请刷新后查看");
+        run = result.run; showProgress();
+        if (ACTIVE_TASK_STATUSES.has(run.status)) await new Promise(resolve => window.setTimeout(resolve, 2000));
+      }
+      mailAnalysisRetries.delete(mail.id);
+      await Promise.all([loadRecruitmentMails({ showLoading: false }), loadFullSchedule(), loadApplications()]);
+      const succeeded = ["completed", "succeeded"].includes(run.status) && !run.failed;
+      showToast(succeeded ? "本次邮件分析已结束，请查看最新处理结果" : "本次分析未全部成功，原记录已保留，请查看处理结果", succeeded ? "success" : "info");
+    } catch (error) { showToast(error.message, "error"); }
+    finally {
+      mailAnalysisRetries.delete(mail.id); button.disabled = false; button.textContent = "重试分析";
+    }
+  }
+
+  async function loadRecruitmentMails({ showLoading = true, freshness = null } = {}) {
     if (showLoading) loading($("mail-list"));
     try {
       const response = await api("/api/recruitment-mails?limit=50&refresh=false");
-      renderMails(response.items || [], Boolean(response.unavailable), mailFreshnessFrom(response));
+      renderMails(response.items || [], Boolean(response.unavailable), freshness || mailFreshnessFrom(response));
       return response;
     } catch (error) {
       const cachedItems = state.mails.slice();
@@ -2947,12 +4027,29 @@
     }
     setMailSyncFeedback("syncing", "正在同步招聘邮件", "正在从只读邮箱读取新邮件，请稍候。");
     let outcome = null;
+    let syncFreshness = null;
     try {
       const result = await api("/api/recruitment-mails/sync?limit=100", { method: "POST" });
       const sync = result?.sync || result?.data?.sync || {};
       const counts = mailSyncCounts(sync);
       const status = normalizeMailStatus(result?.status || result?.data?.status);
-      if (!["synced", "success", "succeeded"].includes(status)) {
+      syncFreshness = { status, synced_at: result?.synced_at || result?.data?.synced_at || null,
+        error_type: result?.error_type || result?.data?.error_type || null };
+      if (status === "syncing" || syncFreshness.error_type === "mail_sync_in_progress") {
+        syncFreshness.status = "syncing";
+        syncFreshness.error_type = null;
+        outcome = {
+          status: "in-progress", title: "邮箱正在同步",
+          detail: "已有同步正在进行，未重复启动；请稍后再次点击同步查看结果。",
+          extra: { fetched: 0, inserted: 0, reused: 0 }, toast: "邮箱正在同步，请稍候",
+        };
+      } else if (status === "cached") {
+        outcome = {
+          status: "cached", title: "已复用最近同步结果",
+          detail: syncFreshness.synced_at ? `最近一次同步于 ${mailDateTime(syncFreshness.synced_at)}；本次未重新读取邮箱。` : "本次复用最近同步结果，未重新读取邮箱。",
+          extra: { fetched: 0, inserted: 0, reused: 0 }, toast: "已复用最近同步结果，并非同步失败",
+        };
+      } else if (!["synced", "success", "succeeded"].includes(status)) {
         const failure = mailFreshnessError(result) || text(result?.reason, "邮箱同步未完成");
         outcome = {
           status: "failed",
@@ -2980,6 +4077,7 @@
       }
     } catch (error) {
       const failure = error.message || "邮箱同步请求失败";
+      syncFreshness = { status: "failed", error_type: failure };
       outcome = {
         status: "failed",
         title: "邮箱同步失败",
@@ -2988,7 +4086,8 @@
         toast: `邮箱同步失败：${failure}`,
       };
     }
-    await loadRecruitmentMails({ showLoading: false });
+    if (["success", "succeeded"].includes(syncFreshness?.status)) syncFreshness.status = "synced";
+    await loadRecruitmentMails({ showLoading: false, freshness: syncFreshness });
     if (outcome) {
       setMailSyncFeedback(outcome.status, outcome.title, outcome.detail, outcome.extra);
       showToast(outcome.toast, outcome.status === "failed" ? "error" : (outcome.status === "success" ? "success" : "info"));
@@ -3107,11 +4206,18 @@
   function renderApprovals() {
     renderMailBindingApprovals();
     const node = $("approval-list"); clear(node);
-    const pending = state.approvals.filter((item) => item.status === "pending");
+    const pending = state.approvals.filter((item) => item.status === "pending" && item.operation !== "application_identity_binding");
     setText("approval-summary-count", pending.length); setText("approval-list-count", `${state.approvals.length} 条`);
     setText("nav-approval-count", pending.length);
     if (!state.approvals.length) return empty(node, "暂无审批请求", "只读任务不会自动生成写操作。");
     state.approvals.forEach((approval) => {
+      if (approval.operation === "application_identity_binding") {
+        const audit = element("article", "approval-card");
+        audit.append(element("strong", "", "官网岗位对应记录"),
+          element("p", "", `${approval.preview?.before?.job_title || "投递记录"} · ${approval.status}`),
+          element("small", "", "历史确认仅作审计。当前待办请到投递记录集中处理。"), identityQueueEntry());
+        node.appendChild(audit); return;
+      }
       if (approval.operation === "recruitment_mail_binding" && ["pending", "approved"].includes(approval.status)) {
         node.appendChild(mailBindingCard(approval)); return;
       }
@@ -3197,10 +4303,66 @@
   }
 
   function statusClass(result, response) {
+    if (completedReviewSummary(result, response)) return "success";
     if (result.status === "preview" || response.status === "preview") return "pending";
     if (result.status === "paused" || response.status === "paused") return "pending";
     if (result.status === "succeeded" || result.status === "success" || response.success === true) return "success";
     return "error";
+  }
+
+  function completedReviewSummary(result, response) {
+    if (!isApplicationReviewTool(response.tool_name || result.task_type)) return null;
+    const summary = response.summary || response.data?.summary || response.data || {};
+    if (summary.scope_complete !== true || Number(summary.failed || 0) > 0 || summary.wave_error || response.timed_out) return null;
+    if (response.error_code && String(response.error_code).toLowerCase() !== "ambiguous_match") return null;
+    if (!["ambiguous", "success"].includes(response.status)) return null;
+    return summary;
+  }
+
+  function isApplicationReviewTool(name) {
+    return /(?:^|__)(?:application_status_review|batch_observe_application_status|application_review_status|application_review_control)$/.test(name || "");
+  }
+
+  function reviewSummaryFromReceipt(toolName, value, depth = 0) {
+    if (!isApplicationReviewTool(toolName) || depth > 6 || value == null) return null;
+    if (typeof value === "string") {
+      try { return reviewSummaryFromReceipt(toolName, JSON.parse(value), depth + 1); } catch (_) { return null; }
+    }
+    if (typeof value !== "object" || value.isError === true) return null;
+    const receiptData = value.data || value;
+    let summary = value.summary || receiptData.summary || receiptData;
+    if (receiptData && typeof receiptData === "object" && "run" in receiptData) {
+      if (!receiptData.run || typeof receiptData.run !== "object" || Array.isArray(receiptData.run)
+        || receiptData.selection === "ambiguous" || (Array.isArray(receiptData.runs) && receiptData.runs.length !== 1)) return null;
+      if (receiptData.runs?.[0]?.run_id && receiptData.run.run_id !== receiptData.runs[0].run_id) return null;
+      summary = receiptData.run;
+    }
+    if (typeof summary.scope_complete === "boolean" && (Number.isFinite(summary.retained_count) || Array.isArray(summary.identity_confirmation_items)
+      || Number.isInteger(summary.identity_confirmation_required_count))) {
+      const projection = {};
+      for (const key of ["run_id", "scope_complete", "retained_count", "unchanged_or_retained_count", "attention_required_count", "blocked", "failed", "wave_error"]) {
+        if (["string", "number", "boolean"].includes(typeof summary[key]) || summary[key] === null) projection[key] = summary[key];
+      }
+      projection.identity_confirmation_required_count = Number.isInteger(summary.identity_confirmation_required_count)
+        ? summary.identity_confirmation_required_count : new Set((Array.isArray(summary.identity_confirmation_items)
+          ? summary.identity_confirmation_items : []).filter(item => item && typeof item.application_id === "string")
+          .map(item => item.application_id)).size;
+      if (summary.retained_by_stage && typeof summary.retained_by_stage === "object") {
+        projection.retained_by_stage = Object.fromEntries(Object.entries(summary.retained_by_stage)
+          .filter(([, count]) => Number.isInteger(count) && count > 0));
+      }
+      return projection;
+    }
+    for (const key of ["structuredContent", "structured_content", "result", "output"]) {
+      const found = reviewSummaryFromReceipt(toolName, value[key], depth + 1);
+      if (found) return found;
+    }
+    for (const part of Array.isArray(value.content) ? value.content : []) {
+      if (part?.type !== "text") continue;
+      const found = reviewSummaryFromReceipt(toolName, part.text, depth + 1);
+      if (found) return found;
+    }
+    return null;
   }
 
   function resultBlock(title) {
@@ -3222,9 +4384,90 @@
     block.appendChild(list); node.appendChild(block);
   }
 
+  function reviewReasonLabel(reason) {
+    return ({
+      mail_only: "没有官网进度链接，仅邮件更新",
+      application_records_missing: "页面未提取到投递记录",
+      application_record_entry_not_entered: "官网应聘记录入口未能进入，请打开官网完成进入后重试",
+      application_record_home_redirect: "投递地址返回官网首页，未读取到应聘记录；不代表登录过期",
+      target_record_not_matched: "未找到与目标岗位一致的记录",
+      target_record_ambiguous: "多个候选，暂不能唯一关联",
+      target_card_not_unique: "页面记录不能唯一对应投递，保留原阶段",
+      status_unmapped: "已找到岗位，但状态含义未确认",
+      status_evidence_missing: "缺少可核验的状态证据",
+      record_present_status_unknown: "找到投递记录，但当前阶段不明确，保留原状态",
+      unparsed_page: "页面已加载，但未解析出投递记录，保留原状态",
+      frame_scope_denied: "投递内容位于当前不可访问的页面框架",
+      application_page_unavailable: "官网投递记录页不可用",
+      application_page_ready_timeout: "页面准备超时",
+      desktop_readiness_timeout: "投递页面未在时限内就绪",
+      desktop_load_failed: "官网页面加载失败，本轮未核验状态",
+      desktop_load_timeout: "官网首屏加载超时，尚未读取投递记录",
+      desktop_observation_timeout: "官网页面内容读取超时，未核验投递状态",
+      desktop_review_queue_timeout: "浏览器复核排队超时，尚未读取官网",
+      desktop_review_timeout: "本次官网复核超过单页时限，未核验投递状态",
+      observation_timeout: "等待官网页面证据超时，未核验投递状态",
+      review_wave_timeout: "本批复核达到时限，已保存结果；剩余岗位等待续跑",
+      desktop_navigation_changed: "页面跳转受限，未完成核验",
+      desktop_account_changed: "读取期间登录账号发生变化，已停止使用原页面证据，请重新复核",
+      https_downgrade: "官网尝试从 HTTPS 跳转到 HTTP，已安全拦截；尚未核验状态",
+      unapproved_origin: "官网跳转到未批准的域名，已拦截；尚未核验状态",
+      official_sso_hop_limit: "统一认证跳转次数超限，已停止循环；尚未核验状态",
+      official_sso_reobservation_limit: "统一认证再次跳出招聘页，已停止重复读取；尚未核验状态",
+      login_required: "官网明确要求登录", captcha_required: "需要用户完成人机验证",
+      authentication_recovery_timeout: "统一认证页未在时限内返回招聘页；尚不能确认登录是否失效",
+      returned_to_home_without_application_records: "官网返回了首页，未读取到投递记录；登录状态尚未确认",
+      model_timeout: "辅助判读超时，保留原阶段",
+      model_invalid_output: "辅助判读结果格式无效，保留原阶段",
+      model_unavailable: "辅助判读暂不可用，保留原阶段",
+      model_uncertain: "辅助判读仍不确定，保留原阶段",
+      talent_pool_status_unmapped: "官网显示进入人才库，未说明录用或淘汰，保留原阶段",
+      position_recommendation_unmapped: "官网显示推荐至其他岗位，保留原阶段",
+      model_identity_mismatch: "判读结果与目标岗位不一致",
+      model_quote_not_found: "判读引用不在目标记录中",
+      visual_target_evidence_incomplete: "截图判读未包含完整目标岗位，请重新读取；保留原阶段",
+      observation_evidence_expired: "历史页面诊断已清理，请重新复核",
+      model_evidence_scope_incomplete: "引用未包含完整岗位卡片，保留原阶段",
+      model_evidence_ref_invalid: "判读选取的证据范围不一致，保留原阶段",
+      model_label_not_found: "判读状态文字不在目标记录中",
+      model_budget_exhausted: "本次判读时间预算不足，保留原阶段",
+      model_interrupted: "辅助判读已中断，保留原阶段",
+      model_cache_unavailable: "判读证据记录暂不可用",
+      status_semantics_unsupported: "状态含义不足以确认阶段",
+      untrusted_web_content: "页面包含不可信指令，未采纳",
+    })[reason] || "";
+  }
+
+  function reviewStateLabel(record) {
+    if (record.presentation_state === "retained") {
+      return record.saved_stage ? `保留原阶段：${APPLICATION_STAGE_LABELS[record.saved_stage] || text(record.saved_stage)}` : "保留原阶段";
+    }
+    return ({ updated: "已更新", unchanged: "状态未变化", blocked: "需要登录或验证",
+      unresolved: "未确认，保留原阶段", failed: "执行失败", excluded: "已跳过（仅邮件更新）" })[record.state] || record.state || record.status;
+  }
+
+  function reviewEvidenceLabel(record) {
+    const model = ({called: "本轮已调用模型", cache_hit: "复用已保存的模型判读", error: "本轮模型判读失败",
+      skipped: "未发起新的文本判读", rule_resolved: "规则校验完成"})[record.model_disposition] || "";
+    const vision = record.vision_disposition;
+    const visual = !vision || vision === "not_requested" ? "" : ({analyzed: "已读取截图证据",
+      cache_hit: "复用截图判读", not_configured: "截图判读未启用", skipped: "未使用截图",
+      budget_deferred: "截图判读等待后续批次", response_invalid: "截图模型输出格式错误，未据此确认状态",
+      response_truncated: "截图模型输出被截断，未据此确认状态", vision_timeout: "截图模型判读超时",
+      vision_queue_timeout: "截图识别排队超时，未据此确认状态",
+      vision_duplicate_wait_timeout: "同一截图的判读仍未完成，未据此确认状态",
+      request_failed: "截图模型请求失败", disabled_in_settings: "配置未开启截图判读",
+      disabled_by_request: "本次请求未启用截图判读", skipped_blank_page: "页面空白，未发送截图",
+      skipped_frame_restricted: "页面框架受限，未发送截图"})[vision] || "截图判读未完成，未据此确认状态";
+    const cards = record.diagnostics?.vision_card_diagnostics?.length ? "本页部分截图卡片信息未通过校验" : "";
+    return [model, visual, cards].filter(Boolean).join(" · ");
+  }
+
   function summarizeRecord(record) {
     if (!record || typeof record !== "object") return text(record);
-    const preferred = [record.title, record.job_title, record.company_name, record.company_id, record.city, record.stage, record.status, record.match_score == null ? null : `匹配 ${record.match_score} 分`];
+    const status = (record.state || record.status) === "excluded" && record.reason === "mail_only"
+      ? "已跳过（仅邮件更新）" : record.application_id && record.state ? reviewStateLabel(record) : record.state || record.status;
+    const preferred = [record.title, record.job_title, record.company_name, record.company_id, record.city, record.stage, status, record.match_score == null ? null : `匹配 ${record.match_score} 分`];
     const values = preferred.filter((value) => value !== null && value !== undefined && value !== "");
     if (values.length) return values.map((value) => text(value)).join(" · ");
     return Object.entries(record).slice(0, 3).map(([key, value]) => `${key}: ${text(value)}`).join(" · ");
@@ -3235,6 +4478,7 @@
   }
 
   function resultRecordKind(record) {
+    if (record?.application_id && record?.state && record?.reason) return "application-review";
     if (record?.detail_url && record?.title && record?.company_id) return "job";
     if (record?.event_type && (record?.event_date || record?.event_time || record?.time_kind)) return "schedule";
     if (record?.job_title && record?.stage) return "application";
@@ -3250,7 +4494,23 @@
     const title = document.createElement("strong");
     const meta = document.createElement("span");
     const actions = document.createElement("div"); actions.className = "business-result-actions";
-    if (kind === "job") {
+    if (kind === "application-review") {
+      title.textContent = [record.company_name, record.job_title].filter(Boolean).join(" · ") || "投递复核记录";
+      meta.textContent = reviewStateLabel(record);
+      if (record.presentation_state === "retained") {
+        const details = element("details", "result-details");
+        details.append(element("summary", "", "查看复核说明"), element("p", "", [
+          reviewReasonLabel(record.reason), reviewEvidenceLabel(record), record.observed_label && `官网原文：${text(record.observed_label).slice(0, 200)}`,
+        ].filter(Boolean).join(" · ")));
+        content.append(title, meta, details); item.append(content, actions); return item;
+      }
+      if (reviewReasonLabel(record.reason)) meta.textContent += ` · ${reviewReasonLabel(record.reason)}`;
+      if (reviewEvidenceLabel(record)) meta.textContent += ` · ${reviewEvidenceLabel(record)}`;
+      if (record.observed_label) meta.textContent += ` · 官网原文：${text(record.observed_label).slice(0, 200)}`;
+      if (["target_record_not_matched", "target_record_ambiguous", "target_card_not_unique", "model_identity_mismatch"].includes(record.reason)) {
+        actions.appendChild(identityQueueEntry());
+      }
+    } else if (kind === "job") {
       title.textContent = text(record.title);
       meta.textContent = [companyName(record.company_id), record.city, record.match_score == null ? null : `匹配 ${record.match_score} 分`].filter(Boolean).join(" · ");
       const ask = document.createElement("button"); ask.type = "button"; ask.className = "text-action"; ask.textContent = "解释匹配";
@@ -3267,6 +4527,7 @@
     } else if (kind === "application") {
       title.textContent = `${text(record.company_name)} · ${text(record.job_title)}`;
       meta.textContent = `当前阶段：${text(record.stage)}${record.source_status ? ` · 官网：${record.source_status}` : ""}`;
+      if ((record.state || record.status) === "excluded" && record.reason === "mail_only") meta.textContent += " · 已跳过（仅邮件更新）";
       if (/^https?:\/\//i.test(record.record_url || "")) {
         const link = document.createElement("a"); link.className = "text-action"; link.href = record.record_url; link.target = "_blank"; link.rel = "noreferrer"; link.textContent = "查看投递"; actions.appendChild(link);
       }
@@ -3285,9 +4546,19 @@
     content.append(title, meta); item.append(content, actions); return item;
   }
 
-  function renderResultData(node, data) {
+  function renderResultData(node, data, { showIdentity = true } = {}) {
     if (data == null) return;
     const block = resultBlock("工具结果");
+    const reviewSummary = data.summary || data;
+    if (Number(reviewSummary.retained_count) > 0) {
+      block.appendChild(element("p", "result-copy", `状态未变化或保留原阶段 ${reviewSummary.unchanged_or_retained_count ?? reviewSummary.retained_count} 条，其中保留原阶段 ${reviewSummary.retained_count} 条。未发现可确认的新进展，不代表官网已核验无变化。`));
+      const stages = Object.entries(reviewSummary.retained_by_stage || {}).map(([stage, count]) =>
+        `${APPLICATION_STAGE_LABELS[stage] || (stage === "unknown" ? "原阶段" : stage)} ${count} 条`);
+      if (stages.length) block.appendChild(element("p", "result-copy", `保留阶段：${stages.join("、")}。`));
+    }
+    if (data.summary?.excluded_mail_only > 0) {
+      block.appendChild(element("p", "result-copy", `已跳过（仅邮件更新）${data.summary.excluded_mail_only} 条：没有官网进度链接，通过邮件更新。`));
+    }
     const collection = ["items", "events", "companies", "matches"].find((key) => Array.isArray(data[key]));
     if (collection) {
       const list = document.createElement("ul"); list.className = "result-list business-result-list";
@@ -3330,6 +4601,13 @@
     pre.textContent = safeJson(compactResultValue(data));
     details.append(summary, pre); block.appendChild(details);
     node.appendChild(block);
+
+    if (showIdentity && (Array.isArray(reviewSummary.identity_confirmation_items) || Number.isInteger(reviewSummary.identity_confirmation_required_count))) {
+      const identities = resultBlock("官网岗位对应");
+      identities.append(element("p", "result-copy", "待核对事项在投递记录中集中处理。"), identityQueueEntry());
+      block.appendChild(identities);
+      void loadApplicationIdentityQueue();
+    }
 
     if (data.preview_only === true || data.send_attempted === false || data.write_attempted === false) {
       const note = document.createElement("p"); note.className = "preview-safety-note";
@@ -3516,14 +4794,16 @@
     node.appendChild(section);
   }
 
-  function renderTaskResult(result, targetId) {
+  function renderTaskResult(result, targetId, { showIdentity = true } = {}) {
     const node = $(targetId); if (!node) return;
     clear(node); node.dataset.state = "ready";
     const response = result.tool_response || {};
+    const completedReview = completedReviewSummary(result, response);
     const header = document.createElement("div"); header.className = "result-header";
     const statusLine = document.createElement("div"); statusLine.className = "result-status-line";
     const badge = document.createElement("span"); badge.className = `status-label status-label--${statusClass(result, response)}`;
-    badge.textContent = statusLabel(response.status || result.status);
+    badge.textContent = completedReview ? (Number(completedReview.attention_required_count || 0) + Number(completedReview.blocked || 0) > 0
+      ? "复核已完成，部分记录待处理" : "复核已完成") : statusLabel(response.status || result.status);
     const title = document.createElement("strong"); title.textContent = `${result.display_label || TASK_LABELS[result.task_type] || text(result.task_type, "助理任务")} · ${text(result.steps, 0)} 步`;
     statusLine.append(badge, title);
     const meta = document.createElement("span"); meta.className = "result-meta";
@@ -3536,7 +4816,7 @@
       answer.appendChild(copy); node.appendChild(answer);
     }
     const noResults = response.status === "no_results";
-    const reasons = noResults
+    const reasons = completedReview ? [] : noResults
       ? [result.error && result.error !== "no_results" ? result.error : null].filter(Boolean)
       : [result.error, response.error_message, response.error_code && `错误码 ${response.error_code}`, response.timed_out && "工具已超时"].filter(Boolean);
     if (reasons.length) {
@@ -3547,7 +4827,7 @@
     }
 
     if (!renderExecutionStages(node, result) && result.plan?.length) renderPlan(node, result.plan);
-    if (response.data !== undefined && response.data !== null) renderResultData(node, response.data);
+    if (response.data !== undefined && response.data !== null) renderResultData(node, response.data, { showIdentity });
     renderCitations(node, response.evidence, "工具引用");
     if (result.grounded_evidence) {
       if (result.grounded_evidence.answerable === false) {
@@ -3627,7 +4907,7 @@
       const ensureRendered = () => {
         if (rendered) return;
         rendered = true;
-        renderTaskResult(result, key);
+        renderTaskResult(result, key, { showIdentity: false });
       };
       disclosure.addEventListener("toggle", () => {
         if (disclosure.open) ensureRendered();
@@ -3639,6 +4919,20 @@
     } else {
       node.appendChild(article);
     }
+    renderMessageReview(article, result);
+  }
+
+  function renderMessageReview(article, result) {
+    const summary = result?.review_summary || (isApplicationReviewTool(result?.tool_response?.tool_name)
+      ? result.tool_response.summary || result.tool_response.data?.summary || result.tool_response.data : null);
+    const old = Array.from(article.children).find(child => child.className === "message-review-summary");
+    if (!summary) { old?.remove(); return; }
+    const signature = JSON.stringify(summary);
+    if (old?.dataset.summary === signature) return;
+    old?.remove();
+    const visible = element("div", "message-review-summary"); visible.dataset.summary = signature;
+    article.appendChild(visible);
+    renderResultData(visible, { summary });
   }
 
   const CONTEXT_LABELS = {
@@ -3756,17 +5050,18 @@
   }
 
   async function refreshConversationList(options = {}) {
-    if (state.codexEnabled !== true || state.codexReady !== true) {
+    if (state.codexEnabled !== true) {
       state.codexThreadListError = codexUnavailableMessage();
       renderConversationList();
       return false;
     }
     const append = options.append === true;
+    const quiet = options.quiet === true;
     if (state.codexThreadListLoading) return false;
     const cursor = append ? state.codexThreadCursor : "";
     if (append && !cursor) return true;
     state.codexThreadListLoading = true;
-    if (!append) {
+    if (!append && !quiet) {
       state.conversations = [];
       state.codexThreadCursor = "";
       state.codexThreadListError = "";
@@ -3777,19 +5072,34 @@
         ? `/api/codex/threads?limit=20&cursor=${encodeURIComponent(cursor)}`
         : "/api/codex/threads?limit=20";
       const response = await api(path);
-      const rows = Array.isArray(response?.data)
+      const returnedRows = Array.isArray(response?.data)
         ? response.data
         : Array.isArray(response?.threads)
           ? response.threads
           : [];
-      state.conversations = append ? state.conversations.concat(rows) : rows;
+      const rows = returnedRows.filter(thread => !deletedConversationIds.has(codexThreadIdOf(thread)));
+      state.conversations = append ? state.conversations.concat(rows) : quiet
+        ? rows.concat(state.conversations.filter(thread => !deletedConversationIds.has(codexThreadIdOf(thread))
+          && !rows.some(row => codexThreadIdOf(row) === codexThreadIdOf(thread)))) : rows;
       const nextCursor = response?.next_cursor ?? response?.nextCursor;
-      state.codexThreadCursor = typeof nextCursor === "string" ? nextCursor.trim() : text(nextCursor, "").trim();
+      if (!quiet) state.codexThreadCursor = typeof nextCursor === "string" ? nextCursor.trim() : text(nextCursor, "").trim();
       state.codexThreadListError = "";
+      const selected = rows.find(thread => codexThreadIdOf(thread) === state.codexThreadId);
+      if (quiet && selected?.automation?.direct && state.codexThreadMetadata?.automation?.direct
+        && (selected.updatedAt ?? selected.updated_at) !== (state.codexThreadMetadata.updatedAt ?? state.codexThreadMetadata.updated_at)
+        && !state.activeAssistantController) {
+        const threadId = state.codexThreadId;
+        const detail = codexThreadPayload(await api(`/api/codex/threads/${encodeURIComponent(threadId)}`));
+        if (state.codexThreadId === threadId && codexThreadIdOf(detail) === threadId && detail.automation?.direct) {
+          state.codexThreadMetadata = detail;
+          state.messages = codexHistoryMessages(detail);
+          persistConversation(); renderConversation();
+        }
+      }
       return true;
     } catch (error) {
       state.codexThreadListError = error.message;
-      if (!append) state.conversations = [];
+      if (!append && !quiet) state.conversations = [];
       return false;
     } finally {
       state.codexThreadListLoading = false;
@@ -3799,11 +5109,14 @@
 
   function useEmptyCodexThread(threadId) {
     state.codexThreadId = threadId;
+    syncAssistantRun();
     state.codexThreadMetadata = null;
     state.messages = [];
     state.tasks = [];
     state.selectedTask = null;
     state.codexHistoryError = "";
+    state.codexHistoryFailure = null;
+    state.codexResumePendingThreadId = "";
     writeStorage(STORAGE_KEYS.codexThread, threadId);
     persistConversation();
     renderAssistantContext({});
@@ -3812,40 +5125,95 @@
     setAssistantStatus("新会话等待首次提问", "ok");
   }
 
+  function conversationFailure(error, threadId, phase) {
+    const code = error.code || (error.name === "AbortError" ? "history_timeout"
+      : error.name === "TypeError" ? "history_network_error" : "history_request_failed");
+    const message = code === "history_network_error" ? "无法连接本机服务，请确认软件服务已启动后重试。"
+      : code === "history_timeout" ? "会话请求超时，请重试。" : error.message;
+    return { threadId, phase, code, message, requestId: error.requestId || "" };
+  }
+
+  function renderConversationRecovery() {
+    const node = $("assistant-messages");
+    if (!node) return;
+    Array.from(node.children).filter(child => child.dataset.conversationRecovery === "true").forEach(child => child.remove());
+    const failure = state.codexHistoryFailure;
+    if (!failure) return;
+    const panel = element("div", "state-panel");
+    panel.dataset.conversationRecovery = "true";
+    panel.setAttribute("role", "status");
+    panel.appendChild(element("strong", "", failure.phase === "resume" ? "历史已显示，运行时暂未恢复" : "会话历史暂未读取成功"));
+    panel.appendChild(element("p", "", `${failure.message} 当前已显示的消息未删除。${failure.requestId ? `（诊断编号：${failure.requestId}）` : ""}`));
+    const retry = element("button", "secondary-button", failure.phase === "resume" ? "重试恢复" : "重试读取");
+    retry.type = "button";
+    retry.addEventListener("click", async () => {
+      retry.disabled = true;
+      if (failure.phase === "resume") await resumeConversationRuntime(failure.threadId);
+      else await loadConversation(failure.threadId);
+      retry.disabled = false;
+    });
+    panel.appendChild(retry);
+    node.appendChild(panel);
+  }
+
+  async function resumeConversationRuntime(threadId, requestId = state.codexHistoryRequestId) {
+    if (state.codexThreadId === threadId) state.codexResumePendingThreadId = threadId;
+    try {
+      await api(`/api/codex/threads/${encodeURIComponent(threadId)}/resume`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}),
+      });
+      if (requestId !== state.codexHistoryRequestId || state.codexThreadId !== threadId) return false;
+      state.codexResumePendingThreadId = "";
+      state.codexHistoryFailure = null;
+      state.codexHistoryError = "";
+      renderConversationRecovery();
+      setAssistantStatus("已恢复 Codex 会话", "ok");
+      return true;
+    } catch (error) {
+      if (requestId !== state.codexHistoryRequestId || state.codexThreadId !== threadId) return false;
+      state.codexResumePendingThreadId = threadId;
+      state.codexHistoryFailure = conversationFailure(error, threadId, "resume");
+      state.codexHistoryError = state.codexHistoryFailure.message;
+      renderConversationRecovery();
+      setAssistantStatus("历史已显示，运行时恢复失败，可重试", "warn");
+      return false;
+    }
+  }
+
   async function loadConversation(threadId) {
-    if (state.codexEnabled !== true || state.codexReady !== true) {
+    if (state.codexEnabled !== true) {
       setAssistantStatus("Codex 运行时不可用", "error");
       return false;
     }
     const selectedThreadId = codexThreadIdOf(threadId);
-    if (!selectedThreadId) return false;
+    if (!selectedThreadId || deletedConversationIds.has(selectedThreadId)) return false;
     const requestId = state.codexHistoryRequestId + 1;
     state.codexHistoryRequestId = requestId;
     state.codexPendingThreadId = selectedThreadId;
     state.codexHistoryLoading = true;
     state.codexHistoryError = "";
-    loading($("assistant-messages"));
-    setAssistantStatus("正在恢复 Codex 会话", "warn");
+    state.codexHistoryFailure = null;
+    // Keep cached messages visible until a complete history response is available.
+    renderConversationRecovery();
+    setAssistantStatus("正在读取 Codex 会话历史", "warn");
     renderConversationList();
     try {
       const detailResponse = await api(`/api/codex/threads/${encodeURIComponent(selectedThreadId)}`);
-      if (requestId !== state.codexHistoryRequestId) return false;
+      if (requestId !== state.codexHistoryRequestId || deletedConversationIds.has(selectedThreadId)) return false;
       const detailThread = codexThreadPayload(detailResponse);
-      if (!Array.isArray(detailThread.turns) || !detailThread.turns.length) {
+      if (codexThreadIdOf(detailThread) && codexThreadIdOf(detailThread) !== selectedThreadId) throw new Error("会话历史与请求不一致，请重试读取。");
+      if (!Array.isArray(detailThread.turns)) throw new Error("服务未返回完整会话历史，请重试读取。");
+      const hasSavedMessages = Array.isArray(detailThread.messages) && detailThread.messages.length > 0;
+      if (!detailThread.turns.length && !hasSavedMessages && state.codexThreadId === selectedThreadId && state.messages.length) {
+        throw new Error("运行时暂未找到已保存的历史，当前消息已保留，请重试读取。");
+      }
+      if (!detailThread.turns.length && !hasSavedMessages) {
         useEmptyCodexThread(selectedThreadId);
         return true;
       }
-      const resumeResponse = await api(`/api/codex/threads/${encodeURIComponent(selectedThreadId)}/resume`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (requestId !== state.codexHistoryRequestId) return false;
-      const resumedThread = codexThreadPayload(resumeResponse);
-      const historyThread = !Array.isArray(detailThread.turns) && Array.isArray(resumedThread.turns)
-        ? resumedThread
-        : detailThread;
+      const historyThread = detailThread;
       state.codexThreadId = selectedThreadId;
+      syncAssistantRun();
       state.codexThreadMetadata = historyThread;
       state.messages = codexHistoryMessages(historyThread);
       state.tasks = [];
@@ -3859,18 +5227,17 @@
       renderConversation();
       renderTaskHistory();
       renderConversationList();
-      setAssistantStatus(state.messages.length ? "已恢复 Codex 会话" : "已恢复空会话", "ok");
+      setAssistantStatus("历史已显示，正在恢复运行时", "warn");
+      // History rendering must not depend on the independent resume succeeding.
+      if (historyThread.automation?.direct || historyThread.automation?.local_only) setAssistantStatus("已读取定时任务记录", "ok");
+      else await resumeConversationRuntime(selectedThreadId, requestId);
       return true;
     } catch (error) {
       if (requestId !== state.codexHistoryRequestId) return false;
-      if (/not materialized|includeTurns is unavailable/i.test(error.message || "")) {
-        useEmptyCodexThread(selectedThreadId);
-        return true;
-      }
-      state.codexHistoryError = error.message;
-      errorState($("assistant-messages"), "会话恢复失败", error.message);
-      setAssistantStatus(`会话恢复失败：${error.message}`, "error");
-      if (!$("assistant-view")?.hidden) showToast(`会话读取失败：${error.message}`, "error");
+      state.codexHistoryFailure = conversationFailure(error, selectedThreadId, "read");
+      state.codexHistoryError = state.codexHistoryFailure.message;
+      renderConversationRecovery();
+      setAssistantStatus("会话读取失败，已保留当前消息", "warn");
       return false;
     } finally {
       if (requestId === state.codexHistoryRequestId) {
@@ -3883,7 +5250,7 @@
 
   async function loadConversationWorkspace() {
     renderCodexRuntimeStatus();
-    if (state.codexEnabled !== true || state.codexReady !== true) {
+    if (state.codexEnabled !== true) {
       renderConversationList();
       renderAssistantContext({});
       renderConversation();
@@ -3900,14 +5267,9 @@
     const currentThreadId = state.codexThreadId;
     const firstThreadId = state.conversations.length ? codexThreadIdOf(state.conversations[0]) : "";
     const targetThreadId = currentThreadId || firstThreadId;
-    const targetThread = state.conversations.find((thread) => codexThreadIdOf(thread) === targetThreadId);
-    const targetTurnCount = targetThread?.turn_count ?? targetThread?.turnCount;
-    if (targetThreadId && Number(targetTurnCount) === 0) useEmptyCodexThread(targetThreadId);
-    else if (targetThreadId) {
-      const loaded = await loadConversation(targetThreadId);
-      if (!loaded && firstThreadId && firstThreadId !== targetThreadId) {
-        await loadConversation(firstThreadId);
-      }
+    if (targetThreadId) {
+      // A stale list count (often zero) is not evidence that history is empty.
+      await loadConversation(targetThreadId);
     } else {
       state.messages = [];
       state.tasks = [];
@@ -3934,6 +5296,7 @@
       }
       visibleMessages.forEach((record) => renderMessageRecord(record, node, false));
     }
+    renderConversationRecovery();
     node.dataset.state = state.messages.length ? "ready" : "empty";
     setText("assistant-thread-label", `当前会话 · ${state.messages.length} 条`);
     if (shouldScroll) node.scrollTop = node.scrollHeight;
@@ -3976,6 +5339,7 @@
     else delete article.dataset.streaming;
     const copy = article.querySelector(".message-copy");
     if (copy) renderMarkdown(copy, body);
+    if (result !== undefined) renderMessageReview(article, result);
     const messageList = $("assistant-messages");
     if (messageList) messageList.scrollTop = messageList.scrollHeight;
   }
@@ -4016,23 +5380,56 @@
     if (state.codexEnabled === false) throw new Error(codexUnavailableMessage());
     if (state.codexEnabled !== true || state.codexReady !== true) throw new Error(codexUnavailableMessage());
     if (!state.codexThreadId) await createCodexThread();
-    const requestThreadId = state.codexThreadId;
+    let requestThreadId = state.codexThreadId;
+    const sourceThreadId = requestThreadId;
+    if (state.codexResumePendingThreadId === requestThreadId
+      && !await resumeConversationRuntime(requestThreadId)) {
+      throw new Error(state.codexHistoryError || "会话尚未恢复，请重试恢复后再发送。");
+    }
+    if (state.codexThreadId !== requestThreadId) throw new Error("会话已切换，本次请求未发送。");
+    if (assistantRuns.has(requestThreadId)) throw new Error("当前会话正在执行，请等待本轮完成。");
     const controller = new AbortController();
-    state.activeAssistantController = controller;
-    state.codexStopRequested = false;
-    state.codexTurnId = "";
     let resolveTurnReady = null;
-    state.codexTurnReady = new Promise((resolve) => { resolveTurnReady = resolve; });
+    let activeTurnId = "";
+    const run = { controller, turnId: "", stopRequested: false,
+      turnReady: new Promise((resolve) => { resolveTurnReady = resolve; }) };
+    assistantRuns.set(requestThreadId, run);
+    syncAssistantRun();
+    const ownsView = () => state.codexThreadId === requestThreadId;
+    const runEventStatus = (...args) => { if (ownsView()) setCodexEventStatus(...args); };
+    const runText = (...args) => { if (ownsView()) setText(...args); };
     const cleanupCodexRun = () => {
-      resolveTurnReady?.(state.codexTurnId || "");
-      state.codexTurnReady = null;
-      state.activeAssistantController = null;
+      resolveTurnReady?.(activeTurnId);
+      // Manual queries and automatic crawl/mail reports share this indicator.
+      // Only its owning turn may clear it, including failure and cancellation.
+      if (assistantRuns.get(requestThreadId) !== run) return;
+      assistantRuns.delete(requestThreadId);
+      if (ownsView()) syncAssistantRun();
     };
     resetCodexEventStatuses();
     setCodexEventStatus("thread", state.codexThreadId, "ok");
     setCodexEventStatus("error", "无", "");
-    const streamPath = `/api/codex/threads/${encodeURIComponent(state.codexThreadId)}/turns/stream`;
-    const eventPath = `/api/codex/threads/${encodeURIComponent(state.codexThreadId)}/events`;
+    const streamPath = `/api/codex/threads/${encodeURIComponent(requestThreadId)}/turns/stream`;
+    let eventPath = `/api/codex/threads/${encodeURIComponent(requestThreadId)}/events`;
+    const followRuntimeThread = (threadId, sourceId = sourceThreadId) => {
+      if (!threadId || threadId === requestThreadId || sourceId !== requestThreadId) return;
+      const previousThreadId = requestThreadId;
+      const selected = ownsView();
+      if (assistantRuns.get(previousThreadId) === run) {
+        assistantRuns.delete(previousThreadId);
+        assistantRuns.set(threadId, run);
+      }
+      requestThreadId = threadId;
+      eventPath = `/api/codex/threads/${encodeURIComponent(threadId)}/events`;
+      if (selected) {
+        state.codexThreadId = threadId;
+        state.codexThreadMetadata = { id: threadId, source_thread_id: previousThreadId };
+        state.codexResumePendingThreadId = "";
+        writeStorage(STORAGE_KEYS.codexThread, threadId);
+        persistConversation();
+        syncAssistantRun();
+      }
+    };
     const requestBody = jobId ? {
       body: JSON.stringify({ text: message, job_id: jobId }),
     } : { body: JSON.stringify({ text: message }) };
@@ -4053,13 +5450,18 @@
     }
     if (!response.ok || !response.body || typeof response.body.getReader !== "function") {
       let detail = `Codex 请求失败（${response.status}）`;
-      try { detail = (await response.json())?.detail || detail; } catch (_) { /* stream may not be JSON */ }
-      setCodexEventStatus("error", detail, "error");
+      try {
+        const failure = (await response.json())?.detail;
+        detail = typeof failure === "string" ? failure : failure?.message || detail;
+      } catch (_) { /* stream may not be JSON */ }
+      runEventStatus("error", detail, "error");
       cleanupCodexRun();
       throw new Error(detail);
     }
+    followRuntimeThread(response.headers?.get?.("X-RecruitOps-Thread-ID"));
 
     let streamedAnswer = "";
+    let reviewSummary = null;
     let streamError = null;
     let turnCompleted = false;
     const eventStages = [];
@@ -4068,9 +5470,8 @@
     let lastEventFingerprint = "";
     let reconnectReplayFence = false;
     let reconnectAttempts = 0;
-    let activeTurnId = "";
     const live = $("assistant-live-run");
-    live.hidden = false;
+    if (ownsView()) live.hidden = false;
 
     const pick = (...values) => values.find((value) => typeof value === "string" && value.trim())?.trim() || "";
     const objectValue = (value) => value && typeof value === "object" ? value : {};
@@ -4100,7 +5501,7 @@
       error.name = "AbortError";
       return error;
     };
-    const isCancelled = () => controller.signal.aborted || state.codexStopRequested;
+    const isCancelled = () => controller.signal.aborted || run.stopRequested;
     const eventIdOf = (event) => {
       const data = objectValue(event?.payload);
       const value = [
@@ -4172,40 +5573,58 @@
       const threadId = pick(event.thread_id, event.threadId, data.thread_id, data.threadId);
       const turnId = pick(event.turn_id, event.turnId, data.turn_id, data.turnId, kind === "turn" ? event.id : "");
       const itemId = pick(event.item_id, event.itemId, data.item_id, data.itemId, data.item?.id);
+      if (kind === "turn") followRuntimeThread(threadId, pick(event.source_thread_id, data.source_thread_id));
+      if (threadId && threadId !== requestThreadId) return;
       if (activeTurnId && turnId && turnId !== activeTurnId) return;
+      if (!activeTurnId && turnId && !["turn", "turn_started"].includes(kind)) return;
       if (turnId && !activeTurnId) activeTurnId = turnId;
       if (shouldSkipDuplicate(eventName, event)) return;
-      if (threadId) setCodexEventStatus("thread", threadId, "ok");
+      if (threadId) runEventStatus("thread", threadId, "ok");
       if (turnId) {
-        state.codexTurnId = turnId;
+        run.turnId = turnId;
+        if (ownsView()) state.codexTurnId = turnId;
         resolveTurnReady?.(turnId);
         resolveTurnReady = null;
-        setCodexEventStatus("turn", turnId, kind === "turn_completed" ? "ok" : "active");
+        runEventStatus("turn", turnId, kind === "turn_completed" ? "ok" : "active");
       }
-      if (itemId) setCodexEventStatus("item", itemId, kind === "item_completed" ? "ok" : "active");
+      if (itemId) runEventStatus("item", itemId, kind === "item_completed" ? "ok" : "active");
 
       const toolName = pick(
         data.tool_name,
         data.toolName,
+        data.tool,
         data.name,
+        data.item?.tool,
+        data.item?.tool_name,
         data.item?.name,
         data.item?.type,
       );
+      if (kind.includes("completed") && isApplicationReviewTool(toolName)) {
+        const receipt = reviewSummaryFromReceipt(toolName, data.item || data);
+        if (receipt) {
+          reviewSummary = receipt;
+          if (receipt.run_id) state.backgroundRunOwners[receipt.run_id] = requestThreadId;
+          if (streamingMessageId && state.codexThreadId === requestThreadId) {
+            updateMessage(streamingMessageId, streamedAnswer, { review_summary: reviewSummary }, true);
+          }
+        }
+      }
       if (/(?:^|__)daily_recruitment_sync$/.test(toolName) && kind.includes("completed")) {
         const runId = dailyRunIdFromReceipt(data);
         if (runId && !state.dailyNotices[runId]) {
+          state.backgroundRunOwners[runId] = requestThreadId;
           state.dailyNotices[runId] = { thread_id: requestThreadId, status: "active", observed_at: Date.now() };
           persistDailyNotices();
         }
       }
       if (toolName || /tool|mcp|command|shell|function/.test(signal)) {
-        setCodexEventStatus("tool", toolName || eventDetail(event, data), kind.includes("completed") ? "ok" : "active");
+        runEventStatus("tool", toolName || eventDetail(event, data), kind.includes("completed") ? "ok" : "active");
       }
       const progressValue = data.progress && typeof data.progress === "object"
         ? pick(data.progress.message, data.progress.status, data.progress.phase)
         : pick(data.progress, data.message, data.status, data.phase);
       if (progressValue || /progress/.test(signal)) {
-        setCodexEventStatus("progress", friendlyRuntimeProgress(progressValue || eventDetail(event, data)), "active");
+        runEventStatus("progress", friendlyRuntimeProgress(progressValue || eventDetail(event, data)), "active");
       }
 
       const phase = /tool|mcp|command|shell|function/.test(signal)
@@ -4244,8 +5663,8 @@
               ? "active"
               : "updated",
         event_type: kind,
-        thread_id: threadId || state.codexThreadId,
-        turn_id: turnId || state.codexTurnId,
+        thread_id: threadId || requestThreadId,
+        turn_id: turnId || activeTurnId,
         item_id: itemId || "",
       });
 
@@ -4253,35 +5672,35 @@
         const delta = typeof event.text === "string" ? event.text : "";
         if (delta) {
           streamedAnswer += delta;
-          if (streamingMessageId) updateMessage(streamingMessageId, streamedAnswer, undefined, true);
-          setText("assistant-live-label", "正在生成回答");
-          setText("assistant-live-detail", "正在整理结果");
+          if (streamingMessageId && ownsView()) updateMessage(streamingMessageId, streamedAnswer, undefined, true);
+          runText("assistant-live-label", "正在生成回答");
+          runText("assistant-live-detail", "正在整理结果");
         }
         return;
       }
       if (kind === "thread_started" || kind === "thread_updated") {
-        setText("assistant-live-label", "求职助理已连接");
-        setText("assistant-live-detail", "正在准备本次任务");
+        runText("assistant-live-label", "求职助理已连接");
+        runText("assistant-live-detail", "正在准备本次任务");
       } else if (kind === "turn" || kind === "turn_started") {
-        setText("assistant-live-label", "求职助理正在处理");
-        setText("assistant-live-detail", "正在分析请求");
+        runText("assistant-live-label", "求职助理正在处理");
+        runText("assistant-live-detail", "正在分析请求");
       } else if (kind === "item_started") {
-        setText("assistant-live-label", "正在执行当前步骤");
-        setText("assistant-live-detail", "请稍候");
+        runText("assistant-live-label", "正在执行当前步骤");
+        runText("assistant-live-detail", "请稍候");
       } else if (kind === "turn_completed") {
         turnCompleted = true;
-        setCodexEventStatus("progress", "已完成", "ok");
-        setText("assistant-live-label", "执行完成");
-        setText("assistant-live-detail", "正在显示结果");
+        runEventStatus("progress", "已完成", "ok");
+        runText("assistant-live-label", "执行完成");
+        runText("assistant-live-detail", "正在显示结果");
       }
       if (kind === "error" || /error|failed/.test(signal)) {
         const detail = friendlyRuntimeError(
           eventDetail(event, data, "模型运行时返回了未说明的错误。")
         );
         streamError = detail;
-        setCodexEventStatus("error", detail, "error");
-        setText("assistant-live-label", "求职助理执行失败");
-        setText("assistant-live-detail", detail);
+        runEventStatus("error", detail, "error");
+        runText("assistant-live-label", "求职助理执行失败");
+        runText("assistant-live-detail", detail);
       }
     };
 
@@ -4297,7 +5716,7 @@
       try { handleEvent(eventName, JSON.parse(dataLines.join("\n"))); }
       catch (_) {
         streamError = "Codex 返回了无法解析的流式事件。";
-        setCodexEventStatus("error", streamError, "error");
+        runEventStatus("error", streamError, "error");
       }
     };
 
@@ -4344,10 +5763,10 @@
           if (reconnectAttempts >= CODEX_STREAM_MAX_RECONNECTS) throw error;
           reconnectAttempts += 1;
           reconnectReplayFence = true;
-          setAssistantStatus(`Codex 连接中断，正在重连（${reconnectAttempts}/${CODEX_STREAM_MAX_RECONNECTS}）`, "warn");
-          setText("assistant-live-label", "Codex 流连接中断");
-          setText("assistant-live-detail", `正在重连（${reconnectAttempts}/${CODEX_STREAM_MAX_RECONNECTS}）`);
-          setCodexEventStatus("progress", `连接中断，正在重连（${reconnectAttempts}/${CODEX_STREAM_MAX_RECONNECTS}）`, "active");
+          if (ownsView()) setAssistantStatus(`Codex 连接中断，正在重连（${reconnectAttempts}/${CODEX_STREAM_MAX_RECONNECTS}）`, "warn");
+          runText("assistant-live-label", "Codex 流连接中断");
+          runText("assistant-live-detail", `正在重连（${reconnectAttempts}/${CODEX_STREAM_MAX_RECONNECTS}）`);
+          runEventStatus("progress", `连接中断，正在重连（${reconnectAttempts}/${CODEX_STREAM_MAX_RECONNECTS}）`, "active");
           const headers = {
             Accept: "text/event-stream",
             ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
@@ -4365,7 +5784,7 @@
     if (streamError) throw new Error(streamError);
     if (!turnCompleted) throw new Error("Codex 流已结束，但没有收到 turn_completed 事件。");
     const completedTask = {
-      task_id: `codex-${state.codexTurnId || Date.now()}`,
+      task_id: `codex-${activeTurnId || Date.now()}`,
       task_type: "conversation",
       user_request: message,
       status: "succeeded",
@@ -4373,10 +5792,12 @@
       answer: streamedAnswer || "Codex 未返回文本。",
       error: null,
       thread_id: requestThreadId,
-      turn_id: state.codexTurnId,
+      ...(sourceThreadId !== requestThreadId ? { source_thread_id: sourceThreadId } : {}),
+      turn_id: activeTurnId,
       stages: eventStages,
       codex_events: eventStages,
       job_id: jobId,
+      ...(reviewSummary ? { review_summary: reviewSummary } : {}),
     };
     // The user may have switched conversations while a background summary was
     // streaming. Keep its result in the original Codex thread, not this UI state.
@@ -4394,22 +5815,25 @@
   }
 
   async function stopAssistantExecution() {
+    const requestThreadId = state.codexThreadId;
+    const run = assistantRuns.get(requestThreadId);
     const controller = state.activeAssistantController;
     if (!controller) return;
     state.codexStopRequested = true;
+    if (run) run.stopRequested = true;
     controller.abort();
     setAssistantStatus("正在停止 Codex", "warn");
-    if (state.codexThreadId) {
-      if (!state.codexTurnId && state.codexTurnReady) {
+    if (requestThreadId) {
+      if (!run?.turnId && run?.turnReady) {
         await Promise.race([
-          state.codexTurnReady,
+          run.turnReady,
           new Promise((resolve) => window.setTimeout(resolve, 1000)),
         ]);
       }
-      const turnId = state.codexTurnId;
+      const turnId = run?.turnId;
       if (turnId) {
         try {
-          await api(`/api/codex/threads/${encodeURIComponent(state.codexThreadId)}/interrupt`, {
+          await api(`/api/codex/threads/${encodeURIComponent(requestThreadId)}/interrupt`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ turn_id: turnId }),
@@ -4459,8 +5883,9 @@
     if (wasActive && state.activeAssistantController) await stopAssistantExecution();
     try {
       await api(`/api/codex/threads/${encodeURIComponent(selectedThreadId)}`, { method: "DELETE" });
+      deletedConversationIds.add(selectedThreadId);
       state.conversations = state.conversations.filter((item) => codexThreadIdOf(item) !== selectedThreadId);
-      if (wasActive) {
+      if (state.codexThreadId === selectedThreadId) {
         state.codexThreadId = "";
         state.codexThreadMetadata = null;
         state.messages = [];
@@ -4471,9 +5896,11 @@
         persistConversation();
         const nextThreadId = state.conversations.length ? codexThreadIdOf(state.conversations[0]) : "";
         if (nextThreadId) await loadConversation(nextThreadId);
-        else {
+        else if (state.codexReady === true) {
           const createdThreadId = await createCodexThread();
           useEmptyCodexThread(createdThreadId);
+        } else {
+          renderAssistantContext({}); renderConversation(); renderTaskHistory();
         }
       }
       await refreshConversationList();
@@ -4526,7 +5953,7 @@
   }
 
   async function submitAssistantQuestion(message, explicitJobId = null) {
-    if (state.activeAssistantController) {
+    if (state.activeAssistantController || mailReportBusy || mailBindingBusy) {
       showToast("求职助理正在处理上一条请求，请稍候。", "info");
       return null;
     }
@@ -4546,13 +5973,7 @@
       return null;
     }
     const intent = mapIntent(normalized);
-    let previousDailyRunIds = null;
-    if (intent.taskType === "full_recruitment_sync") {
-      try {
-        const before = await api("/api/local-ui/tasks/progress", { headers: authHeaders("daily-progress") });
-        previousDailyRunIds = new Set((before?.runs || []).filter((run) => run?.task_kind === "daily").map((run) => run.run_id));
-      } catch (_) { /* An unavailable progress snapshot must not block the user's request. */ }
-    }
+    let requestThreadId = state.codexThreadId;
     const jobId = text(explicitJobId ?? $("assistant-job-id")?.value, "").trim();
     $("assistant-message").value = "";
     $("assistant-job-id").value = "";
@@ -4567,6 +5988,9 @@
     const streamingMessage = appendMessage("assistant", "", null, { streaming: true });
     try {
       const task = await runCodexAssistantQuery(normalized, jobId, streamingMessage.id);
+      if (task.source_thread_id === requestThreadId) requestThreadId = task.thread_id;
+      requestThreadId ||= task.thread_id;
+      if (state.codexThreadId !== requestThreadId) return task;
       const taskLabel = task.display_label || TASK_LABELS[task.task_type] || intent.label || "任务";
       const answer = task.error
           ? `任务未完成：${localizeCodexRuntimeMessage(task.error)}`
@@ -4574,28 +5998,33 @@
             ? text(task.answer)
             : `已完成${taskLabel}，结果和引用已记录。`;
       updateMessage(streamingMessage.id, answer, task, false);
-      await refreshDailyProgress(previousDailyRunIds ? task.thread_id || state.codexThreadId : "", previousDailyRunIds || new Set());
+      await refreshDailyProgress();
       await refreshConversationList();
+      if (state.codexThreadId !== requestThreadId || state.activeAssistantController) return task;
       try {
         state.approvals = normalizeApprovals(await api("/api/approvals"));
         renderApprovals(); renderDashboardLists(); renderDashboardTodos();
       } catch (error) {
         showToast(`审批状态刷新失败：${error.message}`, "error");
       }
+      if (state.codexThreadId !== requestThreadId || state.activeAssistantController) return task;
+      const awaitingMail = mailConfirmationThread === state.codexThreadId && mailConfirmationItems().length;
       setAssistantStatus(
         task.error
           ? `已停止：${localizeCodexRuntimeMessage(task.error)}`
-          : `已完成：${taskLabel}`,
-        task.error ? "warn" : "ok"
+          : awaitingMail ? `等待确认：${awaitingMail} 封邮件` : `已完成：${taskLabel}`,
+        task.error || awaitingMail ? "warn" : "ok"
       );
       showToast(
         task.error
           ? `任务已停止：${localizeCodexRuntimeMessage(task.error)}`
-          : `任务完成：${taskLabel}`,
-        task.error ? "error" : "success"
+          : awaitingMail ? "请在弹窗中选择对应投递，确认后继续处理" : `任务完成：${taskLabel}`,
+        task.error ? "error" : awaitingMail ? "info" : "success"
       );
       return task;
     } catch (error) {
+      if (state.codexThreadMetadata?.source_thread_id === requestThreadId) requestThreadId = state.codexThreadId;
+      if (requestThreadId && state.codexThreadId !== requestThreadId) return null;
       if (error.name === "AbortError") {
         const stopped = "已按你的要求停止本次执行。服务端会保留停止前已经完成的步骤。";
         if (streamingMessage) updateMessage(streamingMessage.id, stopped, null, false);
@@ -4614,12 +6043,9 @@
       showToast(localizedError, "error");
       return null;
     } finally {
-      state.activeAssistantController = null;
-      state.codexStopRequested = false;
-      $("run-task-button").disabled = false;
-      $("assistant-stop-button").hidden = true;
-      $("assistant-live-run").hidden = true;
+      if (!requestThreadId || state.codexThreadId === requestThreadId) syncAssistantRun();
       await refreshAssistantBusinessData();
+      if (!requestThreadId || state.codexThreadId === requestThreadId) await refreshMailConfirmations({ autoOpen: true });
     }
   }
 
@@ -4627,7 +6053,7 @@
     // A failed or interrupted turn may already have committed business changes.
     // Refresh data only: keep conversation, filters, pagination and navigation intact.
     await Promise.allSettled([
-      loadApplications(), loadFullSchedule(), loadAutomations(),
+      loadApplications(), loadApplicationIdentityQueue(), loadFullSchedule(), loadAutomations(),
       loadRecruitmentMails({ showLoading: false }),
       loadJobBrowser({ refreshFeatured: true }),
       api("/api/approvals").then((approvals) => {
@@ -4692,7 +6118,7 @@
         state.operationalReport = report; renderDashboardLists(); renderDashboardTodos();
         setText("metric-anomalies", report?.counts?.crawler_issues ?? 0); setText("metric-anomalies-detail", "运营报告异常");
       }), ["today-anomalies"]),
-      loadApplications(), loadFullSchedule(), loadAutomations(),
+      loadApplications(), loadApplicationIdentityQueue(), loadFullSchedule(), loadAutomations(),
     ]);
     setText("today-label", today); setText("last-sync-label", `读取于 ${new Date().toLocaleTimeString()}`);
   }
@@ -4785,7 +6211,7 @@
     $("sidebar")?.classList.remove("is-open"); $("mobile-menu-button")?.setAttribute("aria-expanded", "false");
     if (changed) window.scrollTo(0, viewScroll.get(view) || 0);
     if (changed && view === "schedule") void loadFullSchedule();
-    if (changed && view === "applications") void loadApplications();
+    if (changed && view === "applications") { void loadApplications({ useCache: true }); void loadApplicationIdentityQueue(); }
     if (view === "assistant") void refreshDailyProgress();
   }
 
@@ -4932,6 +6358,8 @@
       }
       const automationButton = event.target.closest("[data-automation-disable]");
       if (automationButton) { event.preventDefault(); void disableAutomation(automationButton.dataset.automationDisable); return; }
+      const automationDeleteButton = event.target.closest("[data-automation-delete]");
+      if (automationDeleteButton) { event.preventDefault(); void deleteAutomation(automationDeleteButton.dataset.automationDelete); return; }
       const automationDetailButton = event.target.closest("[data-automation-detail]");
       if (automationDetailButton) {
         event.preventDefault();
@@ -4957,6 +6385,11 @@
     $("jobs-back-button").addEventListener("click", () => void returnToJobBrowseLocation());
     $("refresh-button").addEventListener("click", loadCore);
     const createDialog = $("application-create-dialog");
+    const editDialog = $("application-edit-dialog");
+    const editorBusy = () => Boolean(editDialog?.querySelector("button:disabled"));
+    $("application-edit-close")?.addEventListener("click", () => { if (!editorBusy()) editDialog.close(); });
+    editDialog?.addEventListener("cancel", event => { if (editorBusy()) event.preventDefault(); });
+    editDialog?.addEventListener("close", () => clear($("application-edit-body")));
     const createForm = $("application-create-form");
     const createSubmit = $("application-create-submit");
     const createError = $("application-create-error");
@@ -4964,6 +6397,9 @@
       createForm.elements.stage.add(new Option(label, value));
     });
     $("application-add-button").addEventListener("click", () => openManualApplicationDraft());
+    $("application-identity-queue-button").addEventListener("click", () => void openApplicationIdentityQueue());
+    $("application-identity-queue-close").addEventListener("click", () => { $("application-identity-queue-panel").hidden = true; });
+    $("application-identity-queue-refresh").addEventListener("click", () => void loadApplicationIdentityQueue({ force: true }));
     // Only the isolated workbench preload supplies this one-way subscription.
     // Remote pages have no preload; never listen for cross-window messages.
     if (typeof window.recruitopsDesktop?.onApplicationDraft === "function") {
@@ -5008,6 +6444,7 @@
       button.disabled = true;
       button.setAttribute("aria-busy", "true");
       try {
+        void loadApplicationIdentityQueue({ force: true });
         if (await loadApplications()) showToast("投递记录已刷新", "success");
       } finally {
         button.disabled = false;
@@ -5131,6 +6568,12 @@
       if (event.target === $("schedule-editor-dialog")) closeScheduleEditor();
     });
     $("job-detail-close").addEventListener("click", () => $("job-detail-dialog").close());
+    const mailDialog = $("mail-binding-dialog");
+    $("mail-binding-close")?.addEventListener("click", () => { if (!mailBindingBusy) mailDialog.close(); });
+    mailDialog?.addEventListener("cancel", event => { if (mailBindingBusy) event.preventDefault(); });
+    mailDialog?.addEventListener("close", () => { mailBindingSequence += 1; });
+    $("review-results-close")?.addEventListener("click", () => $("review-results-dialog").close());
+    $("application-review-results-button")?.addEventListener("click", () => void openReviewResults());
     $("job-detail-dialog").addEventListener("click", (event) => {
       if (event.target === $("job-detail-dialog")) $("job-detail-dialog").close();
     });
@@ -5159,6 +6602,7 @@
     safeScheduleHref,
     updateScheduleStatus,
     openScheduleEditor,
+    submitScheduleForm,
     openRecruitmentMail,
     renderAutomations,
     openAutomationDetail,
@@ -5166,17 +6610,36 @@
     scheduleFormPayload,
     renderApplications,
     loadApplications,
+    applicationProgressChannel,
+    setApplicationChannel,
+    renderResultData,
+    renderTaskResult,
+    reviewStateLabel,
     applicationBrowseQuery,
     loadJobBrowser,
     openMailBinding,
     confirmMailBinding,
     renderMailBindingApprovals,
+    refreshMailConfirmations,
+    reportConfirmedMailRun,
+    openReviewResults,
+    applicationIdentityCard,
+    openApplicationIdentityBinding,
+    loadApplicationIdentityQueue,
+    renderApplicationIdentityQueue,
+    openApplicationIdentityQueue,
+    renderApprovals,
+    reviewReasonLabel,
     controlBackgroundTask,
     loadCore,
     loadFullSchedule,
     normalizeApplicationDraft,
     syncRecruitmentMails,
+    retryRecruitmentMailAnalysis,
     runCodexAssistantQuery,
+    loadConversation,
+    loadConversationWorkspace,
+    resumeConversationRuntime,
     codexHistoryMessages,
     stopAssistantExecution,
     submitAssistantQuestion,
@@ -5184,6 +6647,7 @@
     friendlyRuntimeProgress,
     renderDailyProgress,
     refreshDailyProgress,
+    refreshConversationList,
     deleteConversation,
     state,
   };
@@ -5197,5 +6661,6 @@
     } catch (_) { /* Start at jobs when storage is unavailable. */ }
     bind(); switchView(initialView); updateIntentHint(); renderConversation(); renderTaskHistory(); renderDashboardTodos(); loadCore();
     window.setInterval(() => { if (activeView === "assistant" || hasPendingDailyNotices()) void refreshDailyProgress(); }, 5000);
+    window.setInterval(() => { if (activeView === "assistant") void refreshConversationList({ quiet: true }); }, 5000);
   }
 })();

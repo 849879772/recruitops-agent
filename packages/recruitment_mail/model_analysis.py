@@ -14,7 +14,7 @@ from typing import Annotated, Final, Protocol, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field
 
 
-MAIL_ANALYSIS_VERSION: Final[str] = "recruitops.mail_analysis.v3"
+MAIL_ANALYSIS_VERSION: Final[str] = "recruitops.mail_analysis.v4"
 
 MAX_RECORD_ID_LENGTH: Final[int] = 128
 MAX_DIGEST_LENGTH: Final[int] = 64

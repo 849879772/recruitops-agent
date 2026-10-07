@@ -17,6 +17,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from packages.domain.models import TaskRun, TaskStatus
+from packages.domain.crawl_outcome import crawl_completion_gaps
 from packages.pipeline.daily import PipelineInterrupted
 
 
@@ -127,6 +128,8 @@ def _summary_metrics(value: Any) -> dict[str, Any]:
         "inactive_count",
         "restored_count",
         "issue_count",
+        "new", "changed", "reused", "failed_companies", "failed_jobs",
+        "scored", "scoring_failed", "unscored",
     )
     return {
         key: payload[key]
@@ -272,10 +275,13 @@ class DailyRecruitmentSync:
         try:
             pipeline_output = self.crawl(dry_run)
             outputs[DailySyncStage.CRAWL] = pipeline_output
+            gaps = crawl_completion_gaps(_json_safe(pipeline_output))
+            if gaps:
+                warnings.append("；".join(gaps) + "；已保留可用成果，不能视为全量完成")
             emit(
                 DailySyncStage.CRAWL,
-                StageStatus.SUCCEEDED,
-                "批量抓取与增量分析完成",
+                StageStatus.PARTIAL if gaps else StageStatus.SUCCEEDED,
+                "批量抓取与增量分析部分完成" if gaps else "批量抓取与增量分析完成",
                 value=pipeline_output,
             )
         except PipelineInterrupted as exc:

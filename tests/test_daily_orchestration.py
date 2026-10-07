@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from packages.orchestration import DailyRecruitmentSync, DailySyncStage, DailySyncStatus
 from packages.pipeline.daily import PipelineInterrupted
 
@@ -111,3 +113,47 @@ def test_dry_run_propagates_to_crawl_and_offline_reconciliation() -> None:
 
     assert result.dry_run is True
     assert observed == [("crawl", True), ("offline", True)]
+
+
+@pytest.mark.parametrize("payload", [
+    {"failed_jobs": 1239},
+    {"failed_companies": 335},
+    {"scoring_failed": 1},
+    {"companies": [{"status": "partial", "list_complete": False}]},
+    {"companies": [{"status": "completed", "detail_failure_count": 1}]},
+    {"job_write_statistics": {"new_pending_count": 9}},
+    {"status": "completed", "failed": 1},
+    {"failed_companies": 0, "failed_jobs": 0, "companies": [{
+        "status": "partial", "list_complete": True, "detail_failure_count": 0,
+        "failure_reason": "detail_capture_failed",
+    }]},
+])
+def test_crawl_business_gaps_degrade_terminal_status_without_discarding_results(payload):
+    calls = []
+    result = DailyRecruitmentSync(
+        crawl=lambda _dry_run: payload,
+        offline_reconcile=lambda *_args: calls.append("safe_company_reconcile") or {},
+        report=lambda *_args: calls.append("report") or {},
+    ).run()
+    assert result.status is DailySyncStatus.DEGRADED
+    assert result.pipeline == payload
+    assert result.warnings
+    assert calls == ["safe_company_reconcile", "report"]
+    crawl = [event for event in result.stages if event.stage is DailySyncStage.CRAWL][-1]
+    assert crawl.status.value == "partial"
+
+
+def test_filtering_reuse_and_disabled_analysis_do_not_mean_incomplete():
+    result = DailyRecruitmentSync(crawl=lambda _: {
+        "reused": 15000, "filtered": 70000, "rejected": 20,
+        "failed_jobs": 0, "failed_companies": 0, "analysis_enabled": False, "unscored": 15,
+        "companies": [{"status": "completed", "list_complete": True}],
+    }).run()
+    assert result.status is DailySyncStatus.SUCCEEDED
+
+
+def test_dry_run_predicted_pending_records_are_not_actual_failures():
+    result = DailyRecruitmentSync(crawl=lambda _: {
+        "dry_run": True, "job_write_statistics": {"new_pending_count": 9},
+    }).run(dry_run=True)
+    assert result.status is DailySyncStatus.SUCCEEDED

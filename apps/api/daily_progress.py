@@ -8,7 +8,8 @@ import os
 from sqlalchemy import or_, select
 
 from packages.scheduler.runner import _business_failure, _business_paused
-from packages.storage import AgentStateStore, Storage, TaskRun, ToolCall
+from packages.storage import AgentStateStore, AutomationExecution, ConversationThread, Storage, TaskRun, ToolCall
+from packages.storage.task_identity import task_identity
 
 
 _TASK_TYPES = ("daily_recruitment_intelligence", "daily_recruitment_sync")
@@ -47,19 +48,22 @@ def _daily_resume_available(record: Mapping) -> bool:
                 or value(sections, "checkpoint_ref", "checkpoint_path", "checkpoint_snapshot"))
 
 
-def latest_daily_progress(storage: Storage) -> dict[str, object]:
+def latest_daily_progress(storage: Storage, thread_id: str | None = None) -> dict[str, object]:
     with storage.session() as session:
-        rows = list(session.scalars(
-            select(TaskRun).where(TaskRun.task_type.in_(_TASK_TYPES))
-            .order_by(TaskRun.created_at.desc(), TaskRun.updated_at.desc()).limit(20)
-        ))
-    if not rows:
+        statement = select(TaskRun).where(TaskRun.task_type.in_(_TASK_TYPES))
+        if thread_id:
+            owned = select(ToolCall.task_id).where(ToolCall.arguments["metadata"]["thread_id"].as_string() == thread_id)
+            automated = select(AutomationExecution.id).where(AutomationExecution.thread_id == thread_id)
+            statement = statement.where(or_(TaskRun.id.in_(owned), TaskRun.id.in_(automated)))
+        rows = list(session.scalars(statement.order_by(TaskRun.created_at.desc(), TaskRun.updated_at.desc()).limit(20)))
+    values = [_daily_projection(storage, row) for row in rows]
+    values = [value for value in values if value and (not thread_id or value["thread_id"] == thread_id)]
+    if not values:
         return {"run": None}
-    row = next((item for item in rows if item.status == "running"), rows[0])
-    return {"run": _daily_projection(storage, row)}
+    return {"run": next((value for value in values if value["status"] == "running"), values[0])}
 
 
-def _daily_projection(storage, row):
+def _daily_projection(storage, row, control=None):
     record = AgentStateStore(storage).get_task_run(row.id)
     if record is None:
         return None
@@ -93,9 +97,40 @@ def _daily_projection(storage, row):
                 value = raw_progress.get(field)
                 if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000_000:
                     progress[field] = value
-    metadata = record.get("metadata") or {}
+    if control is None:
+        from packages.tools.task_runtime_control import CONTROL_TOOL
+        with storage.session() as session:
+            receipt = session.scalar(select(ToolCall).where(ToolCall.task_id == row.id, ToolCall.tool_name == CONTROL_TOOL))
+            control = receipt.arguments if receipt and isinstance(receipt.arguments, Mapping) else {}
+    saved_metadata = record.get("metadata")
+    control_metadata = control.get("metadata") if isinstance(control, Mapping) else None
+    metadata = {**(saved_metadata if isinstance(saved_metadata, Mapping) else {}),
+                **(control_metadata if isinstance(control_metadata, Mapping) else {})}
+    ownership = task_identity(row.id, metadata, task_id=row.task_type)
+    automation = None
+    # Direct scheduled executions use the same durable execution/run id. This
+    # exact link repairs older state envelopes without guessing a UI owner.
+    if row.id.startswith("automation-run-") or metadata.get("automation_execution_id") == row.id:
+        with storage.session() as session:
+            execution = session.get(AutomationExecution, row.id)
+            if execution:
+                if status in {"accepted", "running"} and execution.status != "running":
+                    status = "success" if execution.status == "succeeded" else "failed"
+                if ownership["thread_id"] is None:
+                    ownership["thread_id"] = execution.thread_id
+                    ownership["turn_id"] = execution.turn_id
+                thread = session.get(ConversationThread, execution.thread_id) if execution.thread_id else None
+                context = thread.context if thread and isinstance(thread.context, Mapping) else {}
+                saved = context.get("automation")
+                if (isinstance(saved, Mapping) and saved.get("direct") is True
+                        and saved.get("run_id") == execution.id and ownership["thread_id"] == execution.thread_id):
+                    automation = {"direct": True, "execution_id": execution.id, "run_id": execution.id,
+                                  "schedule_id": execution.schedule_id, "task_id": ownership["task_id"]}
     mode = metadata.get("requested_mode") if isinstance(metadata, Mapping) else None
     return {
+        **ownership,
+        "automation": automation,
+        "report_persisted": bool(automation),
         "status": status,
         "mode": mode if mode in {"full", "crawl_only", "score_only", "resume"} else "full",
         "phase": phase,
@@ -117,7 +152,7 @@ def task_progress(storage: Storage, run_id: str | None = None, thread_id: str | 
     from packages.tools.task_runtime_control import ACTIVE_STATUSES, CONTROL_TOOL, RECOVERABLE_STATUSES
     from packages.recruitment_mail.run_service import project_mail_progress
 
-    visible_statuses = ACTIVE_STATUSES | {"awaiting_continuation"} | ({"stopped", "paused", "failed", "timed_out", "interrupted"} if include_recoverable else set())
+    visible_statuses = ACTIVE_STATUSES | {"awaiting_continuation", "awaiting_confirmation"} | ({"stopped", "paused", "failed", "timed_out", "interrupted"} if include_recoverable else set())
     runs = []
     with storage.session() as session:
         statement = select(TaskRun).where(TaskRun.task_type.in_(_TASK_TYPES))
@@ -138,13 +173,12 @@ def task_progress(storage: Storage, run_id: str | None = None, thread_id: str | 
             )
         } if rows else {}
     for row in rows:
-        value = _daily_projection(storage, row)
+        control = controls.get(row.id, {})
+        value = _daily_projection(storage, row, control)
         if value is None:
             continue
-        control = controls.get(row.id, {})
         record = AgentStateStore(storage).get_task_run(row.id) or {}
-        metadata = {**(record.get("metadata") or {}), **(control.get("metadata") or {})}
-        if thread_id and metadata.get("thread_id") != thread_id:
+        if thread_id and value["thread_id"] != thread_id:
             continue
         previous_boot = control.get("desktop_run_id")
         current_boot = os.environ.get("RECRUITOPS_DESKTOP_RUN_ID", "")
@@ -168,7 +202,7 @@ def task_progress(storage: Storage, run_id: str | None = None, thread_id: str | 
         fallback_key = "confirmed_complete" if stage == "companies" else "run_completed"
         completed = progress.get(complete_key, progress.get(fallback_key, 0))
         total = progress.get(total_key, progress.get("run_total", 0))
-        value.update(run_id=row.id, task_kind="daily", thread_id=metadata.get("thread_id"),
+        value.update(task_kind="daily",
                      completed=completed, total=total, unit=unit, phase=stage,
                      failed=progress.get("retry_pending", 0), blocked=0,
                      can_pause=bool(control) and value["status"] in {"accepted", "running"},
@@ -178,14 +212,18 @@ def task_progress(storage: Storage, run_id: str | None = None, thread_id: str | 
         runs.append(value)
     for summary in review_runs(storage, run_id=run_id, thread_id=thread_id, statuses=visible_statuses):
         runs.append({
-            "run_id": summary["run_id"], "task_kind": "application_review", "thread_id": summary["thread_id"],
+            **task_identity(summary["run_id"], summary, task_id="application_status_review"),
+            "task_kind": "application_review",
             "status": summary["run_status"], "phase": "application_review",
             "completed": summary["completed_count"], "total": summary["scope_total"], "unit": "条记录",
             "processed": summary["processed_count"], "verified": summary["verification_success_count"],
             "failed": summary["failed"], "blocked": summary["blocked"], "unresolved": summary["unresolved"],
+            "retained": summary.get("retained_count", 0),
+            "attention_required": summary.get("attention_required_count", summary["unresolved"]),
             "remaining": summary["remaining_count"], "database_total": summary["database_total"],
             "retry_pending": summary["retryable_count"],
             "excluded_terminal": summary["excluded_terminal"], "updated_at": summary["updated_at"],
+            "excluded_mail_only": summary.get("excluded_mail_only", 0),
             **{key: summary[key] for key in ("can_pause", "can_resume", "can_cancel")},
         })
     runs.extend(project_mail_progress(storage, run_id=run_id, thread_id=thread_id,

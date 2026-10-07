@@ -208,10 +208,10 @@ def test_mcp_tool_surface_is_current_and_explicitly_classified() -> None:
         definition.name for definition in TOOL_DEFINITIONS if not definition.read_only
     }
 
-    assert MCP_TOOL_PROTOCOL_VERSION == "25"
-    assert len(MCP_TOOL_NAMES) == 47
-    assert len(MCP_READ_ONLY_TOOL_NAMES) == 28
-    assert len(MCP_ACTION_TOOL_NAMES) == 19
+    assert MCP_TOOL_PROTOCOL_VERSION == "29"
+    assert len(MCP_TOOL_NAMES) == 51
+    assert len(MCP_READ_ONLY_TOOL_NAMES) == 30
+    assert len(MCP_ACTION_TOOL_NAMES) == 21
     assert set(MCP_TOOL_NAMES) == definition_names
     assert set(MCP_READ_ONLY_TOOL_NAMES) == definition_read_only
     assert set(MCP_ACTION_TOOL_NAMES) == definition_actions

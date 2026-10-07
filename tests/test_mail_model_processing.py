@@ -81,6 +81,30 @@ def test_model_dji_overrides_wrong_legacy_extraction_and_second_run_skips():
     assert client.calls == 2
 
 
+def test_mail_process_updates_stage_without_sender_authentication_metadata():
+    from packages.recruitment_mail.storage import RecruitmentMailRecord
+
+    store, repo, record, settings, triage, proposal = setup_case("written_test")
+    store.update_source_metadata(record.id, {"authentication_results": []})
+    with store.storage.write_transaction() as session:
+        saved = session.get(RecruitmentMailRecord, record.id)
+        metadata = dict(saved.raw_metadata)
+        metadata["model_processing"] = {
+            "digest": record.content_digest,
+            "version": "recruitops.mail_analysis.v3",
+            "state": "needs_auth_metadata",
+            "inputs": "previous-run",
+        }
+        saved.raw_metadata = metadata
+        saved.processing_status = "needs_auth_metadata"
+    result = process_pending_mail(store, repo, settings, client=Client([triage, proposal]))
+
+    assert result["updated"] == 1
+    assert store.get(record.id).processing_status == "processed_updated"
+    with store.storage.session() as session:
+        assert session.get(ApplicationSnapshot, "4").stage == "written"
+
+
 @pytest.mark.parametrize("state", ["processed_updated", "processed_unchanged", "processed", "irrelevant", "ignored"])
 def test_completed_mail_resync_preserves_mark_and_never_reanalyzes(state):
     from packages.recruitment_mail.processing import _eligible

@@ -2,23 +2,29 @@ import { createHmac, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { OwnedRuntime } from './runtime-client';
-import { ReviewObservationError } from './review-readiness';
+import { ReviewObservationError, reviewDiagnosticSummary, reviewNavigationDiagnostics } from './review-readiness';
+import type { ReviewDiagnosticCallback, ReviewDiagnosticSummary, ReviewNavigationDiagnostics } from './review-readiness';
+import type { ReviewReuseContext } from './review-page-cache';
 const WebSocket = require('ws');
 type RecordValue = Record<string, any>;
 const identifier = (value: unknown): value is string => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(value);
 
 export const REVIEW_OPERATION_BUDGET_MS = 38000;
+export const REVIEW_VISION_BUDGET_MS = 70000;
 export const REVIEW_QUEUE_WAIT_MS = 8000;
+export const REVIEW_MAX_ACTIVE = 6;
 const MAX_SEEN_OPERATION_IDS = 4096;
 export type ReviewStage = 'EXTRACTING' | 'WAITING_FOR_CONTENT' | 'VALIDATING' | 'WAITING_FOR_LOGIN' | 'STATE_UNCLEAR';
 type ReviewCallback = (url: string, operationId: string, ids: string[], signal: AbortSignal, deadline: number,
-  onStage?: (stage: ReviewStage) => void) => Promise<unknown>;
+  onStage?: (stage: ReviewStage) => void, onDiagnostic?: ReviewDiagnosticCallback, includeVision?: boolean,
+  reuse?: ReviewReuseContext) => Promise<unknown>;
 interface BridgeOptions {
   maxActive?: number;
   maxQueued?: number;
   queueWaitMs?: number;
   operationBudgetMs?: number;
   socketFactory?: (target: string, options: RecordValue) => any;
+  onReviewInvalidated?: (operationId?: string) => void;
 }
 interface ReviewTask {
   id: string;
@@ -26,6 +32,8 @@ interface ReviewTask {
   controller: AbortController;
   url: string;
   ids: string[];
+  includeVision: boolean;
+  reuse: ReviewReuseContext;
   dispatchedAt: number;
   deadline: number;
   startedAt?: number;
@@ -33,17 +41,22 @@ interface ReviewTask {
   stage: string;
   queueTimer?: NodeJS.Timeout;
   operationTimer?: NodeJS.Timeout;
+  lastObservation?: ReviewDiagnosticSummary;
+  navigation?: ReviewNavigationDiagnostics;
 }
 
 const SAFE_REVIEW_ERROR_CODES = new Set([
   'ACTION_NOT_ALLOWED', 'COMMAND_INVALID', 'DESKTOP_ADAPTER_UNAVAILABLE', 'DESKTOP_BROWSER_UNAVAILABLE',
   'DESKTOP_INVALID_BINDING', 'DESKTOP_LOAD_FAILED', 'DESKTOP_LOAD_TIMEOUT', 'DESKTOP_MANUAL_CAPTURE_UNAVAILABLE',
   'DESKTOP_NAVIGATION_CHANGED', 'DESKTOP_OBSERVATION_FAILED', 'DESKTOP_OBSERVATION_TIMEOUT',
+  'DESKTOP_ACCOUNT_CHANGED',
   'DESKTOP_PAGE_LOADING', 'DESKTOP_PAYLOAD_LIMIT', 'DESKTOP_READINESS_TIMEOUT', 'DESKTOP_REVIEW_BUSY',
   'DESKTOP_REVIEW_CANCELLED', 'DESKTOP_REVIEW_DISCONNECTED', 'DESKTOP_REVIEW_QUEUE_FULL',
   'DESKTOP_REVIEW_HISTORY_FULL', 'DESKTOP_REVIEW_QUEUE_TIMEOUT', 'DESKTOP_REVIEW_RESULT_EXPIRED',
   'DESKTOP_REVIEW_TIMEOUT', 'FRAME_EVIDENCE_UNAVAILABLE', 'FRAME_NOT_ALLOWED',
-  'LOGIN_REQUIRED', 'SOURCE_NOT_ALLOWED', 'STATE_UNCLEAR', 'CAPTCHA_REQUIRED'
+  'LOGIN_REQUIRED', 'SOURCE_NOT_ALLOWED', 'STATE_UNCLEAR', 'CAPTCHA_REQUIRED',
+  'FRAME_SCOPE_DENIED', 'APPLICATION_PAGE_UNAVAILABLE', 'UNPARSED_APPLICATION_PAGE', 'AUTHENTICATION_RECOVERY_TIMEOUT',
+  'APPLICATION_RECORD_ENTRY_NOT_ENTERED', 'APPLICATION_RECORD_HOME_REDIRECT'
 ]);
 const BROWSER_ERROR_CODES: Record<string, string> = {
   browser_adapter_unavailable: 'DESKTOP_ADAPTER_UNAVAILABLE',
@@ -52,11 +65,13 @@ const BROWSER_ERROR_CODES: Record<string, string> = {
   browser_load_failed: 'DESKTOP_LOAD_FAILED',
   browser_load_timeout: 'DESKTOP_LOAD_TIMEOUT',
   browser_navigation_changed: 'DESKTOP_NAVIGATION_CHANGED',
+  browser_account_changed: 'DESKTOP_ACCOUNT_CHANGED',
   browser_observation_timeout: 'DESKTOP_OBSERVATION_TIMEOUT',
   browser_page_loading: 'DESKTOP_PAGE_LOADING',
   browser_payload_limit: 'DESKTOP_PAYLOAD_LIMIT',
   browser_readiness_timeout: 'DESKTOP_READINESS_TIMEOUT',
   browser_unavailable_or_busy: 'DESKTOP_BROWSER_UNAVAILABLE',
+  authentication_recovery_timeout: 'AUTHENTICATION_RECOVERY_TIMEOUT',
   manual_capture_unavailable: 'DESKTOP_MANUAL_CAPTURE_UNAVAILABLE'
 };
 
@@ -92,7 +107,14 @@ export function reviewCommand(message: RecordValue) {
       !Array.isArray(command.application_ids) || command.application_ids.length < 1 || command.application_ids.length > 100 ||
       !command.application_ids.every(identifier) || new Set(command.application_ids).size !== command.application_ids.length ||
       !command.application_ids.includes(command.application_id)) throw new Error('COMMAND_INVALID');
-  return { url: command.page_url as string, ids: command.application_ids as string[] };
+  const includeVision = command.params?.include_vision === true;
+  if (includeVision && (payload.operation !== 'observe_application_status_page'
+      || command.params?.vision_fallback_reason !== 'no_structured_evidence_visible_status_likely')) throw new Error('COMMAND_INVALID');
+  const reuseId = command.params?.reuse_observation_operation_id;
+  const reviewTaskId = command.params?.review_task_id;
+  return { url: command.page_url as string, ids: command.application_ids as string[], includeVision,
+    ...(includeVision && identifier(reuseId) && reuseId !== message.operation_id ? {reuseObservationOperationId: reuseId} : {}),
+    ...(identifier(reviewTaskId) ? {reviewTaskId} : {}) };
 }
 
 export class DesktopBridge {
@@ -134,6 +156,7 @@ export class DesktopBridge {
       this.socket = undefined; this.authenticated = false;
       clearTimeout(this.timeout); clearInterval(this.heartbeat);
       this.clearSocketTasks(socket, 'DESKTOP_REVIEW_DISCONNECTED');
+      this.options.onReviewInvalidated?.();
       this.status = 'disconnected'; this.changed();
       if (!this.stopped && this.runtime.origin) this.retry = setTimeout(() => this.connect(), Math.min(30000, 1000 * 2 ** Math.min(this.attempts++, 5)));
     });
@@ -163,6 +186,7 @@ export class DesktopBridge {
     if (message.device_id !== this.deviceId || !identifier(message.operation_id) || !Number.isSafeInteger(message.sequence) || message.sequence <= 0) throw new Error('ownership');
     const id = message.operation_id;
     if (message.type === 'operation.cancel') {
+      this.options.onReviewInvalidated?.(id);
       const task = this.operations.get(id);
       if (task) this.finishTask(task, null, false, true);
       else if (!this.completed.has(id)) {
@@ -183,10 +207,13 @@ export class DesktopBridge {
     catch (error) { this.completeRejected(id, error); return; }
     const task: ReviewTask = {
       id, socket: this.socket, controller: new AbortController(), url: command.url, ids: command.ids,
-      dispatchedAt: Date.now(), deadline: Date.now() + (this.options.operationBudgetMs ?? REVIEW_OPERATION_BUDGET_MS),
+      includeVision: command.includeVision,
+      reuse: {reviewTaskId: command.reviewTaskId, reuseObservationOperationId: command.reuseObservationOperationId,
+        retainForVisionReuse: !command.includeVision && message.payload.operation === 'observe_application_status_page'},
+      dispatchedAt: Date.now(), deadline: Date.now() + (this.options.operationBudgetMs ?? (command.includeVision ? REVIEW_VISION_BUDGET_MS : REVIEW_OPERATION_BUDGET_MS)),
       state: 'queued', stage: 'QUEUED'
     };
-    if (this.active < (this.options.maxActive ?? 4)) {
+    if (this.active < (this.options.maxActive ?? REVIEW_MAX_ACTIVE)) {
       task.state = 'running'; this.operations.set(id, task); this.runTask(task); return;
     }
     if (this.queue.length >= (this.options.maxQueued ?? 10)) {
@@ -222,9 +249,14 @@ export class DesktopBridge {
   }
 
   private failure(task: ReviewTask, code: string, error?: unknown): RecordValue {
-    return { type: 'result', operation_id: task.id, event_id: `desktop-result-${randomUUID()}`, status: 'FAILED',
+    const lastObservation = error instanceof ReviewObservationError ? error.lastObservation : task.lastObservation;
+    const navigation = error instanceof ReviewObservationError ? error.navigation || task.navigation : task.navigation;
+    return { type: 'result', operation_id: task.id, event_id: `desktop-result-${randomUUID()}`, status: code === 'LOGIN_REQUIRED' ? 'STATE_UNCLEAR' : 'FAILED',
       error_code: safeReviewErrorCode(code), result: { evidence_only: true, database_updated: false, stage: task.stage, ...this.timing(task),
-        ...(error instanceof ReviewObservationError ? {last_observation: error.lastObservation} : {}) } };
+        ...(code === 'LOGIN_REQUIRED' ? {requires_user_action: true, pause: {reason: 'login_required'},
+          ...(navigation?.authNavigation ? {auth_navigation: navigation.authNavigation} : {})} : {}),
+        ...(lastObservation ? {last_observation: lastObservation} : {}),
+        ...(navigation ? {navigation_diagnostics: navigation} : {}) } };
   }
 
   private completeRejected(id: string, error: unknown, remember = true) {
@@ -246,14 +278,14 @@ export class DesktopBridge {
 
   private finishTask(task: ReviewTask, result: RecordValue | null, send: boolean, abort: boolean) {
     if (!this.release(task)) return;
-    if (abort) task.controller.abort();
+    if (abort) { task.controller.abort(); this.options.onReviewInvalidated?.(task.id); }
     this.remember(task.id, result);
     if (send && result && !this.stopped && task.socket === this.socket) this.send(result, task.socket);
     this.pump();
   }
 
   private pump() {
-    while (!this.stopped && this.active < (this.options.maxActive ?? 4) && this.queue.length) {
+    while (!this.stopped && this.active < (this.options.maxActive ?? REVIEW_MAX_ACTIVE) && this.queue.length) {
       const id = this.queue.shift()!;
       const task = this.operations.get(id);
       if (!task || task.state !== 'queued') continue;
@@ -275,11 +307,18 @@ export class DesktopBridge {
           // the result envelope so it can carry the evidence/error payload.
           const status = stage === 'WAITING_FOR_CONTENT' || stage === 'STATE_UNCLEAR' ? 'EXTRACTING' : stage;
           this.progress(task, status, stage);
-        });
+        }, (summary, navigation) => {
+          if (this.operations.get(task.id) !== task) return;
+          task.lastObservation = summary;
+          task.navigation = navigation;
+        }, task.includeVision, task.reuse);
       if (this.operations.get(task.id) !== task) return;
-      this.finishTask(task, this.normalizeResult(value, task), true, false);
+      const normalized = this.normalizeResult(value, task);
+      if (normalized.status !== 'SUCCEEDED') this.options.onReviewInvalidated?.(task.id);
+      this.finishTask(task, normalized, true, false);
     } catch (error) {
       if (this.operations.get(task.id) !== task) return;
+      this.options.onReviewInvalidated?.(task.id);
       this.finishTask(task, this.failure(task, safeReviewErrorCode(error), error), true, false);
     }
   }
@@ -301,7 +340,9 @@ export class DesktopBridge {
     if (!['http:', 'https:'].includes(observedUrl.protocol) || observedUrl.username || observedUrl.password) {
       return this.failure(task, 'DESKTOP_OBSERVATION_FAILED');
     }
-    if (observedUrl.origin !== requestedUrl.origin) return this.failure(task, 'DESKTOP_NAVIGATION_CHANGED');
+    if (observedUrl.origin !== requestedUrl.origin) return this.failure(task, 'DESKTOP_NAVIGATION_CHANGED',
+      new ReviewObservationError('browser_navigation_changed', task.lastObservation || reviewDiagnosticSummary(value),
+        reviewNavigationDiagnostics(task.url, observedUrl.href, observedUrl.href, 'result_origin_mismatch')));
     const resultIds = response.result.application_ids;
     if (!Array.isArray(resultIds) || resultIds.length !== task.ids.length ||
         resultIds.some((id: unknown, index: number) => id !== task.ids[index])) {
@@ -347,6 +388,7 @@ export class DesktopBridge {
   }
 
   stop() {
+    this.options.onReviewInvalidated?.();
     this.stopped = true; clearTimeout(this.retry); clearTimeout(this.timeout); clearInterval(this.heartbeat);
     const socket = this.socket; this.socket = undefined; this.authenticated = false;
     if (socket) this.clearSocketTasks(socket, 'DESKTOP_REVIEW_DISCONNECTED');

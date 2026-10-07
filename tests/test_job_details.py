@@ -390,7 +390,8 @@ def test_beisen_missing_request_uuid_is_rejected_for_bound_row(monkeypatch) -> N
 
     result = job_details.fetch_beisen_job_description_status(BEISEN_DETAIL_URL, identity=row)
 
-    assert result[1] == "identity_mismatch"
+    assert result[1] == "content_incomplete"
+    assert result.identity_status == "unverified"
     assert "reason:beisen_request_id_missing" in result.identity_evidence
 
 

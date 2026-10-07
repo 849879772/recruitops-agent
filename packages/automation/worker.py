@@ -14,6 +14,9 @@ class AutomationRunResult:
     error: str | None = None
     thread_id: str | None = None
     turn_id: str | None = None
+    details: dict | None = None
+    # A repeated callback observes the owner, but must not finalize its run.
+    skip_completion: bool = False
 
 
 AutomationExecutor = Callable[[ClaimedAutomation], Awaitable[AutomationRunResult]]
@@ -53,6 +56,8 @@ class LocalAutomationWorker:
                 status="failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
+        if result.skip_completion:
+            return True
         await asyncio.to_thread(
             self.store.complete,
             claimed.execution_id,
@@ -61,6 +66,7 @@ class LocalAutomationWorker:
             error=result.error,
             thread_id=result.thread_id,
             turn_id=result.turn_id,
+            result_details=result.details,
         )
         return True
 

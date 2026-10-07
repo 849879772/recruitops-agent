@@ -72,6 +72,10 @@ from packages.tools.application_capture import (
     ApplicationCaptureResponse,
     prepare_application_capture,
 )
+from packages.tools.application_identity_binding import (
+    ApplicationIdentityCandidatesInput, ApplicationIdentityProposeInput,
+    application_identity_candidates, application_identity_propose, application_identity_queue,
+)
 from packages.tools.recruitment_mail import (
     RecruitmentMailDetailData,
     RecruitmentMailDetailInput,
@@ -88,11 +92,13 @@ from packages.tools.recruitment_mail import (
     search_recruitment_mail,
 )
 from apps.api.codex_bff import get_codex_bff_service
+from apps.api.codex_history import HISTORY_REQUEST_TIMEOUT_SECONDS, history_http_error
 from packages.browser_bridge import BrowserBridgeServer, BrowserBridgeStore
 from packages.codex_runtime.telemetry import JsonlTraceRecorder as CodexJsonlTraceRecorder
 from packages.vision import VisionError, VisionResult, VisionService
 from packages.vision.observation import analyze_observation
 from packages.automation import (
+    AutomationRunningError,
     AutomationRunResult,
     AutomationStore,
     LocalAutomationWorker,
@@ -117,7 +123,8 @@ browser_bridge_server = BrowserBridgeServer(
 class BrowserVisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    image_data_url: str = Field(min_length=32, max_length=9_000_000)
+    image_data_url: str | None = Field(default=None, min_length=32, max_length=9_000_000)
+    image_data_urls: list[str] | None = Field(default=None, min_length=1, max_length=4)
     page_url: str = Field(min_length=8, max_length=2_048)
     operation_id: str = Field(min_length=1, max_length=128)
 
@@ -132,7 +139,7 @@ def browser_vision_service() -> VisionService:
     )
 
 
-def _run_recruitment_mail_sync(*, limit: int = 100) -> dict[str, Any]:
+def _run_recruitment_mail_sync(*, limit: int = 100, force: bool = False) -> dict[str, Any]:
     """Run the same local mailbox sync path used by the API and scheduler."""
 
     settings = get_settings()
@@ -141,7 +148,7 @@ def _run_recruitment_mail_sync(*, limit: int = 100) -> dict[str, Any]:
     store = recruitment_mail_store()
     from packages.recruitment_mail.freshness import ensure_mail_fresh
 
-    return ensure_mail_fresh(settings, store, limit=limit)
+    return ensure_mail_fresh(settings, store, limit=limit, force=force)
 
 
 async def _run_startup_mail_sync(app_state: Any) -> None:
@@ -294,6 +301,34 @@ async def _watch_automation_configuration(lifecycle: _AutomationWorkerLifecycle)
             await asyncio.sleep(4.0)
 
 
+async def _maintain_browser_diagnostics(app_state):
+    """Best-effort bounded maintenance, outside startup and active task execution."""
+    from packages.browser_bridge.retention import compact_browser_diagnostics
+    await asyncio.sleep(60)
+    while True:
+        settings = get_settings()
+        if getattr(settings, 'write_enabled', False) and getattr(settings, 'database_url', None):
+            def sweep():
+                storage = Storage.from_url(settings.database_url)
+                try:
+                    result = compact_browser_diagnostics(storage, enabled=True, dry_run=False)
+                    trace_path = getattr(settings, 'codex_trace_path', None)
+                    if trace_path and not result.get('skipped_active'):
+                        from packages.codex_runtime.trace_retention import prune_trace_file
+                        trace_path = Path(trace_path)
+                        if not trace_path.is_absolute():
+                            trace_path = settings.agent_root / trace_path
+                        result['trace_file'] = prune_trace_file(trace_path)
+                    return result
+                finally:
+                    storage.engine.dispose()
+            try:
+                app_state.browser_diagnostics_retention = await asyncio.to_thread(sweep)
+            except Exception as exc:
+                logger.warning('browser diagnostics maintenance deferred: %s', type(exc).__name__)
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     settings = get_settings()
@@ -335,9 +370,12 @@ async def app_lifespan(_app: FastAPI):
         _watch_automation_configuration(automation_lifecycle),
         name="automation-configuration-watch",
     )
+    diagnostics_maintenance = asyncio.create_task(_maintain_browser_diagnostics(_app.state), name='browser-diagnostics-retention')
     try:
         yield
     finally:
+        diagnostics_maintenance.cancel()
+        await asyncio.gather(diagnostics_maintenance, return_exceptions=True)
         if automation_lifecycle_task is not None:
             automation_lifecycle_task.cancel()
             await asyncio.gather(automation_lifecycle_task, return_exceptions=True)
@@ -388,7 +426,7 @@ set_start_retry_callback(_start_company_source_retry)
 def _is_same_origin_progress_get(request: Request) -> bool:
     origin = request.headers.get("origin")
     return (request.method == "GET"
-            and request.url.path in {"/api/local-ui/daily-recruitment/progress", "/api/local-ui/tasks/progress"}
+            and request.url.path in {"/api/local-ui/daily-recruitment/progress", "/api/local-ui/tasks/progress", "/api/local-ui/mail-confirmations"}
             and request.headers.get("x-recruitops-local-ui") == "1"
             and request.url.hostname in {"localhost", "127.0.0.1", "::1"}
             and request.headers.get("sec-fetch-site") == "same-origin"
@@ -441,11 +479,13 @@ class CodexTurnStartRequest(BaseModel):
     text: str = Field(min_length=1, max_length=40_000)
     job_id: str | None = Field(default=None, max_length=255)
 
-    def prompt(self):
-        if not self.job_id:
+    def prompt(self, thread_id: str | None = None):
+        if not self.job_id and not thread_id:
             return self.text
-        context = {"job_id": self.job_id}
-        return self.text + "\n\n[本轮页面上下文，仅当前选择有效；岗位内容请用 job_detail 核对]\n" + json.dumps(context, ensure_ascii=False)
+        context = {"job_id": self.job_id} if self.job_id else {}
+        if thread_id:
+            context["thread_id"] = thread_id
+        return self.text + "\n\n[本轮页面上下文，仅当前选择有效；岗位内容请用 job_detail 核对；启动邮件处理任务时须传入此 thread_id，勿向用户展示内部编号]\n" + json.dumps(context, ensure_ascii=False)
 
 
 class CodexTurnInterruptRequest(BaseModel):
@@ -521,12 +561,30 @@ async def codex_thread_list(
 ) -> dict[str, Any]:
     if not get_settings().codex_runtime_enabled:
         raise HTTPException(status_code=503, detail="Codex runtime is disabled")
-    page = await get_codex_bff_service().thread_list(
-        cursor=cursor,
-        limit=limit,
-        archived=archived,
-    )
-    return page.model_dump(mode="json") if isinstance(page, BaseModel) else dict(page)
+    local = []
+    if not cursor and not archived and getattr(get_settings(), "database_url", None):
+        from packages.automation.conversations import list_conversations, thread_updated_at
+        local = await asyncio.to_thread(list_conversations,
+            Storage(get_storage_engine()), limit=limit)
+    try:
+        page = await get_codex_bff_service().thread_list(cursor=cursor, limit=limit, archived=archived)
+        payload = page.model_dump(mode="json") if isinstance(page, BaseModel) else dict(page)
+    except Exception:
+        if not local:
+            raise
+        payload = {"data": [], "next_cursor": None, "history_status": "local_automation"}
+    if getattr(get_settings(), "database_url", None):
+        from packages.automation.conversations import visible_runtime_conversations
+        payload["data"] = await asyncio.to_thread(visible_runtime_conversations,
+            Storage(get_storage_engine()), payload.get("data", []))
+    if local:
+        by_id = {item["id"]: item for item in payload.get("data", [])}
+        for item in local:
+            existing = by_id.get(item["id"])
+            by_id[item["id"]] = {**item, **(existing or {}), "automation": item["automation"],
+                "updatedAt": max(thread_updated_at(item), thread_updated_at(existing or {}))}
+        payload["data"] = sorted(by_id.values(), key=thread_updated_at, reverse=True)
+    return payload
 
 
 @app.get("/api/codex/threads/{thread_id}", tags=["codex"])
@@ -536,50 +594,180 @@ async def codex_thread_read(
 ) -> dict[str, Any]:
     if not get_settings().codex_runtime_enabled:
         raise HTTPException(status_code=503, detail="Codex runtime is disabled")
-    service = get_codex_bff_service()
+    local = None
+    if getattr(get_settings(), "database_url", None):
+        from packages.automation.conversations import read_conversation, thread_updated_at
+        local = await asyncio.to_thread(read_conversation,
+            Storage(get_storage_engine()), thread_id, include_messages=include_turns)
+    if local and local["automation"].get("local_only"):
+        return {**local, "turns": [], "history_status": "local_automation"}
+    if local and local["automation"].get("direct"):
+        # Direct tasks have durable local messages before their first model
+        # turn. Reading must not resume or execute them; later user turns, if
+        # present, still belong in the same visible conversation.
+        try:
+            async with asyncio.timeout(HISTORY_REQUEST_TIMEOUT_SECONDS):
+                thread = await get_codex_bff_service().thread_read(thread_id, include_turns=include_turns)
+            payload = thread.model_dump(mode="json") if isinstance(thread, BaseModel) else dict(thread)
+        except Exception:
+            payload = {"turns": [], "history_status": "local_automation"}
+        turns = payload.get("turns")
+        return {**payload, **local,
+                "preview": payload.get("preview") or local["preview"],
+                "updatedAt": max(thread_updated_at(payload), thread_updated_at(local)),
+                "turns": turns if include_turns and isinstance(turns, list) else []}
     try:
-        thread = await service.thread_read(thread_id, include_turns=include_turns)
-    except JsonRpcRemoteError as error:
-        if _is_unloaded_thread_error(error):
-            await service.thread_resume(thread_id)
+        async with asyncio.timeout(HISTORY_REQUEST_TIMEOUT_SECONDS):
+            service = get_codex_bff_service()
+            unmaterialized = False
             try:
                 thread = await service.thread_read(thread_id, include_turns=include_turns)
-            except JsonRpcRemoteError as resumed_error:
-                if not include_turns or not _is_unmaterialized_thread_error(resumed_error):
+            except JsonRpcRemoteError as error:
+                if _is_unloaded_thread_error(error):
+                    # Loading an unloaded runtime thread does not execute a turn.
+                    await service.thread_resume(thread_id)
+                    try:
+                        thread = await service.thread_read(thread_id, include_turns=include_turns)
+                    except JsonRpcRemoteError as resumed_error:
+                        if not include_turns or not _is_unmaterialized_thread_error(resumed_error):
+                            raise
+                        thread = await service.thread_read(thread_id, include_turns=False)
+                        unmaterialized = True
+                elif include_turns and _is_unmaterialized_thread_error(error):
+                    thread = await service.thread_read(thread_id, include_turns=False)
+                    unmaterialized = True
+                else:
                     raise
-                thread = await service.thread_read(thread_id, include_turns=False)
-            return thread.model_dump(mode="json") if isinstance(thread, BaseModel) else dict(thread)
-        # A newly created App Server thread has no materialized turn history yet.
-        # Reading the thread itself is still valid, so retry without turns instead
-        # of surfacing a transient 500 to the workbench.
-        if not include_turns or not _is_unmaterialized_thread_error(error):
-            raise
-        thread = await service.thread_read(thread_id, include_turns=False)
-    return thread.model_dump(mode="json") if isinstance(thread, BaseModel) else dict(thread)
+            payload = thread.model_dump(mode="json") if isinstance(thread, BaseModel) else dict(thread)
+            if unmaterialized:
+                payload.update(turns=[], history_status="not_materialized")
+            if local:
+                payload["automation"] = local["automation"]
+                payload["title"] = local["title"]
+                if include_turns and not payload.get("turns"):
+                    payload["messages"] = local["messages"]
+            return payload
+    except Exception as error:
+        if local:
+            return {**local, "turns": [], "history_status": "local_automation"}
+        raise history_http_error(error, operation="read", thread_id=thread_id) from None
 
 
 @app.post("/api/codex/threads/{thread_id}/resume", tags=["codex"])
 async def codex_thread_resume(thread_id: str) -> dict[str, Any]:
     if not get_settings().codex_runtime_enabled:
         raise HTTPException(status_code=503, detail="Codex runtime is disabled")
-    thread = await get_codex_bff_service().thread_resume(thread_id)
-    return thread.model_dump(mode="json") if isinstance(thread, BaseModel) else dict(thread)
+    if getattr(get_settings(), "database_url", None):
+        from packages.automation.conversations import read_conversation
+        local = await asyncio.to_thread(read_conversation,
+            Storage(get_storage_engine()), thread_id, include_messages=False)
+        if local and local["automation"].get("local_only"):
+            return {**local, "turns": [], "history_status": "local_automation"}
+    try:
+        async with asyncio.timeout(HISTORY_REQUEST_TIMEOUT_SECONDS):
+            thread = await get_codex_bff_service().thread_resume(thread_id)
+            return thread.model_dump(mode="json") if isinstance(thread, BaseModel) else dict(thread)
+    except Exception as error:
+        raise history_http_error(error, operation="resume", thread_id=thread_id) from None
 
 
 @app.delete("/api/codex/threads/{thread_id}", tags=["codex"])
 async def codex_thread_delete(thread_id: str) -> dict[str, str]:
     if not get_settings().codex_runtime_enabled:
         raise HTTPException(status_code=503, detail="Codex runtime is disabled")
-    await get_codex_bff_service().thread_delete(thread_id)
+    local = None
+    if getattr(get_settings(), "database_url", None):
+        from packages.automation.conversations import read_conversation, archive_conversation
+        local = await asyncio.to_thread(read_conversation,
+            Storage(get_storage_engine()), thread_id, include_messages=False)
+    if local and local["automation"].get("local_only"):
+        await asyncio.to_thread(archive_conversation, Storage(get_storage_engine()), thread_id)
+        return {"status": "deleted", "thread_id": thread_id}
+    try:
+        await get_codex_bff_service().thread_delete(thread_id)
+    except JsonRpcRemoteError as error:
+        if not (local and local["automation"].get("direct") and (
+                _is_unmaterialized_thread_error(error) or "no rollout" in str(error).casefold()
+                or "not found" in str(error).casefold())):
+            raise
+    if local:
+        await asyncio.to_thread(archive_conversation, Storage(get_storage_engine()), thread_id)
     return {"status": "deleted", "thread_id": thread_id}
+
+
+_automation_followup_locks: dict[str, asyncio.Lock] = {}
+
+
+def _followup_http_error(error: Exception, *, thread_id: str, unconfirmed_start: bool = False) -> HTTPException:
+    failure = history_http_error(error, operation="followup", thread_id=thread_id)
+    if failure.status_code == 500:
+        failure.status_code = 503
+        failure.detail.update(code="history_runtime_unavailable",
+            message="助理连接暂未就绪，请稍后重试提问；定时任务报告已保留。")
+    if unconfirmed_start:
+        failure.detail.update(code="followup_start_unconfirmed", thread_id=thread_id,
+            message="助理未确认本轮是否启动，请先查看会话运行状态；定时任务报告已保留。")
+    return failure
+
+
+async def _automation_followup(service, thread_id: str, request: CodexTurnStartRequest) -> tuple[str, str]:
+    """A local report is readable offline; only a user question creates a model thread."""
+    if not getattr(get_settings(), "database_url", None):
+        return thread_id, request.prompt(thread_id)
+    from packages.automation.conversations import read_conversation, bind_followup_thread, followup_context
+    storage = Storage(get_storage_engine())
+    local = await asyncio.to_thread(read_conversation, storage, thread_id)
+    if not local or not local["automation"].get("local_only"):
+        return thread_id, request.prompt(thread_id)
+    lock = _automation_followup_locks.setdefault(thread_id, asyncio.Lock())
+    async with lock:
+        local = await asyncio.to_thread(read_conversation, storage, thread_id)
+        if local is None:
+            raise HTTPException(status_code=404, detail="定时任务会话已删除，请选择其他会话或新建会话。")
+        runtime_thread_id = local["automation"].get("followup_thread_id")
+        if runtime_thread_id:
+            try:
+                async with asyncio.timeout(HISTORY_REQUEST_TIMEOUT_SECONDS):
+                    await service.thread_resume(runtime_thread_id)
+            except Exception as error:
+                failure = _followup_http_error(error, thread_id=runtime_thread_id)
+                if failure.status_code != 404:
+                    raise failure from None
+                # The user is asking a new question; an absent old thread may
+                # be replaced. No unknown turn_start response is retried here.
+                runtime_thread_id = None
+        if not runtime_thread_id:
+            try:
+                async with asyncio.timeout(HISTORY_REQUEST_TIMEOUT_SECONDS):
+                    thread = await service.thread_start()
+                payload = thread.model_dump(mode="json") if isinstance(thread, BaseModel) else dict(thread)
+                runtime_thread_id = str(payload.get("id") or "")
+                if not runtime_thread_id:
+                    raise ConnectionError("missing runtime thread id")
+            except Exception as error:
+                raise _followup_http_error(error, thread_id=thread_id) from None
+            await asyncio.to_thread(bind_followup_thread, storage, thread_id, runtime_thread_id)
+        return runtime_thread_id, followup_context(local) + request.prompt(runtime_thread_id)
 
 
 @app.post("/api/codex/threads/{thread_id}/turns", tags=["codex"])
 async def codex_turn_start(thread_id: str, request: CodexTurnStartRequest) -> dict[str, Any]:
     if not get_settings().codex_runtime_enabled:
         raise HTTPException(status_code=503, detail="Codex runtime is disabled")
-    turn = await get_codex_bff_service().turn_start(thread_id, request.prompt())
-    return turn.model_dump(mode="json") if isinstance(turn, BaseModel) else dict(turn)
+    service = get_codex_bff_service()
+    runtime_thread_id, prompt = await _automation_followup(service, thread_id, request)
+    if runtime_thread_id != thread_id:
+        try:
+            async with asyncio.timeout(HISTORY_REQUEST_TIMEOUT_SECONDS):
+                turn = await service.turn_start(runtime_thread_id, prompt)
+        except Exception as error:
+            raise _followup_http_error(error, thread_id=runtime_thread_id, unconfirmed_start=True) from None
+    else:
+        turn = await service.turn_start(runtime_thread_id, prompt)
+    payload = turn.model_dump(mode="json") if isinstance(turn, BaseModel) else dict(turn)
+    if runtime_thread_id != thread_id:
+        payload.update(thread_id=runtime_thread_id, source_thread_id=thread_id)
+    return payload
 
 
 @app.post("/api/codex/threads/{thread_id}/turns/stream", tags=["codex"])
@@ -590,18 +778,46 @@ async def codex_turn_stream(
     if not get_settings().codex_runtime_enabled:
         raise HTTPException(status_code=503, detail="Codex runtime is disabled")
     service = get_codex_bff_service()
+    runtime_thread_id, prompt = await _automation_followup(service, thread_id, request)
+    prepared_subscription = None
+    prepared_turn = None
+    if runtime_thread_id != thread_id:
+        try:
+            # Subscribe first so fast turn events are queued, but acknowledge
+            # turn_start before committing an HTTP 200 streaming response.
+            prepared_subscription = service.subscribe(runtime_thread_id)
+            async with asyncio.timeout(HISTORY_REQUEST_TIMEOUT_SECONDS):
+                prepared_turn = await service.turn_start(runtime_thread_id, prompt)
+        except BaseException as error:
+            if prepared_subscription is not None:
+                prepared_subscription.close()
+            if isinstance(error, Exception):
+                raise _followup_http_error(error, thread_id=runtime_thread_id, unconfirmed_start=True) from None
+            raise
 
     async def stream():
-        subscription = service.subscribe(thread_id)
+        subscription = prepared_subscription if prepared_subscription is not None else service.subscribe(runtime_thread_id)
         try:
-            turn = await service.turn_start(thread_id, request.prompt())
+            turn = prepared_turn if prepared_subscription is not None else await service.turn_start(runtime_thread_id, prompt)
             turn_payload = (
                 turn.model_dump(mode="json") if isinstance(turn, BaseModel) else dict(turn)
             )
             turn_id = str(turn_payload.get("id") or "")
+            turn_payload.update(thread_id=runtime_thread_id, turn_id=turn_id or None, run_id=None)
+            if runtime_thread_id != thread_id:
+                turn_payload["source_thread_id"] = thread_id
             yield f"event: turn\ndata: {json.dumps(turn_payload, ensure_ascii=False)}\n\n"
             async for event in subscription:
+                if event.thread_id != runtime_thread_id or turn_id and event.turn_id and event.turn_id != turn_id:
+                    continue
+                # A thread-wide event is not evidence that its text/tool item
+                # belongs to this turn. Do not label unowned deltas as current.
+                if turn_id and not event.turn_id and event.event_type.value not in {"thread_started", "thread_updated", "health"}:
+                    continue
                 payload = event.model_dump(mode="json")
+                explicit_run = event.payload.get("run_id")
+                payload["run_id"] = (explicit_run if isinstance(explicit_run, str)
+                                     and 0 < len(explicit_run) <= 128 else None)
                 yield (
                     f"event: {event.event_type.value}\n"
                     f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -616,7 +832,8 @@ async def codex_turn_stream(
     return StreamingResponse(
         stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "X-RecruitOps-Thread-ID": runtime_thread_id},
     )
 
 
@@ -638,7 +855,12 @@ async def codex_thread_events(thread_id: str) -> StreamingResponse:
 
     async def stream():
         async for event in get_codex_bff_service().event_stream(thread_id):
+            if event.thread_id != thread_id:
+                continue
             payload = event.model_dump(mode="json")
+            explicit_run = event.payload.get("run_id")
+            payload["run_id"] = (explicit_run if isinstance(explicit_run, str)
+                                 and 0 < len(explicit_run) <= 128 else None)
             yield f"event: {event.event_type.value}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -699,19 +921,22 @@ def get_storage_engine():
 
 
 @app.get("/api/local-ui/daily-recruitment/progress", tags=["local-ui"])
-def daily_recruitment_progress(request: Request) -> dict[str, object]:
+def daily_recruitment_progress(request: Request, thread_id: str | None = Query(default=None, min_length=1, max_length=255)) -> dict[str, object]:
     # Same-origin GET normally has no Origin header, unlike local UI writes.
     if not _is_same_origin_progress_get(request):
         raise HTTPException(403, "Local same-origin UI request required")
-    return latest_daily_progress(Storage(get_storage_engine()))
+    storage = Storage(get_storage_engine())
+    return latest_daily_progress(storage, thread_id=thread_id) if thread_id else latest_daily_progress(storage)
 
 
 @app.get("/api/local-ui/tasks/progress", tags=["local-ui"])
-def current_task_progress(request: Request, run_id: str | None = Query(default=None, min_length=8, max_length=128)) -> dict[str, object]:
+def current_task_progress(request: Request, run_id: str | None = Query(default=None, min_length=8, max_length=128),
+                          thread_id: str | None = Query(default=None, min_length=1, max_length=255)) -> dict[str, object]:
     if not _is_same_origin_progress_get(request):
         raise HTTPException(403, "Local same-origin UI request required")
     # No history fallback: a new conversation never resurrects a finished card.
-    return task_progress(Storage(get_storage_engine()), run_id=run_id)
+    storage = Storage(get_storage_engine())
+    return task_progress(storage, run_id=run_id, thread_id=thread_id) if thread_id else task_progress(storage, run_id=run_id)
 
 
 class TaskControlRequest(BaseModel):
@@ -743,7 +968,59 @@ async def control_current_task(run_id: str, payload: TaskControlRequest,
 def mail_processing_run_service():
     from packages.recruitment_mail.run_service import MailProcessingRunService
     return MailProcessingRunService(recruitment_mail_store(), repository(), get_settings(),
-                                    sync_mail=_run_recruitment_mail_sync)
+                                    sync_mail=lambda: _run_recruitment_mail_sync(force=True))
+
+
+class MailConfirmationResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    thread_id: str = Field(min_length=1, max_length=255)
+    record_id: str = Field(min_length=1, max_length=255)
+    action: Literal["confirmed", "rejected"]
+    content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class MailConfirmationReport(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    thread_id: str = Field(min_length=1, max_length=255)
+    version: int = Field(ge=1)
+    action: Literal["claim", "complete", "release"]
+    claim_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
+@app.get("/api/local-ui/mail-confirmations", tags=["local-ui"])
+def pending_mail_confirmations(request: Request, thread_id: str = Query(min_length=1, max_length=255)):
+    if not _is_same_origin_progress_get(request):
+        raise HTTPException(403, "Local same-origin UI request required")
+    from packages.recruitment_mail.run_service import mail_confirmation_queue
+    return mail_confirmation_queue(Storage(get_storage_engine()), thread_id)
+
+
+@app.post("/api/local-ui/mail-confirmations/{run_id}/resolve", tags=["local-ui"])
+def resolve_mail_confirmation(run_id: str, payload: MailConfirmationResolution,
+                              authorization: str | None = Header(default=None)):
+    _require_local_api_token(authorization, require_configured=True)
+    if not get_settings().write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    try:
+        return {"run": mail_processing_run_service().resolve_confirmation(run_id, **payload.model_dump())}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from None
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+@app.post("/api/local-ui/mail-confirmations/{run_id}/report", tags=["local-ui"])
+def report_mail_confirmation(run_id: str, payload: MailConfirmationReport,
+                             authorization: str | None = Header(default=None)):
+    _require_local_api_token(authorization, require_configured=True)
+    if not get_settings().write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    try:
+        return mail_processing_run_service().report_confirmation(run_id, **payload.model_dump())
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from None
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @lru_cache
@@ -1131,6 +1408,25 @@ def disable_local_automation(
     return _automation_payload(store, row)
 
 
+@app.delete("/api/automations/{schedule_id}", tags=["automations"])
+def delete_local_automation(
+    schedule_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    settings = get_settings()
+    if not settings.write_enabled:
+        raise HTTPException(status_code=503, detail="RECRUITOPS_WRITE_ENABLED must be true")
+    _require_local_api_token(authorization, require_configured=True)
+    store = AutomationStore(Storage.from_url(settings.database_url))
+    try:
+        deleted_executions = store.delete(schedule_id)
+    except AutomationRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if deleted_executions is None:
+        raise HTTPException(status_code=404, detail="Automation schedule was not found")
+    return {"deleted": True, "id": schedule_id, "deleted_executions": deleted_executions}
+
+
 def _mail_data_or_error(result: Any, *, not_found_status: int = 503) -> Any:
     from packages.tools.typed import ToolErrorCode
 
@@ -1186,7 +1482,7 @@ def sync_recruitment_mails(
     if not getattr(settings, "mail_enabled", False):
         raise HTTPException(status_code=503, detail="RECRUITOPS_MAIL_ENABLED is false")
     try:
-        result = _run_recruitment_mail_sync(limit=limit)
+        result = _run_recruitment_mail_sync(limit=limit, force=True)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"mail_sync_failed:{type(exc).__name__}") from exc
     return result
@@ -1212,12 +1508,181 @@ def get_recruitment_mail_detail(
     return _mail_data_or_error(result, not_found_status=404).model_copy(update={"freshness": freshness})
 
 
+@app.get("/api/applications/review-results", tags=["applications"])
+def application_review_results_api(
+    scope: Literal["run", "latest"] = "run",
+    run_id: str | None = Query(default=None, pattern=r"^status-review-[0-9a-f]{32}$"),
+    thread_id: str | None = Query(default=None, min_length=1, max_length=255),
+    category: Literal["all", "attention", "failed", "blocked", "unresolved", "retained", "updated", "unchanged", "excluded"] = "attention",
+    reason: str | None = Query(default=None, min_length=1, max_length=200),
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = Query(default=None, min_length=1, max_length=1024),
+    repo: RecruitmentRepository = Depends(repository),
+):
+    from packages.tools.application_review_results import ApplicationReviewResultsInput, application_review_results
+    from packages.tools.typed import ToolErrorCode
+
+    if scope == "latest" and (run_id or thread_id):
+        raise HTTPException(422, "最新复核口径不能与历史任务条件混用")
+    result = application_review_results(ApplicationReviewResultsInput(
+        scope=scope, run_id=run_id, thread_id=thread_id, category=category,
+        reason=reason, limit=limit, cursor=cursor), repo)
+    if not result.success:
+        raise HTTPException(404 if result.error_code == ToolErrorCode.NOT_FOUND else 409, result.error_message)
+    return result.data
+
+
+@app.get("/api/applications/identity-queue", tags=["applications"])
+def application_identity_queue_api(store: RecruitmentMailStore = Depends(recruitment_mail_store)):
+    return application_identity_queue(store.storage)
+
+
+class ApplicationLoginRecheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    application_ids: list[str] = Field(default_factory=list, max_length=50)
+    run_id: str | None = Field(default=None, pattern=r"^status-review-[0-9a-f]{32}$")
+    request_id: str = Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+@app.post("/api/applications/review-results/recheck", tags=["applications"])
+async def recheck_application_login_group(payload: ApplicationLoginRecheckRequest,
+                                          authorization: str | None = Header(default=None),
+                                          repo: RecruitmentRepository = Depends(repository)):
+    from sqlalchemy import select
+    from packages.domain.urls import application_progress_channel
+    from packages.storage.models import ToolCall
+    from packages.tools.application_review_run import continue_application_review
+    from packages.tools.application_review_results import compact_summary
+    from packages.tools.batch_browser_operations import BatchObserveApplicationStatusInput, _storage
+
+    _require_local_api_token(authorization, require_configured=True)
+    if not get_settings().write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    if bool(payload.run_id) == bool(payload.application_ids):
+        raise HTTPException(422, "请选择一组岗位，或继续该次复核；不能扩大范围")
+    if len(set(payload.application_ids)) != len(payload.application_ids) or any(
+        not isinstance(item, str) or not item.strip() or len(item) > 255 for item in payload.application_ids
+    ):
+        raise HTTPException(422, "投递范围无效")
+    turn_id = "login-recheck:" + payload.request_id.lower()
+    storage = _storage(repo)
+    if storage is None:
+        raise HTTPException(503, "投递存储不可用")
+    resolved_run_id = payload.run_id
+    with storage.session() as db:
+        checkpoint_query = select(ToolCall).where(ToolCall.tool_name == "application_review_checkpoint")
+        checkpoint_query = checkpoint_query.where(ToolCall.task_id == payload.run_id) if payload.run_id else checkpoint_query.where(
+            ToolCall.arguments["metadata"]["turn_id"].as_string() == turn_id)
+        checkpoint = db.scalar(checkpoint_query)
+        if payload.run_id and (checkpoint is None or (checkpoint.arguments.get("metadata") or {}).get("turn_id") != turn_id):
+            raise HTTPException(409, "不能续跑其他复核任务，请刷新本次结果")
+        if checkpoint:
+            if payload.application_ids and set(checkpoint.arguments.get("request_ids", checkpoint.arguments.get("ids", []))) != set(payload.application_ids):
+                raise HTTPException(409, "本次点击的岗位范围不能改变，请刷新后新建复核")
+            resolved_run_id = checkpoint.task_id
+    if not resolved_run_id:
+        applications = {str(item.id): item for item in repo.list_applications()}
+        selected = [applications.get(item) for item in payload.application_ids]
+        if any(item is None for item in selected):
+            raise HTTPException(404, "投递记录不存在，请刷新")
+        if any(str(getattr(item.stage, "value", item.stage)).casefold() in {"rejected", "withdrawn"} for item in selected):
+            raise HTTPException(409, "该组包含已结束投递，无需重新复核；请刷新结果")
+        if any(application_progress_channel(item.record_url) != "official_page" for item in selected):
+            raise HTTPException(422, "仅支持已展示的同公司、同官网岗位组")
+        groups = {(item.company_name.strip().casefold(), urlsplit(item.record_url).netloc.casefold()) for item in selected}
+        if len(groups) != 1:
+            raise HTTPException(422, "仅支持已展示的同公司、同官网岗位组")
+    result = await continue_application_review(BatchObserveApplicationStatusInput(
+        application_ids=[] if resolved_run_id else payload.application_ids, run_id=resolved_run_id, turn_id=turn_id,
+    ), browser_bridge_store, repo)
+    summary = compact_summary(result.summary)
+    if summary.get("active_run_id") or not summary.get("run_id"):
+        raise HTTPException(409, "其他复核正在运行，或浏览器尚未连接；未新建或扩大本次范围")
+    return {"run_id": summary["run_id"], "continuation_required": bool(summary.get("continuation_required")),
+            "scope_complete": bool(summary.get("scope_complete")),
+            "summary": summary, "message": "本组复核已结束，请查看各岗位结果" if summary.get("scope_complete")
+                else "本组复核尚未完成，已保存进度"}
+
+
+@app.get("/api/applications/{application_id}/identity-candidates", tags=["applications"])
+def application_identity_candidates_api(application_id: str, operation_id: str | None = None,
+                                        store: RecruitmentMailStore = Depends(recruitment_mail_store)):
+    try:
+        return application_identity_candidates(ApplicationIdentityCandidatesInput(
+            application_id=application_id, operation_id=operation_id), store.storage).data
+    except KeyError as exc:
+        raise HTTPException(404, "投递记录不存在") from exc
+
+
+@app.post("/api/applications/{application_id}/identity-proposals", tags=["applications"])
+def application_identity_propose_api(application_id: str, payload: ApplicationIdentityProposeInput,
+                                     authorization: str | None = Header(default=None),
+                                     store: RecruitmentMailStore = Depends(recruitment_mail_store)):
+    _require_local_api_token(authorization, require_configured=True)
+    if not get_settings().write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    if application_id != payload.application_id:
+        raise HTTPException(422, "投递范围不一致")
+    try:
+        return application_identity_propose(payload, store.storage, approval_registry)
+    except (KeyError, ValueError) as exc:
+        if str(exc) == "application_closed":
+            raise HTTPException(409, {"code": "application_closed",
+                "message": "该投递已淘汰或已撤回，无需核对官网岗位；投递记录和历史保留"}) from exc
+        raise HTTPException(409, "投递、页面证据或绑定已变化，请重新复核并确认") from exc
+
+
+class IdentityRereadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str = Field(pattern=r"^[A-Za-z0-9-]{1,96}$")
+
+
+@app.post("/api/applications/{application_id}/identity-reread", tags=["applications"])
+async def reread_application_identity(application_id: str, payload: IdentityRereadRequest,
+                                      authorization: str | None = Header(default=None),
+                                      store: RecruitmentMailStore = Depends(recruitment_mail_store),
+                                      repo: RecruitmentRepository = Depends(repository)):
+    from packages.tools.application_identity_binding import refresh_identity_candidates
+    _require_local_api_token(authorization, require_configured=True)
+    settings = get_settings()
+    if not settings.write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    try:
+        return await refresh_identity_candidates(store.storage, browser_bridge_store, repo, application_id,
+            request_id=payload.request_id, vision_enabled=bool(
+                getattr(settings, "vision_enabled", False) and getattr(settings, "llm_enabled", False)))
+    except KeyError as exc:
+        raise HTTPException(404, "投递记录不存在") from exc
+    except ValueError as exc:
+        code = str(exc).lower()
+        messages = {
+            "application_closed": "该投递已淘汰或已撤回，无需重新读取；投递记录和历史保留",
+            "mail_only_application": "该投递没有官网进度链接，仅通过邮件更新",
+            "connection_status_unavailable": "未找到唯一可用的招聘浏览器连接，请检查连接状态",
+            "bridge_dependency_missing": "浏览器连接服务不可用，请检查桌面服务状态",
+            "login_required": "官网要求登录，请在招聘浏览器中登录后重新读取",
+            "captcha_required": "官网要求验证码，请在招聘浏览器中手动完成验证后重新读取",
+            "timeout": "读取官网页面超时，请稍后重试或打开官网查看",
+            "readiness_timeout": "官网页面未在限定时间内准备完成，请稍后重试或打开官网查看",
+            "navigation_restricted": "官网跳转受限，未能读取投递记录页，请打开官网查看",
+            "unparsed_application_page": "官网页面已读取，但未能解析出投递记录，请打开官网查看",
+            "command_invalid": "浏览器通信协议不匹配，请检查浏览器组件版本",
+            "action_not_allowed": "浏览器不支持本次读取操作，请检查浏览器组件版本",
+        }
+        message = messages.get(code)
+        if message is None:
+            code = "identity_observation_failed"
+            message = "未能取得可用的官网页面证据，暂时无法确认具体原因，请稍后重试或打开官网查看"
+        raise HTTPException(409, {"code": code, "message": message + "；投递阶段未修改"}) from exc
+
+
 @app.get("/api/recruitment-mails/{record_id}/binding-candidates", tags=["recruitment-mail"])
 def mail_binding_candidates(record_id: str, query: str = Query(default="", max_length=500),
+                            offset: int = Query(default=0, ge=0), limit: int = Query(default=20, ge=1, le=50),
                             store: RecruitmentMailStore = Depends(recruitment_mail_store)):
     try:
         return recruitment_mail_binding_candidates(
-            RecruitmentMailBindingCandidatesInput(record_id=record_id, query=query), store).data
+            RecruitmentMailBindingCandidatesInput(record_id=record_id, query=query, offset=offset, limit=limit), store).data
     except KeyError as exc:
         raise HTTPException(404, "邮件不存在") from exc
 
@@ -1234,7 +1699,30 @@ def propose_mail_binding(record_id: str, payload: RecruitmentMailBindingProposeI
     try:
         return recruitment_mail_binding_propose(payload, store, approval_registry)
     except (KeyError, ValueError) as exc:
-        raise HTTPException(409, "邮件或投递记录已变化，请刷新后重新确认") from exc
+        messages = {
+            "mail_event_requires_single_application": "该通知不是公司通用笔试或测评，请只选择一个对应岗位",
+            "mail_event_has_specific_job_evidence": "邮件已明确指定岗位，不能关联多个投递，请选择通知对应的岗位",
+            "multi_binding_company_mismatch": "一封公司通知只能关联同一家公司的投递，请重新选择",
+            "invalid_binding_targets": "关联岗位选择无效，一封邮件最多关联 50 条投递，请重新选择",
+            "binding_targets_conflict": "关联岗位选择不一致，请重新选择后确认",
+        }
+        message = messages.get(str(exc), "邮件或投递记录已变化，请刷新后重新确认")
+        raise HTTPException(409, message) from exc
+
+
+@app.post("/api/recruitment-mails/{record_id}/retry", tags=["recruitment-mail"])
+def retry_recruitment_mail_analysis(record_id: str, authorization: str | None = Header(default=None)):
+    _require_local_api_token(authorization, require_configured=True)
+    if not get_settings().write_enabled:
+        raise HTTPException(503, "RECRUITOPS_WRITE_ENABLED must be true")
+    try:
+        return mail_processing_run_service().start(record_ids=[record_id], retry_failed=True, refresh=False)
+    except KeyError as exc:
+        raise HTTPException(404, "邮件不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(409, "邮件不再处于失败状态，或已有邮件处理任务，请刷新后重试") from exc
+    except PermissionError as exc:
+        raise HTTPException(503, "邮件分析写入当前未启用") from exc
 
 
 @app.post(
@@ -1297,16 +1785,18 @@ def recognize_browser_screenshot(
     """Send one authorized screenshot to the vision model, without changing application status."""
 
     _require_local_api_token(authorization, require_configured=True)
-    if not get_settings().vision_enabled:
-        raise HTTPException(status_code=503, detail="Screenshot understanding is disabled.")
+    settings = get_settings()
+    if not (settings.vision_enabled and settings.llm_enabled and settings.write_enabled):
+        raise HTTPException(status_code=503, detail={"code": "vision_disabled"})
     try:
         return analyze_observation(
             browser_bridge_store, browser_vision_service(),
             operation_id=request.operation_id, page_url=request.page_url,
-            image_data_url=request.image_data_url,
+            image_data_url=request.image_data_url, image_data_urls=request.image_data_urls,
         )
     except VisionError as exc:
-        unavailable = exc.code in {"vision_not_configured", "vision_model_unsupported", "transport_failed"}
+        unavailable = exc.code in {"vision_not_configured", "vision_model_unsupported", "transport_failed",
+                                   "vision_queue_timeout", "vision_duplicate_wait_timeout"}
         raise HTTPException(status_code=503 if unavailable else 422, detail={"code": exc.code}) from exc
 
 
@@ -1403,6 +1893,10 @@ def create_approval(
     """Validate and register a write preview without executing it."""
 
     _require_local_api_token(authorization, require_configured=True)
+    if preview.operation.value == "application_identity_binding":
+        # The displayed identity must be reconstructed from persisted records,
+        # never supplied independently of the payload by an API/model caller.
+        raise HTTPException(422, "官网岗位绑定必须通过 identity-proposals 生成数据库确认预览")
     return approval_registry.issue(preview)
 
 

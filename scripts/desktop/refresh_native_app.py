@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -19,8 +20,14 @@ def main():
     parser.add_argument("--bundle", required=True, type=Path)
     args = parser.parse_args()
     root = args.bundle.resolve()
-    if not root.is_relative_to(ROOT / ".desktop-runtime-tests"):
-        raise ValueError("isolated bundle required")
+    isolated_bundle = root.is_relative_to(ROOT / ".desktop-runtime-tests")
+    package_stage = (
+        root.parent == ROOT / "apps" / "desktop" / ".package-staging" / root.parent.name
+        and root.name == "desktop-runtime"
+        and re.fullmatch(r"n-[a-f0-9]{8}", root.parent.name) is not None
+    )
+    if not (isolated_bundle or package_stage):
+        raise ValueError("isolated bundle or native package stage required")
     manifest_path = root / "runtime-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     script = "process.stdout.write(JSON.stringify(require('./apps/desktop/packaging/resources.cjs').sourceInventory(process.cwd())))"

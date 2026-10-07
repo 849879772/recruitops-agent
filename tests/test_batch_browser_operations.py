@@ -117,13 +117,14 @@ def test_batch_excludes_closed_applications_before_browser_access(tmp_path, monk
 
     async def fake_observe(request, _store, _repository):
         requests.append(request)
-        context = "软件开发工程师 投递记录"
+        context = "软件开发工程师 申请成功"
         return _observed({
             "page": {"url": record_url, "title": "投递记录", "text": context},
             "entries": [],
             "application_records": [{
                 "title": "软件开发工程师",
-                "status": "",
+                "status": "applied",
+                "label": "申请成功",
                 "context": context,
                 "signals": {"conflicting_statuses": False},
             }],
@@ -179,8 +180,9 @@ def test_batch_selects_all_non_terminal_without_application_query(tmp_path, monk
             "application_records": [
                 {
                     "title": "软件开发工程师",
-                    "status": "",
-                    "context": "软件开发工程师 投递记录",
+                    "status": "applied",
+                    "label": "已投递",
+                    "context": "软件开发工程师 已投递",
                     "signals": {"conflicting_statuses": False},
                 },
                 {
@@ -250,6 +252,8 @@ def test_unknown_run_id_does_not_restart_scope(tmp_path):
 def test_full_review_checkpoints_exact_scope_without_reopening_completed_pages(
     tmp_path, monkeypatch, active_count,
 ) -> None:
+    from packages.tools import application_review_run
+    monkeypatch.setattr(application_review_run, "_WAVE_PAGES", 10)
     repository = _repository(tmp_path, [
         {"id": str(i), "title": f"Engineer {i}", "record_url": f"https://site{i}.example/applications",
          "stage": "applied" if i < active_count else "rejected"}
@@ -262,8 +266,8 @@ def test_full_review_checkpoints_exact_scope_without_reopening_completed_pages(
         return _observed({
             "page": {"url": request.application_url, "text": "Applications"},
             "application_records": [{"title": f"Engineer {request.application_id}",
-                                     "context": f"Engineer {request.application_id} 投递简历",
-                                     "status": "", "signals": {}}],
+                                     "context": f"Engineer {request.application_id} 申请成功",
+                                     "status": "applied", "label": "申请成功", "signals": {}}],
         })
 
     monkeypatch.setattr(batch_module, "observe_application_status_page_workflow", fake_observe)
@@ -333,7 +337,7 @@ def test_full_review_ten_pages_parallel_across_origins_only(tmp_path, monkeypatc
     ))
     assert result.summary["processed_count"] == 10
     assert result.summary["scope_complete"] is True
-    assert peak == (1 if shared_origin else 4)
+    assert peak == (1 if shared_origin else 6)
 
 
 def test_full_review_retains_completed_pages_when_wave_times_out(tmp_path, monkeypatch):
@@ -440,7 +444,7 @@ def test_batch_reports_missing_evidence_as_unresolved_not_success(tmp_path, monk
     assert response.success is False
     assert response.updated == []
     assert response.unchanged == []
-    assert response.unresolved[0].reason == "status_evidence_missing"
+    assert response.unresolved[0].reason == "application_records_missing"
     assert response.summary["write_count"] == 0
     with repository.storage.session() as session:
         assert session.get(ApplicationSnapshot, "1").stage == "applied"
@@ -518,16 +522,37 @@ def test_batch_retries_transient_empty_feishu_shell_once(tmp_path, monkeypatch) 
 
     assert len(requests) == 2
     assert requests[0].idempotency_key != requests[1].idempotency_key
-    assert response.unchanged[0].reason == "no_newer_status_observed"
     assert response.unresolved == []
+    assert response.unchanged[0].observed_status == "applied"
+    assert not response.unchanged[0].wrote
 
 
-def test_login_shell_is_blocked_but_login_navigation_with_cards_is_not() -> None:
+def test_login_navigation_without_cards_is_not_a_login_wall() -> None:
     observation = {"page": {"text": "新华三 首页 校园招聘 登录/注册 投递记录"},
                    "entries": [], "application_records": []}
-    assert batch_module._page_authentication_gate(observation)
+    assert not batch_module._page_authentication_gate(observation)
     observation["application_records"] = [{"title": "软件工程师", "status": "applied"}]
     assert not batch_module._page_authentication_gate(observation)
+
+
+@pytest.mark.parametrize("text", [
+    "请先登录后查看投递记录", "登录后查看投递记录",
+    "手机号登录 邮箱登录 获取验证码 7天内免登录 登录 注册账号",
+    "首页 职位 登录 +86 获取验证码 登录 未注册的手机号码验证后将自动创建账号",
+    "登录/注册 校招登入 短信验证码 +86 获取验证码 登录/注册",
+])
+def test_explicit_access_and_code_login_prompts_are_authentication_gates(text):
+    assert batch_module._page_authentication_gate({"page": {"text": text}})
+
+
+@pytest.mark.parametrize("text", [
+    "应届生 登录/注册 粤公网安备…",
+    "首页 社会招聘 校园招聘 关于固德威 登录/注册 固德威GOODWE 向下滑动",
+    "身份认证说明：手机号可用于发送验证码，也可使用邮箱验证。",
+    "请勿向他人透露验证码",
+])
+def test_public_home_and_identity_help_are_not_authentication_gates(text):
+    assert not batch_module._page_authentication_gate({"page": {"text": text}})
 
 
 def test_batch_treats_in_page_identity_verification_as_blocked(tmp_path, monkeypatch) -> None:
@@ -558,7 +583,7 @@ def test_batch_treats_in_page_identity_verification_as_blocked(tmp_path, monkeyp
     assert response.unresolved == []
 
 
-def test_batch_confirms_existing_applied_when_exact_card_has_no_newer_status(
+def test_batch_confirms_dated_submission_without_using_another_cards_termination(
     tmp_path, monkeypatch
 ) -> None:
     record_url = "https://ats.example/applications"
@@ -587,9 +612,9 @@ def test_batch_confirms_existing_applied_when_exact_card_has_no_newer_status(
         repository,
     ))
 
-    assert response.unchanged[0].reason == "no_newer_status_observed"
-    assert response.unchanged[0].observed_status == "applied"
     assert response.unresolved == []
+    assert response.unchanged[0].observed_status == "applied"
+    assert not response.unchanged[0].wrote
 
 
 def test_batch_retains_higher_stage_for_exact_card_with_generic_status(
@@ -622,9 +647,11 @@ def test_batch_retains_higher_stage_for_exact_card_with_generic_status(
         repository,
     ))
 
-    assert response.success is True
-    assert response.unchanged[0].reason == "no_newer_status_observed"
-    assert response.unresolved == []
+    # A parsed applied enum cannot turn the unknown literal '测试中' into
+    # verified unchanged. Without configured vision, retain the stored stage.
+    assert response.success is False and not response.unchanged
+    assert response.unresolved[0].reason == "status_unmapped"
+    assert response.unresolved[0].presentation_state == "retained"
     with repository.storage.session() as session:
         assert session.get(ApplicationSnapshot, "1").stage == "written"
 
@@ -659,7 +686,7 @@ def test_batch_identifies_removed_application_page_without_changing_stage(
         repository,
     ))
 
-    assert response.unresolved[0].reason == "status_evidence_missing"
+    assert response.unresolved[0].reason == "application_records_missing"
     assert response.unchanged == []
     with repository.storage.session() as session:
         assert session.get(ApplicationSnapshot, "1").stage == "applied"

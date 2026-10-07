@@ -232,6 +232,7 @@ READ_ONLY_TOOL_NAMES = frozenset(
         "company_coverage",
         "application_query",
         "application_status_review",
+        "application_review_results",
         "browser_observation",
         "crawler_acceptance",
         "recruitment_mail_search",

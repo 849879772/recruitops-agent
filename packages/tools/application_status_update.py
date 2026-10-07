@@ -15,8 +15,8 @@ from pydantic import Field, field_validator
 
 from packages.approval import AgentApplicationWriteAdapter
 from packages.domain.models import Application, ApplicationStage
+from packages.domain.urls import application_progress_channel
 from packages.recruitment_mail import (
-    backfill_mail_authentication,
     find_stale_company_only_match,
     RecruitmentMailProcessingStatus,
     RecruitmentMailStore,
@@ -99,15 +99,6 @@ def _application(repository: RecruitmentRepository, application_id: str) -> Appl
     return None
 
 
-def _authenticated(record: object) -> bool:
-    if getattr(record, "source", None) != "imap_readonly":
-        return False
-    metadata = getattr(record, "raw_metadata", {})
-    transport = metadata.get("transport", {}) if isinstance(metadata, dict) else {}
-    from packages.recruitment_mail.authentication import has_aligned_authentication
-    return has_aligned_authentication(transport)
-
-
 def _audit_id(request: ApplicationStatusUpdateInput) -> str:
     value = f"{request.evidence_type}:{request.evidence_id}:{request.application_id}:{request.target_status}"
     return f"status-audit:{sha256(value.encode()).hexdigest()[:32]}"
@@ -126,12 +117,12 @@ def _mail_update(
         return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
                          error_code=ToolErrorCode.NOT_FOUND, error_message="Persisted mail evidence was not found.")
     from packages.recruitment_mail.analysis_binding import parsed_model_evidence, model_application_matches
-    from packages.recruitment_mail.binding import confirmed_binding_matches, binding_revision
+    from packages.recruitment_mail.binding import confirmed_binding_matches, binding_revision, bound_application_ids
     from packages.recruitment_mail.model_analysis import MAIL_ANALYSIS_VERSION
 
     analysis = (record.raw_metadata or {}).get("model_analysis")
     attempt = (record.raw_metadata or {}).get("model_processing", {})
-    if (record.processing_status in {"ambiguous_application", "failed_terminal", "needs_auth_metadata"}
+    if (record.processing_status in {"ambiguous_application", "failed_terminal"}
             and attempt.get("state") != "running"):
         return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
                          error_code=ToolErrorCode.INVALID_SOURCE,
@@ -153,7 +144,9 @@ def _mail_update(
         return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
                          error_code=ToolErrorCode.INVALID_SOURCE,
                          error_message="Process this mail with recruitment_mail_process before a status write.")
-    if record.application_id and str(record.application_id) != application.id:
+    confirmed = confirmed_binding_matches(record, application) is True
+    multi_confirmed = confirmed and len(bound_application_ids(record)) > 1
+    if record.application_id and str(record.application_id) != application.id and not multi_confirmed:
         store.update_processing_status(
             record.id,
             RecruitmentMailProcessingStatus.AMBIGUOUS_APPLICATION,
@@ -172,7 +165,7 @@ def _mail_update(
         and stale_company_match is not None
         and str(stale_company_match.id) == str(application.id)
     )
-    if not safe_stale_noop and (len(matches) != 1 or str(matches[0].id) != str(application.id)):
+    if not safe_stale_noop and not multi_confirmed and (len(matches) != 1 or str(matches[0].id) != str(application.id)):
         store.update_processing_status(
             record.id,
             RecruitmentMailProcessingStatus.AMBIGUOUS_APPLICATION,
@@ -183,10 +176,8 @@ def _mail_update(
                          error_message="Company and job title do not exactly identify this application; retryable=false.")
     detail = repository.get_job(application.job_id) if application.job_id else None
     company_id = detail.job.company_id if detail is not None else None
-    # A verified identity may be linked even when the status write is blocked
-    # by missing sender authentication; the two outcomes are intentionally
-    # separate in the mailbox state machine.
-    store.update_associations(record.id, application_id=application.id, job_id=application.job_id, company_id=company_id)
+    if not multi_confirmed:
+        store.update_associations(record.id, application_id=application.id, job_id=application.job_id, company_id=company_id)
     if record.source != "imap_readonly":
         store.update_processing_status(
             record.id,
@@ -221,44 +212,6 @@ def _mail_update(
         return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
                          error_code=ToolErrorCode.INVALID_INPUT,
                          error_message="Target stage does not match the persisted mail category; retryable=false.")
-    if not _authenticated(record) and settings is not None:
-        backfill_mail_authentication(settings, store, record.id)
-        record = store.get(record_id=record.id)
-        assert record is not None
-    if not _authenticated(record):
-        if safe_stale_noop:
-            audit_id = _audit_id(request)
-            base = dict(
-                application_id=application.id,
-                current_stage=application.stage,
-                target_stage=target,
-                state="unchanged",
-                reason_code="stale_evidence",
-                reason="Older mail cannot move the uniquely identified company application backwards.",
-                wrote=False,
-                audit_id=audit_id,
-                idempotency_key=audit_id.removeprefix("status-audit:"),
-            )
-            store.update_processing_status(
-                record.id,
-                RecruitmentMailProcessingStatus.PROCESSED_UNCHANGED,
-                processing_error=None,
-            )
-            return _response(
-                request,
-                status=ToolStatus.SUCCESS,
-                data=ApplicationStatusUpdateData(**base),
-                evidence=evidence,
-            )
-        store.update_processing_status(
-            record.id,
-            RecruitmentMailProcessingStatus.NEEDS_AUTH_METADATA,
-            processing_error="mail_authentication_unavailable; retryable=false",
-        )
-        return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
-                         error_code=ToolErrorCode.INVALID_SOURCE,
-                         error_message="Trusted aligned DKIM or strict aligned SPF authentication is unavailable; retryable=false.",
-                         next_action="Do not retry this evidence unless its stored authentication metadata changes.")
     if parsed.received_at is None:
         store.update_processing_status(
             record.id,
@@ -298,6 +251,13 @@ def _mail_update(
                 processing_error=None,
             )
         base.update(state="unchanged", reason_code="already_at_target", reason="Application is already at the requested stage.")
+        return _response(request, status=ToolStatus.SUCCESS, data=ApplicationStatusUpdateData(**base), evidence=evidence)
+    from packages.recruitment_mail.association import _STAGE_ORDER
+    if _STAGE_ORDER[target] < _STAGE_ORDER[application.stage]:
+        base.update(state="unchanged", reason_code="later_stage_retained",
+                    reason="The application is already at a later stage; mail cannot move it backwards.")
+        store.update_processing_status(record.id, RecruitmentMailProcessingStatus.PROCESSED_UNCHANGED,
+                                       processing_error=None)
         return _response(request, status=ToolStatus.SUCCESS, data=ApplicationStatusUpdateData(**base), evidence=evidence)
     if application.source_status_synced_at is not None:
         current_time = application.source_status_synced_at
@@ -346,7 +306,7 @@ def _mail_update(
             "source_status": parsed.category.value,
             "source_status_synced_at": parsed.received_at.isoformat(),
             "result": "淘汰" if target is ApplicationStage.REJECTED else "进行中",
-            "note": f"招聘邮件已核验：{record.subject}",
+            "note": f"招聘邮件证据：{record.subject}",
             "source": "recruitment_mail",
             "source_ref": record.id,
             "idempotency_key": idem,
@@ -368,7 +328,7 @@ def _mail_update(
     if effect.before == effect.after:
         base.update(state="unchanged", reason_code="evidence_already_applied", reason="This evidence was already applied.")
         return _response(request, status=ToolStatus.SUCCESS, data=ApplicationStatusUpdateData(**base), evidence=evidence)
-    base.update(state="updated", reason_code="status_updated", reason="Application stage updated from verified mail evidence.", wrote=True)
+    base.update(state="updated", reason_code="status_updated", reason="Application stage updated from matched mail evidence.", wrote=True)
     return _response(request, status=ToolStatus.SUCCESS, data=ApplicationStatusUpdateData(**base), evidence=evidence)
 
 
@@ -389,6 +349,18 @@ def update_application_status(
                          error_code=ToolErrorCode.NOT_FOUND, error_message="Application was not found.")
     if request.evidence_type == "mail":
         return _mail_update(request, application, repository, mail_store, settings)
+    if application_progress_channel(application.record_url) == "mail_only":
+        reason = "该投递没有有效的官网进度链接，仅通过邮件更新；不能使用页面证据更新状态。"
+        return _response(
+            request, status=ToolStatus.FAILURE, evidence=evidence,
+            data=ApplicationStatusUpdateData(
+                application_id=application.id, current_stage=application.stage,
+                target_stage=ApplicationStage(request.target_status), state="blocked",
+                reason_code="mail_only", reason=reason,
+                audit_id=_audit_id(request), idempotency_key=request.evidence_id,
+            ),
+            error_code=ToolErrorCode.INVALID_SOURCE, error_message=reason,
+        )
     if browser_bridge is None:
         return _response(request, status=ToolStatus.FAILURE, data=None, evidence=evidence,
                          error_code=ToolErrorCode.SOURCE_UNAVAILABLE, error_message="Browser evidence storage is unavailable.")

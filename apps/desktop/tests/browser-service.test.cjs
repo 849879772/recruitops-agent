@@ -1,6 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const vm = require('node:vm');
 const { BrowserService } = require('../dist/browser-service');
 function contents(evaluate) {
   return Object.assign(new EventEmitter(), { id: 1, isDestroyed: () => false, isLoadingMainFrame: () => false,
@@ -12,12 +13,30 @@ function navigableContents(url, evaluate) {
     getURL: () => currentUrl, setURL: value => { currentUrl = value; }, executeJavaScriptInIsolatedWorld: evaluate });
 }
 const adapter = { buildObservationScript: () => 'fixed-code', normalizeObservation: (raw, context) => ({ raw, context }) };
+function assertObservationListenersReleased(wc) {
+  // A single shared provenance watcher intentionally survives observations so
+  // screenshots cannot reuse evidence after navigation, including same-URL loads.
+  for (const event of ['did-start-navigation', 'did-navigate-in-page', 'render-process-gone']) {
+    assert.equal(wc.listenerCount(event), 1, `${event}: only the shared provenance watcher remains`);
+  }
+  for (const event of ['will-navigate', 'will-redirect']) {
+    assert.equal(wc.listenerCount(event), 0, `${event}: temporary observation listener released`);
+  }
+}
 test('fixed isolated world pins full URL and trusted application IDs', async () => {
   const service = new BrowserService(adapter);
   const wc = contents(async (world, scripts) => { assert.equal(world, 1004); assert.equal(scripts[0].code, 'fixed-code'); return { evidence: true }; });
   const result = await service.observe(wc, 'operation-1', ['application-1']);
   assert.deepEqual(result.context.application_ids, ['application-1']);
-  assert.equal(wc.listenerCount('did-start-navigation'), 0);
+  assertObservationListenersReleased(wc);
+});
+test('repeated observations reuse one provenance watcher without leaking temporary listeners', async () => {
+  const service = new BrowserService(adapter);
+  const wc = contents(async () => ({ evidence: true }));
+  for (let index = 0; index < 20; index++) {
+    await service.observe(wc, `repeat-observation-${index}`, ['application-1']);
+    assertObservationListenersReleased(wc);
+  }
 });
 test('navigation race, large payload and missing capture contract fail closed', async () => {
   const service = new BrowserService(adapter);
@@ -55,8 +74,7 @@ for (const [name, targetUrl] of [
     assert.equal(outcome.review_readiness, 'records');
     assert.equal(calls, 2);
     assert.deepEqual(observedUrls, ['https://ats.example/applications', targetUrl]);
-    assert.equal(wc.listenerCount('did-start-navigation'), 0);
-    assert.equal(wc.listenerCount('did-navigate-in-page'), 0);
+    assertObservationListenersReleased(wc);
   });
 }
 
@@ -150,7 +168,7 @@ test('owned navigation cannot reset the deadline or return evidence from the old
   await assert.rejects(service.observeForReview(wc, 'navigation-deadline', ['app-1'],
     { deadline: Date.now() + 100, ownedOrigin: 'https://ats.example' }), /browser_readiness_timeout/);
   assert.equal(calls, 1);
-  assert.equal(wc.listenerCount('did-start-navigation'), 0);
+  assertObservationListenersReleased(wc);
 });
 
 test('child collection is isolated, same-origin scoped, and re-sampled after navigation', async()=>{
@@ -178,5 +196,76 @@ test('child collection is isolated, same-origin scoped, and re-sampled after nav
   }};
   const result=await service.observeForReview(wc,'child-race',['app-1'],{deadline:Date.now()+300});
   assert.equal(result.review_readiness,'records');assert.equal(calls,2);
-  assert.equal(wc.listenerCount('did-start-navigation'),0);
+  assertObservationListenersReleased(wc);
+});
+
+test('cross-origin navigation diagnostics preserve the actual trigger and redact target secrets',async()=>{
+  const initial='https://ats.example/applications?token=initial-secret';
+  const attempted='https://login.example/sso/authorize?code=auth-secret&email=person@example.test';
+  const wc=navigableContents(initial,async()=>{
+    wc.emit('will-redirect',{},attempted,false,true);
+    return {result:{application_records:[{title:'must not be returned'}]}};
+  });
+  const service=new BrowserService({buildObservationScript:()=>'',normalizeObservation:value=>value});
+  await assert.rejects(service.observeForReview(wc,'blocked-sso',['app-1'],
+    {deadline:Date.now()+200,requestedUrl:initial}),error=>{
+    assert.equal(error.message,'browser_navigation_changed');
+    assert.deepEqual(error.navigation,{
+      requestedUrl:'https://ats.example/applications',finalUrl:'https://ats.example/applications',
+      attemptedUrl:'https://login.example/sso/authorize',reason:'will_redirect_cross_origin',sameOrigin:false,ssoCandidate:true,
+      restriction:'unapproved_origin',phase:'observation'
+    });
+    assert.ok(!JSON.stringify(error.navigation).includes('secret'));
+    assert.ok(!JSON.stringify(error.navigation).includes('person@'));
+    return true;
+  });
+});
+
+test('scope evidence uses visible embedding elements without reading foreign frame contents',async()=>{
+  const origin='https://ats.example',url=origin+'/applications';
+  const element=(source,options={})=>({
+    ...options, parentElement:options.parentElement||null,
+    getBoundingClientRect:()=>({width:options.width??900,height:options.height??500}),
+    getClientRects:()=>[{}],getAttribute:name=>name==='src'?source:name==='aria-hidden'?options.ariaHidden:null,
+    hasAttribute:name=>name==='sandbox'&&!!options.sandbox,
+    sandbox:{contains:()=>false},
+    get contentDocument(){throw Error('foreign content must never be read');},
+    get contentWindow(){throw Error('foreign window must never be read');}
+  });
+  const frames=[
+    element('https://foreign.example/applications'),
+    element('/applications',{sandbox:true}),
+    element('https://foreign.example/helper',{hidden:true}),
+    element('https://foreign.example/pixel',{width:1,height:1}),
+    element('https://foreign.example/helper',{opacity:'0'}),
+    element('https://foreign.example/helper',{ariaHidden:'true'}),
+    element('https://foreign.example/helper',{parentElement:{hidden:true,parentElement:null,getAttribute:()=>null}}),
+    element('about:blank'),element(null),element('/helper')
+  ];
+  const top={url,origin,frameTreeNodeId:1,frameToken:'top',detached:false,isDestroyed:()=>false};
+  const foreign={url:'https://foreign.example/applications',origin:'https://foreign.example',
+    frameTreeNodeId:2,frameToken:'foreign',detached:false,isDestroyed:()=>false};
+  top.framesInSubtree=[top,foreign,{...foreign,frameTreeNodeId:3,frameToken:'opaque',url:'about:blank',origin:'null'}];
+  let calls=0;
+  const wc=navigableContents(url,async(world,scripts)=>{
+    assert.equal(world,1004);calls++;
+    if(scripts[0].code==='top-code')return {top:true};
+    return vm.runInNewContext(scripts[0].code,{
+      document:{querySelectorAll:()=>frames,baseURI:url},location:{origin},URL,
+      getComputedStyle:owner=>({display:'block',visibility:'visible',opacity:owner.opacity??'1'})
+    });
+  });
+  wc.mainFrame=top;
+  const service=new BrowserService({buildObservationScript:()=> 'top-code',
+    buildFrameObservationScript:()=>{throw Error('must not execute in a restricted frame');},
+    normalizeObservation:()=>{throw Error('must aggregate');},
+    normalizeFrameObservations:(samples,_context,skipped)=>{
+      assert.deepEqual(samples,[{frameId:0,frameUrl:url,raw:{top:true}}]);
+      assert.equal(skipped,2);
+      return {result:{diagnostics:{skippedFrameCount:skipped},application_records:[]}};
+    }
+  });
+  const result=await service.observe(wc,'frame-scope-evidence');
+  assert.equal(calls,2);
+  assert.equal(result.result.diagnostics.scopeDeniedFrameCount,2);
 });

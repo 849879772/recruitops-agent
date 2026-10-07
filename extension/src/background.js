@@ -265,6 +265,12 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
     const semanticNodes = [];
     const applicationRecords = [];
     const entries = [];
+    const pageSegments = ranked.slice(0, 4).map((item) => {
+      const page = item.response.data.page || {};
+      const text = typeof page.text === "string" ? page.text : "";
+      return {frameId: item.frameId, frameUrl: item.frameUrl,
+        text: text.slice(0, 4000), title: String(page.title || "").slice(0, 200), truncated: text.length > 4000};
+    });
     let visibleMediaCount = 0;
     for (const item of successful) {
       for (const node of item.response.data.semanticNodes || []) {
@@ -291,6 +297,7 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
         semanticNodes,
         applicationRecords,
         entries,
+        pageSegments,
         diagnostics: {
           ...(best.response.data.diagnostics || {}),
           frameCount: responses.length,
@@ -298,6 +305,7 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
           applicationRecordCount: applicationRecords.length,
           mappedStatusCount: entries.length,
           visibleMediaCount,
+          pageSegmentsTruncated: successful.length > 4 || pageSegments.some((item) => item.truncated),
           frames: successful.slice(0, 32).map((item) => ({
             frameId: item.frameId,
             frameUrl: item.frameUrl,
@@ -487,23 +495,26 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
     if (!response?.ok || validation.params.include_vision !== true) return false;
     const applicationIds = normalizeResponseApplicationIds(work?.application_ids);
     const primaryApplicationId = bridgeId(work?.application_id);
-    if (!applicationIds || applicationIds.length !== 1 || applicationIds[0] !== primaryApplicationId) {
+    if (!applicationIds || !applicationIds.length || !applicationIds.includes(primaryApplicationId)) {
       return false;
     }
     const data = response.data;
     const page = data?.page && typeof data.page === "object" ? data.page : {};
     const pageText = typeof page.text === "string" ? page.text.trim() : "";
-    const gateText = `${page.title || ""} ${pageText}`.toLowerCase();
-    const entries = Array.isArray(data?.entries) ? data.entries : [];
+    const segmentText = (data?.pageSegments || []).map((item) => `${item.title || ""} ${item.text || ""}`).join(" ");
+    const gateText = `${page.title || ""} ${pageText} ${segmentText}`.toLowerCase();
     const records = Array.isArray(data?.applicationRecords) ? data.applicationRecords : [];
     if (
-      entries.length > 0 ||
       /captcha|验证码|人机验证|安全验证|滑块验证|security check|verify you are human/.test(gateText) ||
       /请先登录|请登录|登录失效|重新登录|未登录|login required|session expired|sign in|log in/.test(gateText)
     ) return false;
-    if (records.length > 1) return false;
-    if (records.length === 1) {
-      const record = records[0];
+    if (/请(?:先)?(?:进行|完成)?身份(?:认证|验证)/.test(gateText)) return false;
+    if (records.length > 1) {
+      const titles = records.map((record) => String(record?.raw_title || record?.title || "").replace(/\s+/g, "").toLowerCase());
+      if (new Set(titles).size !== titles.length) return false;
+    }
+    if (records.length) {
+      return records.every((record) => {
       if (!record || typeof record !== "object") return false;
       const signals = record.signals && typeof record.signals === "object"
         ? record.signals
@@ -511,9 +522,95 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
       return typeof record.title === "string" &&
         record.title.trim().length > 0 &&
         signals.conflicting_statuses !== true;
+      });
     }
     const visibleMediaCount = Number(data?.diagnostics?.visibleMediaCount);
-    return Boolean(pageText) || (Number.isFinite(visibleMediaCount) && visibleMediaCount > 0);
+    return (pageText.length + segmentText.trim().length > 12) || (Number.isFinite(visibleMediaCount) && visibleMediaCount > 0);
+  }
+
+  function visionFailureCode(error) {
+    const code = String(error?.message || "");
+    const safe = new Set(["SCREEN_CAPTURE_PERMISSION_REQUIRED", "CAPTURE_TAB_CHANGED", "CAPTURE_TAB_NOT_ACTIVE",
+      "CAPTURE_DOCUMENT_CHANGED", "VISION_CAPTURE_TIMEOUT", "VISION_CAPTURE_CANCELLED",
+      "VISION_PRIVACY_MASK_UNAVAILABLE", "VISION_RESPONSE_INVALID", "TAB_UNAVAILABLE", "VISION_PAGE_URL_INVALID",
+      "vision_not_configured", "vision_model_unsupported", "vision_attempt_already_recorded", "visual_evidence_missing",
+      "transport_failed", "response_invalid", "response_incomplete", "image_too_large", "http_429", "http_503"]);
+    return safe.has(code) ? code : "VISION_CAPTURE_FAILED";
+  }
+
+  // Runs in the isolated extension world in every frame. No input value is read.
+  async function visionFrameCaptureState(mode, offset) {
+    const documentKey = "__recruitopsVisionDocumentV1";
+    if (!globalThis[documentKey]) globalThis[documentKey] = crypto.randomUUID();
+    const identity = {documentToken: globalThis[documentKey], documentUrl: location.href,
+      frameUrl: location.href, origin: location.origin};
+    if (mode === "identity") return identity;
+    const key = "__recruitopsVisionCaptureV1";
+    let state = globalThis[key];
+    if (mode === "restore") {
+      if (!state) return {restored: true, ...identity};
+      for (const overlay of state.overlays) overlay.remove();
+      for (const [element, visibility, priority] of state.hidden) {
+        if (visibility) element.style.setProperty("visibility", visibility, priority);
+        else element.style.removeProperty("visibility");
+      }
+      document.documentElement.style.scrollBehavior = state.behavior;
+      scrollTo(state.x, state.y);
+      delete globalThis[key];
+      return {restored: true, ...identity};
+    }
+    if (!state) {
+      state = {x: scrollX, y: scrollY, behavior: document.documentElement.style.scrollBehavior,
+        hidden: [], seen: new Set(), overlays: []};
+      globalThis[key] = state;
+      document.documentElement.style.scrollBehavior = "auto";
+    }
+    if (mode === "scroll") {
+      scrollTo(state.x, offset);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return {y: scrollY, ...identity};
+    }
+    if (mode === "mask") {
+      for (const overlay of state.overlays) overlay.remove();
+      state.overlays = [];
+      for (const element of document.querySelectorAll("input,textarea,select,[contenteditable='true'],[data-private],[data-sensitive],img[class*='avatar'],[class*='user-name'],[class*='username'],[class*='userName']")) {
+        if (!state.seen.has(element)) {
+          state.hidden.push([element, element.style.getPropertyValue("visibility"), element.style.getPropertyPriority("visibility")]);
+          state.seen.add(element);
+        }
+        element.style.setProperty("visibility", "hidden", "important");
+      }
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      const ranges = [];
+      const sensitive = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:\+?86[-\s]?)?1[3-9]\d[-\s]?\d{4}[-\s]?\d{4}|\b\d{17}[\dXx]\b|(?:验证码|密码|password|token)\s*[:：=]\s*\S+/gi;
+      let inspected = 0;
+      while (walker.nextNode()) {
+        if (++inspected > 20000) throw new Error("VISION_PRIVACY_MASK_UNAVAILABLE");
+        const node = walker.currentNode;
+        if (!node.parentElement || node.parentElement.closest("script,style,input,textarea,select")) continue;
+        for (const match of String(node.nodeValue || "").matchAll(sensitive)) {
+          const range = document.createRange();
+          range.setStart(node, match.index); range.setEnd(node, match.index + match[0].length);
+          ranges.push(...range.getClientRects());
+        }
+      }
+      for (const rect of ranges) {
+        if (rect.width <= 0 || rect.height <= 0 || rect.bottom < 0 || rect.top > innerHeight) continue;
+        const overlay = document.createElement("div");
+        overlay.setAttribute("data-recruitops-privacy-mask", "true");
+        overlay.style.setProperty("all", "initial", "important");
+        for (const [name, value] of Object.entries({position: "fixed", display: "block", visibility: "visible", opacity: "1",
+          left: `${Math.max(0, rect.left - 2)}px`, top: `${rect.top - 2}px`, width: `${rect.width + 4}px`,
+          height: `${rect.height + 4}px`, background: "#111", "z-index": "2147483647", "pointer-events": "none",
+          transform: "none", animation: "none", transition: "none", filter: "none"})) {
+          overlay.style.setProperty(name, value, "important");
+        }
+        document.documentElement.appendChild(overlay); state.overlays.push(overlay);
+      }
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    }
+    return {...identity, ready: true, viewportHeight: innerHeight, documentHeight: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
+      iframeCount: document.querySelectorAll("iframe,frame").length};
   }
 
   function pageIdentity(rawUrl) {
@@ -551,6 +648,49 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
     return currentIdentity;
   }
 
+  function checkVisionBudget(budget) {
+    if (budget.owner?.cancelled) throw new Error("VISION_CAPTURE_CANCELLED");
+    if (budget.expired || Date.now() >= budget.deadline) throw new Error("VISION_CAPTURE_TIMEOUT");
+  }
+
+  function visionTask(run, owner) {
+    const budget = {owner, deadline: Date.now() + 45000, expired: false, controller: new AbortController()};
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        budget.expired = true;
+        budget.controller.abort();
+        reject(new Error("VISION_CAPTURE_TIMEOUT"));
+      }, 45000);
+    });
+    const work = Promise.resolve().then(() => { checkVisionBudget(budget); return run(budget); });
+    const promise = Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+    return {promise, work};
+  }
+
+  async function assertVisionDocuments(tab, pageUrl, expected, budget) {
+    checkVisionBudget(budget);
+    await assertVisibleCaptureTarget(tab, pageUrl);
+    const frames = await chrome.scripting.executeScript({target: {tabId: tab.id, allFrames: true},
+      func: visionFrameCaptureState, args: ["identity", 0]});
+    checkVisionBudget(budget);
+    const actual = frames.map((frame) => ({frameId: frame.frameId, documentId: frame.documentId,
+      documentToken: frame.result?.documentToken, documentUrl: frame.result?.documentUrl}));
+    if (!actual.length || actual.some((frame) => !frame.documentToken || !frame.documentUrl)) {
+      throw new Error("CAPTURE_DOCUMENT_CHANGED");
+    }
+    if (expected && (actual.length !== expected.length || expected.some((frame) => {
+      const current = actual.find((item) => item.frameId === frame.frameId);
+      return !current || current.documentToken !== frame.documentToken || current.documentUrl !== frame.documentUrl
+        || (frame.documentId && current.documentId !== frame.documentId);
+    }))) throw new Error("CAPTURE_DOCUMENT_CHANGED");
+    const top = actual.find((frame) => frame.frameId === 0);
+    const currentTab = await chrome.tabs.get(tab.id);
+    checkVisionBudget(budget);
+    if (!top || currentTab?.url !== top.documentUrl) throw new Error("CAPTURE_TAB_CHANGED");
+    return actual;
+  }
+
   function normalizeVisionResponse(body) {
     if (!body || typeof body !== "object" || Array.isArray(body)) {
       throw new Error("VISION_RESPONSE_INVALID");
@@ -568,15 +708,18 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
       throw new Error("VISION_RESPONSE_INVALID");
     }
     return {
-      text: body.text.slice(0, 20_000),
+      text: body.text,
       confidence: body.confidence,
-      model: body.model.slice(0, 200),
-      image_sha256: body.image_sha256.slice(0, 128),
-      usage: body.usage === undefined ? null : body.usage
+      model: body.model,
+      image_sha256: body.image_sha256,
+      usage: body.usage === undefined ? {} : body.usage
     };
   }
 
-  async function captureVisiblePageVision(settings, tab, pageUrl, operationId) {
+  let lastVisionCaptureAt = 0;
+  async function captureVisiblePageVision(settings, tab, pageUrl, operationId, owner, expectedDocuments, budget) {
+    if (!budget) return visionTask((limit) => captureVisiblePageVision(settings, tab, pageUrl, operationId, owner, expectedDocuments, limit), owner).promise;
+    checkVisionBudget(budget);
     if (typeof tab?.id !== "number" || typeof tab?.windowId !== "number") {
       throw new Error("TAB_UNAVAILABLE");
     }
@@ -592,31 +735,63 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
       try { await chrome.windows.update(tab.windowId, {focused: true}); } catch (_focusError) { /* best effort */ }
     });
     try { await chrome.windows.update(tab.windowId, {focused: true}); } catch (_error) { /* best effort */ }
-    const beforeCaptureIdentity = await assertVisibleCaptureTarget(tab, pageUrl);
-    const imageDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: "jpeg",
-      quality: 82
-    });
-    const afterCaptureIdentity = await assertVisibleCaptureTarget(tab, pageUrl);
-    if (beforeCaptureIdentity !== afterCaptureIdentity || afterCaptureIdentity !== expectedPageIdentity) {
-      throw new Error("CAPTURE_TAB_CHANGED");
+    const documents = await assertVisionDocuments(tab, pageUrl, expectedDocuments, budget);
+    const imageDataUrls = [];
+    try {
+      const frames = await chrome.scripting.executeScript({target: {tabId: tab.id, allFrames: true},
+        func: visionFrameCaptureState, args: ["prepare", 0]});
+      const metrics = frames.find((frame) => frame.frameId === 0)?.result;
+      const expectedFrames = 1 + frames.reduce((count, frame) => count + Number(frame.result?.iframeCount || 0), 0);
+      if (!metrics?.ready || !(metrics.viewportHeight > 0) || frames.length !== expectedFrames) {
+        throw new Error("VISION_PRIVACY_MASK_UNAVAILABLE");
+      }
+      const height = Math.max(1, metrics.viewportHeight);
+      const count = Math.min(4, Math.max(1, Math.ceil(metrics.documentHeight / height)));
+      for (let index = 0; index < count; index += 1) {
+        checkVisionBudget(budget);
+        await chrome.scripting.executeScript({target: {tabId: tab.id, frameIds: [0]},
+          func: visionFrameCaptureState, args: ["scroll", index * height]});
+        const masked = await chrome.scripting.executeScript({target: {tabId: tab.id, allFrames: true},
+          func: visionFrameCaptureState, args: ["mask", 0]});
+        if (masked.length !== expectedFrames || masked.some((frame) => !frame.result?.ready)) {
+          throw new Error("VISION_PRIVACY_MASK_UNAVAILABLE");
+        }
+        const interval = Math.max(0, 550 - (Date.now() - lastVisionCaptureAt));
+        if (interval) await delay(interval);
+        await assertVisionDocuments(tab, pageUrl, documents, budget);
+        lastVisionCaptureAt = Date.now();
+        const image = await chrome.tabs.captureVisibleTab(tab.windowId, {format: "jpeg", quality: 82});
+        lastVisionCaptureAt = Date.now();
+        await assertVisionDocuments(tab, pageUrl, documents, budget);
+        if (typeof image !== "string" || image.length > 8_388_672) throw new Error("image_too_large");
+        imageDataUrls.push(image);
+      }
+    } finally {
+      try {
+        await chrome.scripting.executeScript({target: {tabId: tab.id, allFrames: true},
+          func: visionFrameCaptureState, args: ["restore", 0]});
+      } catch (_error) { /* the operation-owned tab is closed by its outer finally */ }
     }
+    await assertVisionDocuments(tab, pageUrl, documents, budget);
     const apiBaseUrl = config.normalizeApiBaseUrl(settings.apiBaseUrl);
     if (!apiBaseUrl) throw new Error("LOCAL_API_ONLY");
     const headers = {"Content-Type": "application/json"};
     if (settings.apiToken) headers.Authorization = `Bearer ${settings.apiToken}`;
+    checkVisionBudget(budget);
     const response = await fetch(`${apiBaseUrl}/api/browser/vision`, {
       method: "POST",
       headers,
       credentials: "omit",
+      signal: budget.controller.signal,
       body: JSON.stringify({
-        image_data_url: imageDataUrl,
+        image_data_urls: imageDataUrls,
         page_url: pageUrl,
         operation_id: operationId
       })
     });
     let body = null;
     try { body = await response.json(); } catch (_error) { body = null; }
+    await assertVisionDocuments(tab, pageUrl, documents, budget);
     if (!response.ok || !body) {
       throw new Error(localApiErrorCode(body, response.status));
     }
@@ -624,11 +799,21 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
   }
 
   let visionQueue = Promise.resolve();
-  function captureVisiblePageVisionSerial(settings, tab, pageUrl, operationId) {
-    const current = visionQueue.catch(() => null).then(
-      () => captureVisiblePageVision(settings, tab, pageUrl, operationId)
-    );
-    visionQueue = current.catch(() => null);
+  const visionRequests = new Map();
+  function captureVisiblePageVisionSerial(settings, tab, pageUrl, operationId, owner, expectedDocuments) {
+    if (visionRequests.has(operationId)) return visionRequests.get(operationId);
+    const previous = visionQueue;
+    const task = visionTask(async (budget) => {
+      await previous.catch(() => null);
+      checkVisionBudget(budget);
+      return captureVisiblePageVision(settings, tab, pageUrl, operationId, owner, expectedDocuments, budget);
+    }, owner);
+    const current = task.promise;
+    // A timed-out Chrome call must not release the capture lock while it is still
+    // running. Queued callers have independent deadlines and cannot upload later.
+    visionQueue = task.work.catch(() => null);
+    visionRequests.set(operationId, current);
+    if (visionRequests.size > 128) visionRequests.delete(visionRequests.keys().next().value);
     return current;
   }
 
@@ -1260,12 +1445,15 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
       });
       const frameResults = await chrome.scripting.executeScript({
         target: {tabId: tab.id, allFrames: true},
-        func: () => ({frameUrl: location.href, origin: location.origin})
+        func: visionFrameCaptureState, args: ["identity", 0]
       });
       const frameContexts = frameResults.map((item) => ({
         frameId: item.frameId,
         frameUrl: sanitizedTabUrl(item.result?.frameUrl) || "",
-        origin: typeof item.result?.origin === "string" ? item.result.origin : ""
+        origin: typeof item.result?.origin === "string" ? item.result.origin : "",
+        documentId: item.documentId,
+        documentToken: item.result?.documentToken,
+        documentUrl: item.result?.documentUrl
       })).filter((item) => /^https?:\/\//i.test(item.origin));
       const response = await waitForSemanticObservation(
         tab.id,
@@ -1277,15 +1465,16 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
       if (response?.ok) {
         const structuredEntries = Array.isArray(response?.data?.entries) ? response.data.entries : [];
         let vision = null;
+        let visionError = null;
         if (canRequestVision(response, validation, work)) {
           await reportBridgeProgress(socket, operationId, "EXTRACTING", "Capturing the visible page for model analysis.");
-          vision = await captureVisiblePageVisionSerial(
-            settings,
-            tab,
-            pageUrl,
-            operationId
-          );
+          try {
+            vision = await captureVisiblePageVisionSerial(settings, tab, pageUrl, operationId, state, frameContexts);
+          } catch (error) {
+            visionError = visionFailureCode(error);
+          }
         }
+        if (state.cancelled) return {ok: false, status: "CANCELLED", result: {reason: "cancelled"}};
         await reportBridgeProgress(socket, operationId, "VALIDATING", "Returning sanitized evidence to the model.");
         const applicationIds = normalizeResponseApplicationIds(work.application_ids)
           || (bridgeId(work.application_id) ? [bridgeId(work.application_id)] : null);
@@ -1303,6 +1492,7 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
             page_url: sanitizedTabUrl(tab.url),
             captured_at: response?.data?.capturedAt || new Date().toISOString(),
             page: response?.data?.page || {},
+            page_segments: Array.isArray(response?.data?.pageSegments) ? response.data.pageSegments : [],
             semantic_nodes: Array.isArray(response?.data?.semanticNodes)
               ? response.data.semanticNodes
               : [],
@@ -1310,7 +1500,8 @@ importScripts("./protocol.js", "./allowlist.js", "./config.js", "./actions.js");
               ? response.data.applicationRecords
               : [],
             entries: structuredEntries,
-            diagnostics: response?.data?.diagnostics || {},
+            diagnostics: {...(response?.data?.diagnostics || {}), ...(visionError ? {vision_error: visionError} : {})},
+            ...(visionError ? {vision_error: visionError} : {}),
             ...(vision ? {vision} : {})
           }
         };

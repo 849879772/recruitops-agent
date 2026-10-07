@@ -21,7 +21,7 @@ from packages.browser_bridge import (
     TERMINAL_STATUSES,
     normalize_status,
 )
-from packages.domain.urls import normalize_http_page_url
+from packages.domain.urls import application_progress_channel, normalize_http_page_url
 from packages.repositories.base import RecruitmentRepository
 from packages.security import redact_sensitive
 from packages.tools.browser_status_update import (
@@ -108,9 +108,9 @@ class ObserveApplicationStatusPageInput(ReviewAndUpdateApplicationStatusInput):
     include_vision: bool = Field(
         default=False,
         description=(
-            "Disabled by default. Enable only for a second, individual observation after a prior "
-            "DOM-only observation returned no bindable structured status evidence and the single "
-            "page has a clear target."
+            "Disabled by default. Enable only for a second observation after DOM/text evidence "
+            "was insufficient on a readable page. One page may contain multiple distinct targets; "
+            "each result must remain independently bound."
         ),
     )
     vision_fallback_reason: Literal["no_structured_evidence_visible_status_likely"] | None = Field(
@@ -122,6 +122,10 @@ class ObserveApplicationStatusPageInput(ReviewAndUpdateApplicationStatusInput):
     )
     retain_on_pause: bool = True
     application_ids: list[str] = Field(default_factory=list, max_length=50)
+    reuse_observation_operation_id: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        description="Optional recent DOM observation hint for a fresh screenshot read; never reuses saved evidence.",
+    )
 
     @model_validator(mode="after")
     def validate_vision_fallback(self) -> "ObserveApplicationStatusPageInput":
@@ -134,6 +138,8 @@ class ObserveApplicationStatusPageInput(ReviewAndUpdateApplicationStatusInput):
             )
         if not self.include_vision and self.vision_fallback_reason is not None:
             raise ValueError("vision_fallback_reason is only valid when include_vision=true")
+        if not self.include_vision and self.reuse_observation_operation_id is not None:
+            raise ValueError("reuse_observation_operation_id is only valid when include_vision=true")
         if self.include_vision and "timeout_ms" not in self.model_fields_set:
             self.timeout_ms = 120_000
         return self
@@ -160,6 +166,53 @@ class ObserveApplicationStatusPageInput(ReviewAndUpdateApplicationStatusInput):
 def _observation_application_ids(request: ObserveApplicationStatusPageInput) -> list[str]:
     values = [request.application_id, *request.application_ids]
     return list(dict.fromkeys(value for value in values if value))
+
+
+def _validated_observation_reuse(
+    request: ObserveApplicationStatusPageInput, store: BrowserBridgeStore,
+    device_id: str, page_url: str, existing: BrowserOperation | None = None,
+) -> str | None:
+    """A short-lived navigation hint, not authority to reuse text/images or write.
+
+    An expired/missing hint falls back to a normal fresh page. A replay keeps its
+    original command: the store still checks every binding and dispatches nothing.
+    """
+    source_id = request.reuse_observation_operation_id
+    if not request.include_vision or not source_id:
+        return None
+    if existing is not None:
+        original = (existing.command or {}).get("params", {}).get("reuse_observation_operation_id")
+        return source_id if original == source_id else None
+    try:
+        source = store.get_operation(source_id)
+        if source is None or source.operation != OperationName.OBSERVE_APPLICATION_STATUS_PAGE.value:
+            return None
+        command = source.command or {}
+        params = command.get("params") or {}
+        if (source.device_id != device_id or source.status != OperationStatus.SUCCEEDED.value
+                or source.error_code or params.get("include_vision") is not False
+                or params.get("review_task_id") != request.task_id
+                or normalize_http_page_url(command.get("page_url") or "") != page_url):
+            return None
+        source_ids = {command.get("application_id"), *(command.get("application_ids") or [])}
+        if not set(_observation_application_ids(request)).issubset(source_ids):
+            return None
+        completed = source.completed_at
+        if completed is None:
+            return None
+        if completed.tzinfo is None:
+            completed = completed.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - completed).total_seconds()
+        if not 0 <= age <= 30:
+            return None
+        result = source.result or {}
+        if (not isinstance(result, dict) or result.get("requires_user_action")
+                or result.get("vision") or result.get("vision_error")):
+            return None
+        return source_id
+    except Exception:
+        # Cache availability must not prevent the normal evidence collection.
+        return None
 
 
 class CaptureOcSnapshotInput(BrowserBridgeInput):
@@ -774,7 +827,15 @@ def observe_application_status_page(
         ).geturl().rstrip("/")
 
     try:
-        replay = browser_bridge_store.get_by_idempotency_key(request.idempotency_key) is not None
+        existing = browser_bridge_store.get_by_idempotency_key(request.idempotency_key)
+        replay = existing is not None
+        if request.task_id:
+            command["params"]["review_task_id"] = request.task_id
+        reuse_id = _validated_observation_reuse(
+            request, browser_bridge_store, device_id, normalized_application_url, existing,
+        )
+        if reuse_id:
+            command["params"]["reuse_observation_operation_id"] = reuse_id
         operation = browser_bridge_store.create(
             OperationName.OBSERVE_APPLICATION_STATUS_PAGE,
             device_id=device_id,
@@ -991,8 +1052,6 @@ async def _observe_application_status_page_workflow(
 
     tool_name = "observe_application_status_page"
     started = perf_counter()
-    if browser_bridge_store is None:
-        return observe_application_status_page(request, None)
     requested_ids = _observation_application_ids(request)
     application_map = {str(item.id): item for item in repository.list_applications()}
     matches = [application_map[item_id] for item_id in requested_ids if item_id in application_map]
@@ -1034,8 +1093,7 @@ async def _observe_application_status_page_workflow(
             operation_id=request.operation_id,
             task_id=request.task_id,
         )  # type: ignore[return-value]
-    page_url = request.application_url or matches[0].record_url
-    if not page_url:
+    if any(application_progress_channel(item.record_url) == "mail_only" for item in matches):
         return _response(
             ObserveApplicationStatusPageResponse,
             tool_name=tool_name,
@@ -1044,13 +1102,16 @@ async def _observe_application_status_page_workflow(
             request=request,
             started=started,
             error_code=BrowserErrorCode.INVALID_INPUT,
-            error_message="The application has no persisted recruitment status URL.",
+            error_message=(
+                "mail_only: 该投递没有有效的官网进度链接，仅通过邮件更新；已跳过官网复核。"
+            ),
             application_id=request.application_id,
             idempotency_key=request.idempotency_key,
             operation_id=request.operation_id,
             task_id=request.task_id,
         )  # type: ignore[return-value]
 
+    page_url = request.application_url or matches[0].record_url
     normalized_page_url = normalize_http_page_url(page_url)
     mismatched = [
         item for item in matches
@@ -1074,7 +1135,7 @@ async def _observe_application_status_page_workflow(
 
     resolved = request.model_copy(update={"application_url": page_url, "application_ids": requested_ids})
     created = observe_application_status_page(resolved, browser_bridge_store)
-    if not created.success or created.data is None:
+    if not created.success or created.data is None or browser_bridge_store is None:
         return created
     operation_id = created.data.operation_id
     deadline = asyncio.get_running_loop().time() + request.timeout_ms / 1_000
@@ -1301,9 +1362,6 @@ async def _review_and_update_application_status_workflow(
 
     tool_name = "review_and_update_application_status"
     started = perf_counter()
-    if browser_bridge_store is None:
-        return review_and_update_application_status(request, None)
-
     matches = [
         item for item in repository.list_applications()
         if str(item.id) == request.application_id
@@ -1326,8 +1384,7 @@ async def _review_and_update_application_status_workflow(
         )  # type: ignore[return-value]
 
     application = matches[0]
-    page_url = request.application_url or application.record_url
-    if not page_url:
+    if application_progress_channel(application.record_url) == "mail_only":
         return _response(
             ReviewAndUpdateApplicationStatusResponse,
             tool_name=tool_name,
@@ -1336,7 +1393,27 @@ async def _review_and_update_application_status_workflow(
             request=request,
             started=started,
             error_code=BrowserErrorCode.INVALID_INPUT,
-            error_message="The application has no persisted recruitment status URL.",
+            error_message=(
+                "mail_only: 该投递没有有效的官网进度链接，仅通过邮件更新；已跳过官网复核。"
+            ),
+            application_id=request.application_id,
+            device_id=request.device_id,
+            idempotency_key=request.idempotency_key,
+            operation_id=request.operation_id,
+            task_id=request.task_id,
+        )  # type: ignore[return-value]
+
+    page_url = request.application_url or application.record_url
+    if normalize_http_page_url(page_url) != normalize_http_page_url(application.record_url):
+        return _response(
+            ReviewAndUpdateApplicationStatusResponse,
+            tool_name=tool_name,
+            operation=OperationName.REVIEW_AND_UPDATE_APPLICATION_STATUS.value,
+            read_only=False,
+            request=request,
+            started=started,
+            error_code=BrowserErrorCode.INVALID_INPUT,
+            error_message="The requested page must match the persisted recruitment status URL.",
             application_id=request.application_id,
             device_id=request.device_id,
             idempotency_key=request.idempotency_key,
@@ -1346,7 +1423,7 @@ async def _review_and_update_application_status_workflow(
 
     resolved_request = request.model_copy(update={"application_url": page_url})
     created = review_and_update_application_status(resolved_request, browser_bridge_store)
-    if not created.success or created.data is None:
+    if not created.success or created.data is None or browser_bridge_store is None:
         return created
 
     operation_id = created.data.operation_id

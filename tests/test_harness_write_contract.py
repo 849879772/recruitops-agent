@@ -65,6 +65,7 @@ def test_trusted_mcp_write_is_reversible_idempotent_and_isolated(tmp_path: Path,
     schedule_tool = _definition("automation_schedule")
     list_tool = _definition("automation_schedule_list")
     disable_tool = _definition("automation_schedule_disable")
+    delete_tool = _definition("automation_schedule_delete")
 
     schedule_input = schedule_tool.input_model.model_validate(
         {"task_id": TaskType.CRAWLER_HEALTH.value, "start_time": "09:30"}
@@ -102,3 +103,10 @@ def test_trusted_mcp_write_is_reversible_idempotent_and_isolated(tmp_path: Path,
         dependencies,
     )
     assert active.data.total == 1
+    deleted = delete_tool.operation(
+        delete_tool.input_model(schedule_id=created.data.schedule_id), dependencies,
+    )
+    assert deleted.success is True
+    assert deleted.read_only is False
+    assert deleted.data.deleted is True
+    assert list_tool.operation(list_tool.input_model(), dependencies).data.total == 1

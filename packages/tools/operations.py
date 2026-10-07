@@ -14,6 +14,7 @@ from pydantic import Field, field_validator, model_validator
 from packages.scheduler.models import TaskCallable
 from packages.scheduler.runner import LocalTaskScheduler, _business_failure
 from packages.scheduler.tasks import TaskType
+from packages.storage.task_identity import task_identity
 from packages.automation import (
     AutomationStore,
     automation_blocked_message,
@@ -74,6 +75,8 @@ class OperationalTaskRunInput(ToolInput):
 class OperationalTaskRunData(ToolModel):
     task_id: str
     run_id: str
+    thread_id: str | None = None
+    turn_id: str | None = None
     run_status: str
     dry_run: bool
     attempts: int = Field(ge=0)
@@ -119,6 +122,7 @@ class OperationalTaskRunner:
             register_daily_task(storage, run_id, request.task_id,
                                 thread_id=request.thread_id, turn_id=request.turn_id)
         initial = {
+            **task_identity(run_id, {"thread_id": request.thread_id, "turn_id": request.turn_id}, task_id=request.task_id),
             "task_id": request.task_id,
             "run_id": run_id,
             "run_status": "accepted",
@@ -184,6 +188,7 @@ class OperationalTaskRunner:
                     },
                 )
                 payload = {
+                    **task_identity(run_id, {"thread_id": request.thread_id, "turn_id": request.turn_id}, task_id=request.task_id),
                     "task_id": request.task_id,
                     "run_id": run_id,
                     "run_status": result.status.value,
@@ -250,6 +255,23 @@ class OperationalTaskRunner:
             getter = getattr(self.state_store, "get_task_run", None)
             if callable(getter):
                 persisted = getter(run_id)
+        ownership = task_identity(run_id, result or {}, task_id=(persisted or {}).get("task_id"))
+        if persisted:
+            metadata = persisted.get("metadata")
+            if isinstance(metadata, Mapping) and any(key in metadata for key in ("thread_id", "turn_id")):
+                ownership = task_identity(run_id, metadata, task_id=persisted.get("task_id"))
+            # Old states stored owner ids only in their cooperative control.
+            storage = getattr(self.state_store, "storage", None)
+            if storage is not None:
+                from sqlalchemy import select
+                from packages.storage.models import ToolCall
+                from .task_runtime_control import CONTROL_TOOL
+                with storage.session() as session:
+                    control = session.scalar(select(ToolCall).where(ToolCall.task_id == run_id, ToolCall.tool_name == CONTROL_TOOL))
+                    if control and isinstance(control.arguments, Mapping):
+                        saved = control.arguments.get("metadata")
+                        if isinstance(saved, Mapping):
+                            ownership = task_identity(run_id, {**ownership, **dict(saved)}, task_id=persisted.get("task_id"))
         if result is None:
             if persisted is None:
                 return None
@@ -258,8 +280,7 @@ class OperationalTaskRunner:
             metadata = persisted.get("metadata") or {}
             business_error = _business_failure(value)
             return {
-                "task_id": persisted.get("task_id"),
-                "run_id": persisted.get("run_id", run_id),
+                **ownership,
                 "run_status": (
                     "failed" if business_error else
                     "paused" if isinstance(value, Mapping) and value.get("status") == "paused"
@@ -286,6 +307,7 @@ class OperationalTaskRunner:
             result["progress"] = state.get("progress") if isinstance(state, Mapping) else None
             if result.get("run_status") in {"accepted", "running"}:
                 result["run_status"] = persisted.get("run_status") or result["run_status"]
+        result.update(ownership)
         return result
 
     def run(
@@ -302,6 +324,8 @@ class OperationalTaskRunner:
                 self.handlers.get(request.task_id),
                 dry_run=request.dry_run and not execute_dry_run,
                 metadata={
+                    "thread_id": request.thread_id, "turn_id": request.turn_id,
+                    "task_id": request.task_id,
                     **({"requested_dry_run": True} if request.dry_run else {}),
                     **({"company_ids": request.company_ids} if request.company_ids else {}),
                     **(
@@ -323,6 +347,8 @@ class OperationalTaskRunner:
                 data=OperationalTaskRunData(
                     task_id=request.task_id,
                     run_id=result.run_id,
+                    thread_id=request.thread_id,
+                    turn_id=request.turn_id,
                     run_status=result.status.value,
                     dry_run=request.dry_run,
                     attempts=result.attempts,
@@ -443,6 +469,20 @@ class AutomationScheduleDisableInput(ToolInput):
 
 
 class AutomationScheduleDisableResponse(ToolResponse[AutomationScheduleData]):
+    read_only: Literal[False] = False
+
+
+class AutomationScheduleDeleteInput(ToolInput):
+    schedule_id: str = Field(min_length=1, max_length=128)
+
+
+class AutomationScheduleDeleteData(ToolModel):
+    schedule_id: str
+    deleted: Literal[True] = True
+    deleted_executions: int = Field(ge=0)
+
+
+class AutomationScheduleDeleteResponse(ToolResponse[AutomationScheduleDeleteData]):
     read_only: Literal[False] = False
 
 
@@ -650,7 +690,46 @@ def disable_automation(
     )
 
 
+def delete_automation(
+    request: AutomationScheduleDeleteInput,
+    store: AutomationStore,
+) -> AutomationScheduleDeleteResponse:
+    from packages.automation import AutomationRunningError
+
+    started = perf_counter()
+    evidence = [EvidenceSource(
+        source="agent_automation_store", source_ref=f"schedule:{request.schedule_id}",
+    )]
+    try:
+        deleted_executions = store.delete(request.schedule_id)
+    except AutomationRunningError as exc:
+        return AutomationScheduleDeleteResponse(
+            tool_name="automation_schedule_delete", status=ToolStatus.FAILURE,
+            success=False, evidence=evidence, error_code=ToolErrorCode.INVALID_INPUT,
+            error_message=str(exc), timeout_ms=request.timeout_ms,
+            elapsed_ms=max(0, int((perf_counter() - started) * 1_000)),
+        )
+    if deleted_executions is None:
+        return AutomationScheduleDeleteResponse(
+            tool_name="automation_schedule_delete", status=ToolStatus.NO_RESULTS,
+            success=False, evidence=evidence, error_code=ToolErrorCode.NOT_FOUND,
+            error_message="Local automation schedule was not found.",
+            timeout_ms=request.timeout_ms,
+            elapsed_ms=max(0, int((perf_counter() - started) * 1_000)),
+        )
+    return AutomationScheduleDeleteResponse(
+        tool_name="automation_schedule_delete", status=ToolStatus.SUCCESS,
+        success=True, data=AutomationScheduleDeleteData(
+            schedule_id=request.schedule_id, deleted_executions=deleted_executions,
+        ), evidence=evidence, timeout_ms=request.timeout_ms,
+        elapsed_ms=max(0, int((perf_counter() - started) * 1_000)),
+    )
+
+
 __all__ = [
+    "AutomationScheduleDeleteData",
+    "AutomationScheduleDeleteInput",
+    "AutomationScheduleDeleteResponse",
     "AutomationScheduleData",
     "AutomationScheduleDisableInput",
     "AutomationScheduleDisableResponse",
@@ -668,6 +747,7 @@ __all__ = [
     "OperationalTaskRunner",
     "activate_automation",
     "disable_automation",
+    "delete_automation",
     "list_automations",
     "plan_automation",
 ]
